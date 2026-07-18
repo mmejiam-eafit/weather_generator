@@ -1,0 +1,77 @@
+[project]
+name = "weather-generator"
+version = "0.1.0"
+description = "Stochastic weather generator for point queries at arbitrary (lat, lon, datetime)"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "scikit-learn>=1.5",
+    "xarray>=2024.10",
+    "pandas (>=3.0.3,<4.0.0)",
+    "pydantic-settings>=2.0",
+    "tensorly (>=0.9.0,<0.10.0)",
+    "pydmd (>=2025.8.1,<2026.0.0)",
+    "seaborn (>=0.13.2,<0.14.0)",
+    "plotly (>=6.9.0,<7.0.0)",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [
+    { include = "core", from = "src" },
+    { include = "train", from = "src" },
+    { include = "weather", from = "src" },
+]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.9",
+    "ipykernel",
+    "jupyter",
+]
+test = [
+    "pytest>=8",
+    "pytest-mock",
+    "pytest-cov",
+    "pytest-xdist",
+]
+lint = [
+    "black",
+    "isort",
+    "mypy>=1.13",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py314"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+namespace_packages = true
+
+# scikit-learn, scipy, and joblib ship no py.typed marker / stub package; treat
+# them as untyped rather than suppressing import-untyped per call site across
+# every transformer and numerical module.
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "scipy.*", "joblib.*", "tensorly.*", "pydmd.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+markers = [
+    "integration: opt-in integration tests (require real data)",
+]
