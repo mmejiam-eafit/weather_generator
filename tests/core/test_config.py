@@ -23,14 +23,14 @@ from core.config import (
 
 def test_grid_shapes_match_archive() -> None:
     """Shapes must match the documented (rows, cols) per grid (§2.2)."""
-    assert WAVE_GRID_SHAPE == (621, 1440)
+    assert WAVE_GRID_SHAPE == (721, 1440)
     assert WIND_GRID_SHAPE == (721, 1440)
     assert OCEAN_GRID_SHAPE == (1121, 2880)
 
 
 def test_row0_latitudes_and_steps() -> None:
     """Row-0 latitudes and resolution steps per the empirically verified §2.7 convention."""
-    assert WAVE_GRID_LAT_AT_ROW0 == -75.0
+    assert WAVE_GRID_LAT_AT_ROW0 == -90.0
     assert WIND_GRID_LAT_AT_ROW0 == -90.0
     assert WAVE_GRID_LAT_STEP_DEG == 0.25
     assert OCEAN_GRID_LAT_STEP_DEG == 0.125
@@ -76,12 +76,12 @@ def test_variable_grid_covers_all_variables() -> None:
 
 
 def test_grid_coordinates_wave() -> None:
-    """Wave grid: row 0 = -75°, 0.25° steps, 621 rows x 1440 cols (§2.2)."""
+    """Wave grid: row 0 = -90°, 0.25° steps, 721 rows x 1440 cols (§2.2, era 3)."""
     lats, lons = grid_coordinates("wave")
-    assert lats.shape == (621,)
+    assert lats.shape == (721,)
     assert lons.shape == (1440,)
-    assert_allclose(lats[0], -75.0)
-    assert_allclose(lats[-1], -75.0 + 620 * 0.25)
+    assert_allclose(lats[0], -90.0)
+    assert_allclose(lats[-1], -90.0 + 720 * 0.25)
     assert_allclose(lons[0], 0.0)
     assert_allclose(lons[-1], 359.75)
 

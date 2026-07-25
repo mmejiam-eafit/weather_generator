@@ -40,6 +40,7 @@ noted as such):
 | 13 | ⬜ | Final docs + release | all | `README.md`, `CHANGELOG.md` |
 | 14 | ✅ | Verify `copulas` dev dependency isolation | — | `src/train/copula.py` (verify only), `pyproject.toml` (verify only) |
 | 15 | ✅ | Evaluate `copulas` as a replacement for `train/copula.py` | — | `notebooks/evaluate_copulas_replacement.ipynb` (new; verdict only, no `src/` change) |
+| 16 | ✅ | Archive grid/cadence drift: era registry + ingest/model fixes | 01, 03, 08 | `src/core/archive_eras.py` (new), `src/train/ingest.py` (edit), `src/core/io.py` (edit), `src/weather/model.py` (edit) |
 
 Update the status cell as work proceeds — this table is the at-a-glance
 index; each task file is the detail. Keep them in sync: if a task's approach

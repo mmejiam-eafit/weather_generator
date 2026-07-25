@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
+from core.archive_eras import ArchiveEra, era_for_timestamp
 from core.config import VARIABLE_GRID, grid_coordinates
 from core.io import decode_compass_code, enumerate_snapshots, load_raw, load_snapshot, snapshot_path
 
@@ -85,6 +86,109 @@ def _coordinates_for_shape(grid: str, n_rows: int, n_cols: int) -> tuple[np.ndar
     return lats[:n_rows], lons[:n_cols]
 
 
+def _resolve_window_era(times: list[datetime]) -> ArchiveEra | None:
+    """Confirm the requested window's snapshots all fall in one archive era (§2.2).
+
+    Called before any file I/O, on the already-materialized `times` list, so
+    a cross-era request is rejected immediately instead of surfacing later as
+    a confusing shape mismatch deep in the per-variable load loop.
+
+    Returns `None` if `times` is empty (nothing to validate -- the existing
+    "no snapshots found for variable" RuntimeError further down already
+    covers an empty window without this function's involvement).
+
+    Raises
+    ------
+    ValueError
+        If `times`' first and last timestamps fall in different
+        `core.archive_eras.ArchiveEra`s. Grid shape and/or cadence differ
+        across eras, so a cross-era window cannot be loaded into one
+        consistent Dataset today (see tasks/16-archive-grid-resolution-
+        drift.md -- unifying eras via regridding is a separate, not-yet-
+        approved design).
+    """
+    if not times:
+        return None
+    first_era = era_for_timestamp(times[0])
+    last_era = era_for_timestamp(times[-1])
+    if first_era.name != last_era.name:
+        raise ValueError(
+            f"requested window [{times[0].isoformat()}, {times[-1].isoformat()}] spans "
+            f"more than one archive era: starts in {first_era.name} "
+            f"({first_era.start.isoformat()} to "
+            f"{'open-ended' if first_era.end is None else first_era.end.isoformat()}) "
+            f"and ends in {last_era.name} ({last_era.start.isoformat()} to "
+            f"{'open-ended' if last_era.end is None else last_era.end.isoformat()}). "
+            f"Transition boundary: {first_era.end.isoformat() if first_era.end else 'unknown'}. "
+            "Grid shape and/or snapshot cadence differ across eras -- request separate "
+            "windows per era (see docs/model_design.md §2.2 and "
+            "tasks/16-archive-grid-resolution-drift.md)."
+        )
+    return first_era
+
+
+def _validate_snapshot_shape(
+    variable: str,
+    grid: str,
+    t: datetime,
+    shape: tuple[int, ...],
+    first_shape: tuple[int, ...] | None,
+    era: ArchiveEra,
+) -> None:
+    """Diagnose a mid-window or oversized shape clearly (§2.2, §5.1).
+
+    Without this check, a variable whose shape changes mid-window (e.g. the
+    window unexpectedly straddles an undetected era boundary, or the archive
+    is corrupted) would surface as an opaque numpy broadcast `ValueError`
+    later, at `values[i] = snapshot`, with no indication of why.
+
+    Skipped for `grid == "ocean"` -- ocean-grid loading is unsupported
+    regardless of era (`core.config.grid_coordinates` raises for `"ocean"`
+    unconditionally); this only tightens diagnostics for the wave/wind grids
+    that are actually loaded end-to-end today.
+
+    Parameters
+    ----------
+    variable : str
+    grid : str
+        `"wave"`, `"wind"`, or `"ocean"` (see `core.config.VARIABLE_GRID`).
+    t : datetime
+        This snapshot's timestamp, for the error message.
+    shape : tuple[int, ...]
+        This snapshot's actual on-disk shape.
+    first_shape : tuple[int, ...] | None
+        The shape of the first successfully-loaded snapshot for this
+        variable in this window, or `None` if `shape` IS the first one (in
+        which case only the era-canonical-bound check applies).
+    era : ArchiveEra
+        The single era this whole window was already confirmed to fall in
+        (see `_resolve_window_era`).
+
+    Raises
+    ------
+    ValueError
+        If `shape` exceeds `era`'s canonical shape for `grid`, or differs
+        from `first_shape`.
+    """
+    if grid not in ("wave", "wind"):
+        return
+    expected = era.wave_grid_shape if grid == "wave" else era.wind_grid_shape
+    if shape[0] > expected[0] or shape[1] > expected[1]:
+        raise ValueError(
+            f"{variable} snapshot at {t.isoformat()} has shape {shape}, exceeding the "
+            f"{era.name} canonical {grid} grid shape {expected} (see "
+            "docs/model_design.md §2.2 and tasks/16-archive-grid-resolution-drift.md)."
+        )
+    if first_shape is not None and shape != first_shape:
+        raise ValueError(
+            f"{variable} snapshot at {t.isoformat()} has shape {shape}, inconsistent "
+            f"with this window's earlier {variable} snapshot shape {first_shape} (era "
+            f"{era.name}); the archive may be corrupted, or an undocumented shape "
+            "change occurred within what should be a single era (see "
+            "docs/model_design.md §2.2 and tasks/16-archive-grid-resolution-drift.md)."
+        )
+
+
 def load_training_window(
     data_dir: Path,
     t_start: datetime,
@@ -113,6 +217,17 @@ def load_training_window(
     synthetic archive that never wrote them), the check is silently
     skipped.
 
+    Even earlier -- before any file I/O at all -- `_resolve_window_era`
+    confirms every requested timestamp falls in a single `core.archive_eras.
+    ArchiveEra`: the real archive's on-disk grid shape and snapshot cadence
+    are not constant over its full history (see §2.2 and
+    tasks/16-archive-grid-resolution-drift.md), so a window spanning more
+    than one era is rejected immediately with a clear error rather than
+    surfacing later as an opaque shape-mismatch failure. Within a
+    single-era window, each loaded snapshot's shape is further checked
+    against that era's canonical shape and against the window's own
+    first-loaded shape (`_validate_snapshot_shape`).
+
     Parameters
     ----------
     data_dir : Path
@@ -134,17 +249,22 @@ def load_training_window(
     Raises
     ------
     ValueError
-        If `t_start`/`t_end` is not UTC-aware, if a variable is not in the
-        §10 variable table, if a variable's grid is not yet supported
-        (e.g. an ocean-grid variable before §2.7 verification), or if `wad`
-        and `wad_come_from` do not differ by 180° at the first or last
-        checked snapshot (§5.1: archive convention drift).
+        If `t_start`/`t_end` is not UTC-aware, if `t_start` is before the
+        earliest known archive era, if the requested window spans more than
+        one archive era (§2.2), if a loaded snapshot's shape is inconsistent
+        with its era or with earlier snapshots in the same window, if a
+        variable is not in the §10 variable table, if a variable's grid is
+        not yet supported (e.g. an ocean-grid variable before §2.7
+        verification), or if `wad` and `wad_come_from` do not differ by 180°
+        at the first or last checked snapshot (§5.1: archive convention
+        drift).
     RuntimeError
         If a variable has a contiguous gap of 24 hours or more, or if every
         snapshot for a variable is missing across the whole window.
     """
     times = list(enumerate_snapshots(t_start, t_end))
     n_times = len(times)
+    window_era = _resolve_window_era(times)
 
     first_wad_t = _find_wad_pair_snapshot(data_dir, times)
     if first_wad_t is not None:
@@ -165,6 +285,7 @@ def load_training_window(
             ) from None
 
         values: np.ndarray | None = None
+        first_shape: tuple[int, ...] | None = None
         contiguous_gap = 0
         for i, t in enumerate(times):
             try:
@@ -186,8 +307,11 @@ def load_training_window(
                 continue
 
             contiguous_gap = 0
+            if window_era is not None:
+                _validate_snapshot_shape(variable, grid, t, snapshot.shape, first_shape, window_era)
             if values is None:
                 values = np.full((n_times, *snapshot.shape), np.nan, dtype=np.float64)
+                first_shape = snapshot.shape
             values[i] = snapshot
 
         if values is None:

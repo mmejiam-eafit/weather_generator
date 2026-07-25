@@ -12,9 +12,9 @@
 
 **Training entry point:** a Jupyter notebook (`notebooks/test_pipeline.ipynb`), not a CLI. Training is a one-shot exploratory activity that benefits from cell-level iteration on Tucker/DMD/OU hyperparameters against a cached preprocessing output.
 
-**Training data:** 2022-01-01 to 2025-12-31 (4 years, ~11,700 snapshots at 3h cadence).
-**Validation (numerical metrics):** 2026-01-01T00:00Z to 2026-07-19T21:00Z (~200 days, ~1,600 snapshots). Held-out real data used to compute the validation battery in §6.
-**Extrapolation window:** 2026-07-20T00:00Z onward — the archive currently ends here. The model must produce plausible synthetic weather for these dates without real data available for comparison. Assessed by consistency and stability checks rather than pointwise metrics; see §6.13.
+**Training data:** the archive spans 2022-01-01 to 2026-07-20T00:00Z, but is **not one uniform grid/cadence throughout** — it has undergone two confirmed, clean, one-time shape/cadence transitions (see §2.2.1 and `core.archive_eras.ARCHIVE_ERAS`, the authoritative source). A previous version of this doc claimed a flat "2022-2025, 4 years, ~11,700 snapshots at 3h cadence" — that is wrong (it spans three distinct archive eras, the earliest of which is 6-hourly, not 3-hourly) and is corrected here. `train.ingest.load_training_window` now rejects any requested window spanning more than one era. **Which single era (or subset of the archive) to actually train the production model on is a separate, still-open decision** — not resolved by this correction; see `tasks/16-archive-grid-resolution-drift.md`.
+**Validation (numerical metrics):** 2026-01-01T00:00Z to 2026-07-19T21:00Z (~200 days, ~1,600 snapshots) — entirely within era 3 (see §2.2.1). Held-out real data used to compute the validation battery in §6. Note: the archive's last ~7 snapshots (2026-07-19T03:00Z–2026-07-20T00:00Z) are missing all 3 ocean variables (`sst`/`ocs`/`ocd`) — currently inconsequential since ocean-grid loading is unsupported regardless (§2.7), but relevant once it is supported.
+**Extrapolation window:** 2026-07-20T00:00Z onward — the archive currently ends here (confirmed, matches this line). The model must produce plausible synthetic weather for these dates without real data available for comparison. Assessed by consistency and stability checks rather than pointwise metrics; see §6.13.
 
 ---
 
@@ -148,20 +148,38 @@ The archive is not one uniform grid. Variables live on three:
 
 | Grid       | Shape (rows × cols) | Resolution | Lat range      | Lon range        | Row 0 | Variables |
 |------------|---------------------|------------|----------------|------------------|-------|-----------|
-| **Wave**   | 621 × 1440          | 0.25°      | [−75°, +80°]   | [0°, 359.75° E]  | south | `sigwh`, `wsh`, `wsp`, `wsd`, `pwh`, `pwp`, `pwd`, `pswh`, `pswp`, `pswd` |
+| **Wave**   | 721 × 1440          | 0.25°      | [−90°, +90°]   | [0°, 359.75° E]  | south | `sigwh`, `wsh`, `wsp`, `wsd`, `pwh`, `pwp`, `pwd`, `pswh`, `pswp`, `pswd` |
 | **Wind**   | 721 × 1440          | 0.25°      | [−90°, +90°]   | [0°, 359.75° E]  | south | `was`, `wad`, `wad_come_from` |
 | **Ocean**  | 1121 × 2880         | 0.125°     | (verify §2.7)  | [0°, 359.875° E] | (verify §2.7) | `sst`, `ocs`, `ocd` |
 
 Row indexing (**both wave and wind grids — this is the non-standard part**):
 
 ```
-wave grid:  lat = -75.0 + row * 0.25    row ∈ [0, 620]
+wave grid:  lat = -90.0 + row * 0.25    row ∈ [0, 720]
 wind grid:  lat = -90.0 + row * 0.25    row ∈ [0, 720]
 ```
 
 Longitude for both: `lon = col * 0.25`, `col ∈ [0, 1439]`, spanning `[0°, 359.75° E]`.
 
 **Row 0 = south is critical.** Most gridded earth-science datasets follow the opposite convention. See §2.7 for how this was established empirically and how to re-verify it for the ocean grid.
+
+#### 2.2.1 The table above now describes era 3 (current) — the archive has three eras
+
+The table above's wave-grid row, and `core.config`'s wave-grid constants (`WAVE_GRID_SHAPE`, `WAVE_GRID_LAT_AT_ROW0`), describe era 3 (2025-10-27 onward, current and open-ended — the era production training targets), not era 2. `core.config`'s wind/ocean/cadence constants were already correct for era 3 — they're numerically identical across era 2 and era 3, so only the wave-grid constants needed updating. Direct binary-search inspection of the real archive (`data/`, a symlink) found two further, confirmed, clean, one-time transitions before era 3. **`core.archive_eras.ARCHIVE_ERAS` is the authoritative, executable source of truth for the table below** — do not hand-copy these numbers elsewhere; import and use `core.archive_eras.era_for_timestamp` instead.
+
+| Era | Dates (UTC) | Wave shape | Wind shape | Ocean shape | Cadence |
+|---|---|---|---|---|---|
+| **era1** | 2022-01-01 → 2023-10-01T18:00Z | (181,360) | (181,360) | `sst`=(180,360) **≠** `ocs`/`ocd`=(1265,2880) — internally inconsistent | 6-hourly (00/06/12/18Z only; 03/09/15/21Z structurally empty, confirmed across the whole era) |
+| **era2** | 2023-10-02T00:00Z → 2025-10-26T21:00Z | (621,1440) — the table above | (721,1440) — the table above | (1121,2880), consistent — the table above | 3-hourly — §5.1's documented default |
+| **era3** | 2025-10-27T00:00Z → archive end (2026-07-20T00:00Z) | (721,1440) — see below | (721,1440) | (1121,2880) | 3-hourly |
+
+All three transitions are confirmed clean, synchronized, one-time cutovers (no patchy/interleaved periods).
+
+**Coordinate convention (`lat0`/step), not just shape** — empirically verified in `notebooks/verify_era1_era3_grid_coordinates.ipynb` (land/ocean mask correlation against era 2's known-correct grid, the same general technique §2.7 describes for the ocean grid):
+- **era1**: `lat0=-90.0`, `1.0°` steps, `lon0=0.0` — a coarser *global* grid (181 rows × 1.0° spans exactly −90°..+90°), decisively confirmed (97.6% land-mask agreement at this offset vs. the next-best candidate at 86.8%). This is **not** era 2's regional wave-grid convention (`lat0=-75.0`) — it matches the wind grid's convention, just 4x coarser.
+- **era3**: the wave grid is a **literal copy of the wind grid** (confirmed via same-timestamp cell-by-cell land-mask agreement of 1.0000, vs. 0.5643 for a different-date control) — `lat0=-90.0`, `0.25°` steps, i.e. `WIND_GRID_LAT_AT_ROW0`/`WIND_GRID_LAT_STEP_DEG`, not the era-2 wave grid's.
+
+Era 3's finding is now wired into `core.config` — `WAVE_GRID_SHAPE`/`WAVE_GRID_LAT_AT_ROW0` encode it, so `core.config.grid_coordinates` returns era 3's convention for the wave grid unconditionally, for every era. This is correct for era 3 (current/production) but a known, accepted tradeoff for era 1/era 2: `train.ingest.load_training_window` validates *shape* per era and rejects cross-era windows, but an era 1 or era 2 window's wave-grid coordinate *labels* are wrong if loaded (era 1's convention remains entirely unwired). See `core/config.py`'s module docstring for the exact mislabeling and rationale.
 
 ### 2.3 On-disk dtypes and decoding
 
@@ -586,8 +604,8 @@ Three deterministic layers plus two stochastic layers.
 Notation used throughout (naming disambiguated in v2):
 
 - `T` — training snapshots (~11,700 for 2022–2025 at 3h cadence).
-- `H, W = 621, 1440` — wave grid dimensions.
-- `N_ocean` — ocean cells after masking; expect ~60% of `H·W` ≈ 5.4 × 10⁵.
+- `H, W = 721, 1440` — wave grid dimensions (era 3, current/production).
+- `N_ocean` — ocean cells after masking; expect ~60% of `H·W` ≈ 6.2 × 10⁵.
 - `V` — jointly modeled variables. Tier 1: ~6 after (u, v) expansion.
 - `r_ocean`, `r_var`, `r_dmd` — truncation ranks.
 - `Δt = 10800 s` (3 hours).
@@ -640,17 +658,19 @@ def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
 
 Log the max deviation on success. Rerun on the last snapshot too — if the archive convention changed *within* the training window, the second check catches it.
 
+**Archive-era consistency check, before any file I/O at all (§2.2.1).** The real archive's grid shape and snapshot cadence are not constant over its full history (§2.2.1, `core.archive_eras.ARCHIVE_ERAS`). Before the wad/wad_come_from check above even runs, `load_training_window` resolves `era_for_timestamp(times[0])` and `era_for_timestamp(times[-1])` and raises `ValueError` immediately if they differ — a cross-era window cannot be loaded into one consistent `Dataset` (shape and/or cadence would differ mid-array). Within a confirmed single-era window, each loaded snapshot's shape is further checked against that era's canonical shape and against the window's own first-loaded shape, so an unexpected shape change (corruption, or an undocumented additional era boundary) fails with a clear diagnostic rather than an opaque numpy broadcast error. `core.io.enumerate_snapshots` is itself era-aware (6-hourly within era 1, 3-hourly within eras 2/3) — it does not reject cross-era windows itself (that stays `load_training_window`'s job), it just enumerates each timestamp at its own era's native cadence.
+
 **Implementation prerequisite: `core/io.py` currently refuses to load `wad_come_from` and `ocd` at all.** `_DIRECTION_ORIGIN_CODES` deliberately omits both (per the v1 design, back when `wad_come_from` was believed to be a redundant duplicate and `ocd`'s convention was unverified), so `load_snapshot` raises `ValueError` for either today. `load_raw` above is *not* `core.io.load_snapshot` — it's a lower-level raw-array read that must be added (or `load_snapshot`'s allowlist extended) before any of §3.7/§5.3's pipeline wiring can run. Add `"wad_come_from": 1` and `"ocd": 1` to `_DIRECTION_ORIGIN_CODES` as part of implementing this section, not as an afterthought.
 
 **Gap handling:** missing file → log to stderr, mark NaN. Gap of 24 h+ → abort. Gap 6–24 h → warn.
 
 **Memory:** 4 years × 6 vars at `float64` at global 0.25° is ~240 GB. Use `np.memmap` or chunk time-blocks (30 days at a time).
 
-**Ocean mask construction:** for each grid, intersection of `not isnan` across all training snapshots and modeled variables on that grid. Wind grid needs external Natural Earth land polygon rasterized to `(721, 1440)`. Store as `.ocean_mask_` on `WeatherModel` — bool `(621, 1440)`.
+**Ocean mask construction:** for each grid, intersection of `not isnan` across all training snapshots and modeled variables on that grid. Wind grid needs external Natural Earth land polygon rasterized to `(721, 1440)`. Store as `.ocean_mask_` on `WeatherModel` — bool `(721, 1440)`.
 
 ### 5.2 Reprojection (`Reprojector` transformer)
 
-Wind (721 × 1440) and ocean (1121 × 2880) fields resampled to the wave grid (621 × 1440, `lat ∈ [−75°, +80°]`).
+Wind (721 × 1440) and ocean (1121 × 2880) fields resampled to the wave grid (721 × 1440, `lat ∈ [−90°, +90°]`).
 
 ```python
 class Reprojector(BaseEstimator, TransformerMixin):
@@ -1155,8 +1175,8 @@ Wrap in a small xarray Dataset containing just the queried points so `inverse_tr
 
 ## 6. Validation
 
-**Training:** 2022-01-01T00:00Z → 2025-12-31T21:00Z.
-**Held-out metrics window:** 2026-01-01T00:00Z → 2026-07-19T21:00Z. Real archive data available; used for numerical validation with ground-truth comparison.
+**Training:** see §1/§2.2.1 — the archive spans three grid/cadence eras, so "2022-2025" is not one loadable window; the actual production training window is a separate, still-open decision (§1).
+**Held-out metrics window:** 2026-01-01T00:00Z → 2026-07-19T21:00Z (entirely within era 3, §2.2.1). Real archive data available; used for numerical validation with ground-truth comparison. Note the archive's last ~7 snapshots in this window are missing ocean variables (§1).
 **Extrapolation window:** 2026-07-20T00:00Z onward. Archive ends here; no ground-truth comparison possible. Assessed by internal-consistency and stability criteria only.
 
 The validation battery splits accordingly into two parts. `weather.validate.full_report` runs both and assembles them into a PDF:
@@ -1228,7 +1248,7 @@ Directory layout — one dir per model version:
 ├── metadata.json          # variable list, grid extents, cadence, training window,
 │                          # ranks, DMD variant, git commit hash,
 │                          # sklearn / numpy / scipy / tensorly / pydmd versions
-├── ocean_mask.npy         # (621, 1440) bool
+├── ocean_mask.npy         # (721, 1440) bool
 ├── preprocess.pkl         # fitted sklearn Pipeline
 ├── tucker.npz             # U_ocean, U_var, reconstruction_error
 ├── dmd.npz                # Phi, Lambda, b0, lam_cont, dt, variant
@@ -1451,7 +1471,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         dmd_              : DMDFit
         mode_ou_          : ModeOUFit
         local_residual_   : LocalResidualFit  (None if include_local_residual=False)
-        ocean_mask_       : np.ndarray, shape (621, 1440), bool
+        ocean_mask_       : np.ndarray, shape (721, 1440), bool
         metadata_         : ModelMetadata
     """
 
@@ -1523,6 +1543,8 @@ Default `dmd_variant="exact"` — fast enough for repeated Tucker/DMD rank sweep
 ### 8.6 Notebook workflow (`notebooks/test_pipeline.ipynb`)
 
 Training is a notebook activity. Structure so that expensive stages run once and cheap stages iterate.
+
+**Stale example dates below — do not copy literally.** `T_TRAIN_START`/`T_TRAIN_END` as shown (`2022-01-01`→`2026-01-01`) spans all three archive eras (§2.2.1) and will now be **rejected** by `load_training_window` (a cross-era window). Pick a single-era window instead — e.g. era 2's full span, `2023-10-02` to `2025-10-27` — until the actual production training window is decided (§1, `tasks/16-archive-grid-resolution-drift.md`); this doc's pseudocode has not been updated with a considered choice, only flagged as needing one. Rewriting the actual notebook is `tasks/11-notebooks.md`'s scope, not done as part of that flagging.
 
 ```
 Cell 1  — Setup: imports, paths, SEED, training + validation windows.
@@ -1669,11 +1691,13 @@ Ordered by expected pain if missed.
 12. **Time zones — always UTC.** Naive datetimes raise `ValueError` at the API boundary.
 
 13. **Reference epochs are TWO datetimes, not one.**
-    - `t_train_start = 2022-01-01T00:00Z` — beginning of training window; used by DMD/OU as the time origin for `Λ^{Δn}` and OU closed-form evolution.
+    - `t_train_start = 2022-01-01T00:00Z` — beginning of training window; used by DMD/OU as the time origin for `Λ^{Δn}` and OU closed-form evolution. **This specific example date is now illegal on its own** — see gotcha 15: `t_train_start=2022-01-01` combined with a `2026-01-01` end spans three archive eras and `load_training_window` will reject it. The two-epoch *mechanism* described below is still correct; only this literal example pair needs revisiting once the real production training window (§1) is chosen.
     - `t_ref = 2024-01-01T10:30Z` — midpoint of the 2022-01-01 → 2026-01-01 training window, used as the climatology's linear trend origin (`Δτ = (t − t_ref) / 1_year`).
     Compute `t_ref` at fit time as `t_train_start + (t_train_end - t_train_start) / 2`. Do not hardcode; if the training window changes, `t_ref` should shift with it. Both stored in `metadata.json`. All temporal computations at query time reference the correct one — climatology uses `t_ref`, DMD/OU use `t_train_start`. Getting these swapped produces a systematic bias that's hard to spot in QQ plots but shows up loudly in the trend-term diagnostic (§6.A.8).
 
 14. **Physical consistency across variables is NOT enforced.** `wsh ≤ sigwh` etc. can be violated. The Gaussian copula preserves correlations but not physical relationships. Defer projection layer until validation shows it's needed.
+
+15. **The archive has three grid/cadence eras — a training window must stay within one.** See §2.2.1 for the full table (`core.archive_eras.ARCHIVE_ERAS` is the authoritative source). `load_training_window` now rejects any `[t_start, t_end)` spanning more than one era, and `WeatherModel._fit_impl` derives `dt` for `dmd_fit`/`fit_local_residual` from `core.archive_eras.era_for_timestamp(t_start)` rather than a flat constant — training on an era-1-only window with the old flat `SNAPSHOT_CADENCE_SECONDS` would otherwise have silently used the wrong `dt` (3h assumed, 6h actual) in the DMD eigenvalue / OU theta math. `core.config.grid_coordinates` now returns era 3's `lat0`/lon-step for the wave grid unconditionally, for every era (era 1's and era 3's coordinate *labels* were empirically verified in `notebooks/verify_era1_era3_grid_coordinates.ipynb`; era 3's is now wired in, era 1's deliberately is not). Loading an era 1 or era 2 window still mislabels that window's wave-grid latitudes as a result — an accepted tradeoff, not a bug; see `core/config.py`'s module docstring and `tasks/16-archive-grid-resolution-drift.md`.
 
 15. **Nested BLAS threading pitfall.** `sample_batch` must not spawn its own workers. Honor `OMP_NUM_THREADS` etc. set by the caller.
 

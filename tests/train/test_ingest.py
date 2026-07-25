@@ -29,11 +29,13 @@ def _write_uniform_window(
     dtype: type,
     value: float,
     skip_indices: frozenset[int] = frozenset(),
+    t0: datetime = _T0,
+    step_hours: int = 3,
 ) -> None:
     for i in range(n_times):
         if i in skip_indices:
             continue
-        t = _T0 + timedelta(hours=3 * i)
+        t = t0 + timedelta(hours=step_hours * i)
         _write_snapshot(data_dir, t, variable, np.full(shape, value), dtype)
 
 
@@ -45,7 +47,7 @@ def test_load_training_window_continuous_variable(tmp_path: Path) -> None:
     assert ds["sigwh"].dims == ("time", "wave_lat", "wave_lon")
     assert ds["sigwh"].shape == (4, 5, 8)
     assert_allclose(ds["sigwh"].values, np.full((4, 5, 8), 2.5))
-    assert_allclose(ds["wave_lat"].values, [-75.0, -74.75, -74.5, -74.25, -74.0])
+    assert_allclose(ds["wave_lat"].values, [-90.0, -89.75, -89.5, -89.25, -89.0])
     assert_allclose(ds["wave_lon"].values, [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75])
 
 
@@ -209,3 +211,69 @@ def test_load_training_window_wad_consistency_check_passes_silently(
 
     assert ds["sigwh"].shape == (n_times, 1, 2)
     assert "consistency check passed" in capsys.readouterr().err
+
+
+# --- Archive era drift (see tasks/16-archive-grid-resolution-drift.md) ---
+
+_ERA1_T0 = datetime(2022, 6, 1, 0, tzinfo=timezone.utc)
+
+
+def test_load_training_window_era1_window_loads_with_era1_cadence(tmp_path: Path) -> None:
+    """A window entirely within era1 (2022-2023) loads at era1's 6-hourly cadence, no gaps logged."""
+    _write_uniform_window(
+        tmp_path,
+        "sigwh",
+        n_times=3,
+        shape=(5, 8),
+        dtype=np.float16,
+        value=2.5,
+        t0=_ERA1_T0,
+        step_hours=6,
+    )
+    ds = load_training_window(tmp_path, _ERA1_T0, _ERA1_T0 + timedelta(hours=18), ["sigwh"])
+
+    assert ds["sigwh"].shape == (3, 5, 8)
+    assert not np.isnan(ds["sigwh"].values).any()
+    assert list(ds["time"].values) == [
+        np.datetime64(_ERA1_T0.replace(tzinfo=None) + timedelta(hours=6 * i), "s") for i in range(3)
+    ]
+
+
+def test_load_training_window_spans_era_boundary_raises_before_file_io(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A window spanning the era1/era2 seam is rejected immediately, before any file I/O.
+
+    No files are written at all — if the rejection happened anywhere other
+    than up-front (e.g. deep in the per-variable load loop), this would
+    instead fail with "no snapshots found" or log "missing snapshot" lines.
+    """
+    t_start = datetime(2023, 10, 1, 18, tzinfo=timezone.utc)  # era1's last real snapshot
+    t_end = datetime(2023, 10, 2, 3, tzinfo=timezone.utc)  # era2
+
+    with pytest.raises(ValueError, match="spans more than one archive era"):
+        load_training_window(tmp_path, t_start, t_end, ["sigwh"])
+
+    captured = capsys.readouterr()
+    assert "missing snapshot" not in captured.err
+
+
+def test_load_training_window_shape_changes_mid_window_raises(tmp_path: Path) -> None:
+    """A variable whose on-disk shape changes mid-window (within a single era) raises clearly."""
+    _write_snapshot(tmp_path, _T0, "sigwh", np.full((5, 8), 1.0), np.float16)
+    _write_snapshot(tmp_path, _T0 + timedelta(hours=3), "sigwh", np.full((5, 7), 1.0), np.float16)
+
+    with pytest.raises(ValueError, match="inconsistent with this window's earlier"):
+        load_training_window(tmp_path, _T0, _T0 + timedelta(hours=6), ["sigwh"])
+
+
+def test_load_training_window_shape_exceeds_era_canonical_raises(tmp_path: Path) -> None:
+    """A variable shape exceeding its era's canonical bound raises clearly.
+
+    era1's canonical wave shape is (181, 360); this writes a (300, 500)
+    snapshot, which exceeds it on both axes.
+    """
+    _write_snapshot(tmp_path, _ERA1_T0, "sigwh", np.full((300, 500), 1.0), np.float16)
+
+    with pytest.raises(ValueError, match="exceeding the era1 canonical"):
+        load_training_window(tmp_path, _ERA1_T0, _ERA1_T0 + timedelta(hours=6), ["sigwh"])

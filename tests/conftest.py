@@ -17,7 +17,7 @@ _N_LON = 5
 
 # Tier-1 end-to-end fixture (see AGENTS.md §3.8, used by tests/weather/test_model.py
 # and tests/weather/test_simulate.py). Wave patch: 6 rows starting at the canonical
-# row 0 (-75.00 .. -73.75). Wind patch: 70 rows starting at the canonical row 0
+# row 0 (-90.00 .. -88.75). Wind patch: 70 rows starting at the canonical row 0
 # (-90.00 .. -72.75), chosen so it fully covers the wave patch's latitude range —
 # otherwise Reprojector's bilinear interpolation would fall outside the wind
 # source's bounds and produce all-NaN u_wind/v_wind, collapsing the ocean mask.

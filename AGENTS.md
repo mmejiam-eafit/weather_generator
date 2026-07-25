@@ -539,11 +539,11 @@ Grid constants are `Final` module-level bindings in `core/config.py`:
 # src/core/config.py
 from typing import Final
 
-WAVE_GRID_SHAPE: Final[tuple[int, int]] = (621, 1440)
+WAVE_GRID_SHAPE: Final[tuple[int, int]] = (721, 1440)
 WIND_GRID_SHAPE: Final[tuple[int, int]] = (721, 1440)
 OCEAN_GRID_SHAPE: Final[tuple[int, int]] = (1121, 2880)
 
-WAVE_GRID_LAT_AT_ROW0: Final[float] = -75.0
+WAVE_GRID_LAT_AT_ROW0: Final[float] = -90.0
 WIND_GRID_LAT_AT_ROW0: Final[float] = -90.0
 # OCEAN_GRID_LAT_AT_ROW0: see handoff §2.7 — verify empirically before setting.
 

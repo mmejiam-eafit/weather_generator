@@ -12,6 +12,8 @@ from typing import Final
 
 import numpy as np
 
+from core.archive_eras import era_for_timestamp
+
 # Continuous fields stored as float16 on disk (see docs/model_design.md §2.3, §10).
 _CONTINUOUS_VARIABLES: Final[frozenset[str]] = frozenset(
     {"sigwh", "wsh", "wsp", "pwh", "pwp", "pswh", "pswp", "was", "sst", "ocs"}
@@ -66,9 +68,17 @@ def snapshot_path(data_dir: Path, t: datetime, variable: str) -> Path:
 
 
 def enumerate_snapshots(t_start: datetime, t_end: datetime) -> Iterator[datetime]:
-    """Yield UTC snapshot timestamps at 3-hour cadence over ``[t_start, t_end)``.
+    """Yield UTC snapshot timestamps at each era's native cadence over ``[t_start, t_end)``.
 
-    (see docs/model_design.md §5.1)
+    (see docs/model_design.md §2.2, §5.1)
+
+    Cadence is looked up per-timestamp via `core.archive_eras.era_for_timestamp`
+    (6-hourly in era 1, 3-hourly in eras 2/3), so a window entirely within
+    era 1 no longer enumerates the systematically-absent 03/09/15/21Z slots.
+    A window spanning more than one era still enumerates cleanly here (mixed
+    cadence) -- this function stays a pure, dumb generator; rejecting
+    cross-era windows is `train.ingest.load_training_window`'s job, not
+    this function's (see tasks/16-archive-grid-resolution-drift.md).
 
     Parameters
     ----------
@@ -80,19 +90,21 @@ def enumerate_snapshots(t_start: datetime, t_end: datetime) -> Iterator[datetime
     Yields
     ------
     datetime
-        Each snapshot timestamp, 3 hours apart, starting at `t_start`.
+        Each snapshot timestamp, spaced by its era's native cadence, starting
+        at `t_start`.
 
     Raises
     ------
     ValueError
-        If `t_start` or `t_end` is not UTC-aware.
+        If `t_start` or `t_end` is not UTC-aware, or if `t_start` is before
+        the earliest known archive era.
     """
     require_utc(t_start, "t_start")
     require_utc(t_end, "t_end")
     t = t_start
     while t < t_end:
         yield t
-        t += timedelta(hours=3)
+        t += timedelta(seconds=era_for_timestamp(t).cadence_seconds)
 
 
 def decode_compass_code(codes: np.ndarray, origin_code: int) -> np.ndarray:

@@ -3,12 +3,18 @@
 import json
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import pytest
 from conftest import TIER1_T0, TIER1_VARIABLES, TIER1_WAVE_SHAPE, fit_small_tier1_model
 from numpy.testing import assert_allclose
 from sklearn.base import clone
 
+import weather.model as model_module
+from core.archive_eras import ArchiveEra
+from train.dmd import dmd_fit as _real_dmd_fit
+from train.local_residual import fit_local_residual as _real_fit_local_residual
 from weather.model import ModelMetadata, WeatherModel
 
 
@@ -250,3 +256,41 @@ def test_sklearn_clone() -> None:
     original_params = model.get_params()
     cloned_params = cloned.get_params()
     assert original_params == cloned_params
+
+
+def test_fit_derives_dt_from_archive_era_not_flat_constant(
+    tier1_archive: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dt for dmd_fit/fit_local_residual comes from core.archive_eras.era_for_timestamp,
+    not a reimported flat SNAPSHOT_CADENCE_SECONDS constant (see
+    tasks/16-archive-grid-resolution-drift.md).
+    """
+    sentinel_cadence = 999.0
+    fake_era = ArchiveEra(
+        name="fake",
+        start=TIER1_T0 - timedelta(days=1),
+        end=None,
+        wave_grid_shape=TIER1_WAVE_SHAPE,
+        wind_grid_shape=TIER1_WAVE_SHAPE,
+        ocean_grid_shapes={},
+        cadence_seconds=sentinel_cadence,
+    )
+    monkeypatch.setattr(model_module, "era_for_timestamp", lambda t: fake_era)
+
+    captured_dts: list[float] = []
+
+    def spy_dmd_fit(*args: Any, **kwargs: Any) -> Any:
+        captured_dts.append(kwargs["dt"])
+        return _real_dmd_fit(*args, **kwargs)
+
+    def spy_fit_local_residual(*args: Any, **kwargs: Any) -> Any:
+        captured_dts.append(kwargs["dt"])
+        return _real_fit_local_residual(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "dmd_fit", spy_dmd_fit)
+    monkeypatch.setattr(model_module, "fit_local_residual", spy_fit_local_residual)
+
+    fit_small_tier1_model(tier1_archive)
+
+    assert len(captured_dts) == 2
+    assert captured_dts == [sentinel_cadence, sentinel_cadence]

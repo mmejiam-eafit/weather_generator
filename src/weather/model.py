@@ -22,7 +22,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_is_fitted
 
-from core.config import SNAPSHOT_CADENCE_SECONDS
+from core.archive_eras import era_for_timestamp
 from train.climatology import ClimatologyRemover
 from train.copula import GaussianCopula
 from train.directional import ComingFromToUV, GoingToToUV
@@ -209,6 +209,11 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         rng = np.random.default_rng(self.random_state)
 
         x_raw = load_training_window(X, self.t_start, self.t_end, self.variables)
+        # load_training_window already confirmed [t_start, t_end) falls in a single
+        # archive era (see train.ingest._resolve_window_era) — safe to derive dt
+        # from t_start alone rather than trusting a flat, era-2-only constant
+        # (see tasks/16-archive-grid-resolution-drift.md).
+        window_era = era_for_timestamp(self.t_start)
         preprocess = Pipeline(
             [
                 (
@@ -255,7 +260,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         dmd_fit_result = dmd_fit(
             core,
             r_dmd=self.r_dmd,
-            dt=SNAPSHOT_CADENCE_SECONDS,
+            dt=window_era.cadence_seconds,
             rng=rng,
             variant=self.dmd_variant,
         )
@@ -277,7 +282,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             local_residual_fit = fit_local_residual(
                 z,
                 z_coherent,
-                dt=SNAPSHOT_CADENCE_SECONDS,
+                dt=window_era.cadence_seconds,
                 variance_floor=self.local_residual_variance_floor,
             )
 

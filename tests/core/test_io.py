@@ -49,6 +49,41 @@ def test_enumerate_snapshots_utc_timezone_required() -> None:
         list(enumerate_snapshots(datetime(2025, 1, 1), datetime(2025, 1, 2, tzinfo=timezone.utc)))
 
 
+def test_enumerate_snapshots_six_hour_cadence_in_era1() -> None:
+    """A window entirely within era1 (2022-2023) yields only the 6-hourly slots that exist.
+
+    (see tasks/16-archive-grid-resolution-drift.md — era1's 03/09/15/21Z
+    hours are structurally empty across the whole era, not random gaps.)
+    """
+    t_start = datetime(2022, 6, 1, 0, tzinfo=timezone.utc)
+    t_end = datetime(2022, 6, 1, 19, tzinfo=timezone.utc)
+    times = list(enumerate_snapshots(t_start, t_end))
+    assert times == [
+        datetime(2022, 6, 1, 0, tzinfo=timezone.utc),
+        datetime(2022, 6, 1, 6, tzinfo=timezone.utc),
+        datetime(2022, 6, 1, 12, tzinfo=timezone.utc),
+        datetime(2022, 6, 1, 18, tzinfo=timezone.utc),
+    ]
+
+
+def test_enumerate_snapshots_mixed_cadence_across_era_boundary_not_rejected_here() -> None:
+    """enumerate_snapshots itself does not reject a cross-era window (that's ingest's job);
+    it enumerates with each timestamp's own era cadence, so the step size varies at the seam.
+    """
+    t_start = datetime(2023, 10, 1, 12, tzinfo=timezone.utc)  # era1, 6-hourly
+    t_end = datetime(2023, 10, 2, 6, tzinfo=timezone.utc)  # era2, 3-hourly
+    times = list(enumerate_snapshots(t_start, t_end))
+    # era1 steps of 6h until crossing the 2023-10-02T00:00Z seam, then era2's 3h steps.
+    assert times == [
+        datetime(2023, 10, 1, 12, tzinfo=timezone.utc),
+        datetime(2023, 10, 1, 18, tzinfo=timezone.utc),
+        datetime(2023, 10, 2, 0, tzinfo=timezone.utc),
+        datetime(2023, 10, 2, 3, tzinfo=timezone.utc),
+    ]
+    deltas = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+    assert deltas == [timedelta(hours=6), timedelta(hours=6), timedelta(hours=3)]
+
+
 def test_wsd_compass_codes() -> None:
     """wsd/pwd use origin code 0 = North (see §2.3)."""
     assert_allclose(decode_compass_code(np.array([[0]], dtype=np.int8), origin_code=0), [[0.0]])
