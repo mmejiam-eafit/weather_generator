@@ -27,6 +27,11 @@ packages = [
     { include = "train", from = "src" },
     { include = "weather", from = "src" },
 ]
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^7.3.0"
+plotly = "^6.9.0"
+nbformat = "^5.10.4"
+
 
 [dependency-groups]
 dev = [
