@@ -4,7 +4,7 @@
 
 **Audience:** coding agent bootstrapping the repo from scratch, or picking up work in progress. This document is self-contained — every convention, formula, and restriction the agent needs is stated here, not by reference.
 
-**One-line summary:** train a stochastic model on the raw 3-hourly `.npy` archive of NOAA GFS-Wave / WAVEWATCH III + GFS wind fields (2022–2025), and provide plausible synthetic samples of any variable at any continuous `(lat, lon, datetime)` when real data isn't available. Validate on 2026.
+**One-line summary:** train a stochastic model on the raw 3-hourly `.npy` archive produced by the [`noaa_etl`](./noaa_etl/) pipeline — NOAA GFS-Wave GRIB2 (wave *and* wind fields together, one product) plus RTOFS/HYCOM (sea surface temperature and ocean currents) (2022–2025) — and provide plausible synthetic samples of any variable at any continuous `(lat, lon, datetime)` when real data isn't available. Validate on 2026. **`docs/noaa_etl/` is the unequivocal source of truth for this archive's origin and transformations** (see `docs/noaa_etl/pipeline.md`); every data fact in §2 below is stated to be consistent with it.
 
 **Approach chosen:** hierarchical decomposition — **linear-trend + harmonic climatology** → **coherent large-scale modes** via Tucker compression + DMD + OU on mode amplitudes → **per-cell local residuals** via independent OU fields. Per-cell Gaussian-copula marginals wrap the whole thing. Orchestrated by a scikit-learn `BaseEstimator + TransformerMixin` wrapper. See §3 for rationale and rejected alternatives.
 
@@ -28,7 +28,7 @@ Read this section if you're already familiar with v1. Otherwise skip to §1.
 4. **Hierarchical decomposition of the anomaly.** After Gaussianization, `Z(s, t)` is now decomposed into a *coherent* term (Tucker + DMD + OU on modes) plus a *local residual* term (independent per-cell OU fields). The v1 design captured only the coherent term, which produced samples that were too spatially smooth. See §3.10 and §5.7.
 5. **New pure-function module.** `train/local_residual.py` fits and evolves the per-cell OU field. See §5.7.
 6. **Notation cleanup.** OU parameters are now subscripted by scope: `θ_mode`, `σ_mode` for DMD modes; `θ_local`, `σ_local` for per-cell residual. `σ_std` is the standardization scale.
-7. **Directional conventions are mixed in the archive, and the pipeline reflects that explicitly.** Previous versions assumed all directions were "coming from" and used a single `DirectionalDecomposer`. In reality `wad` and `ocd` are stored as `going_to`, while `wsd` and `wad_come_from` are confirmed `coming_from`; `pwd`/`pswd` are *assumed* `coming_from` pending domain-expert confirmation (see §2.3, §2.4 — the trade-wind/current climatology check used to confirm the other four fields isn't valid ground truth for wave partitions that can be swell-decoupled from local wind). v2 uses **two atomic transformers** — `ComingFromToUV` and `GoingToToUV` — with disjoint pair lists, so the pipeline definition itself shows which convention each variable uses. See §3.7 and §5.3. `wad_come_from` is the source of truth for wind; a runtime `wad`/`wad_come_from` consistency check guards against archive drift (§5.1). This entire convention table was established empirically in `notebooks/verify_direction_convention.ipynb`, a **single-snapshot check** — re-run it against more snapshots/seasons before treating any of it as final, especially the ocean-grid-dependent `ocd` result (§2.7 is still unverified).
+7. **Directional conventions are mixed in the archive, and the pipeline reflects that explicitly.** Previous versions assumed all directions were "coming from" and used a single `DirectionalDecomposer`. In reality `wad` and `ocd` are stored as `going_to`, while `wsd`, `pwd`, `pswd`, and `wad_come_from` are all `coming_from`. This is no longer just an empirical inference: `docs/noaa_etl/noaa_transform.md` (the ETL's own documentation, authoritative for how these fields are produced) cites NOAA's own references — [NCEP GRIB2 Code Table 4.2-0-2](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-2.shtml) defines the raw `WDIR` GRIB field as "wind direction (from which blowing)", and [NDBC's measurement glossary](https://www.ndbc.noaa.gov/faq/measdes.shtml) defines the wave-direction parameters underlying `pwd`/`wsd`/`pswd` the same way — while ocean current direction is the one NDBC exception, reported as the direction the current flows *toward*, confirming `ocd`'s `going_to` convention independently of grid orientation. `pwd` and `pswd` are therefore **confirmed**, not merely assumed pending domain-expert review as a prior version of this doc stated (see §2.3, §2.4). v2 uses **two atomic transformers** — `ComingFromToUV` and `GoingToToUV` — with disjoint pair lists, so the pipeline definition itself shows which convention each variable uses. See §3.7 and §5.3. `wad_come_from` is the source of truth for wind; a runtime `wad`/`wad_come_from` consistency check guards against archive drift (§5.1) — though per the ETL, `wad` is deterministically derived from `wad_come_from` by a `±180°` transform at transform time, so this check is a defense against upstream *pipeline* changes, not archive noise. The convention table was originally established empirically in `notebooks/verify_direction_convention.ipynb`, a single-snapshot check; it is now corroborated by the ETL's documented sourcing, so it no longer needs to be treated as provisional for `wsd`/`pwd`/`pswd`/`wad`/`wad_come_from`/`ocd`'s "coming from vs. going to" question. The 16-point compass *code-to-degree* mapping itself, however, was wrong in a prior version of this doc — see the corrected §2.3.
 8. **Training split.** Explicitly 2022–2025 for training; 2026-01-01 through 2026-07-19T21:00Z for held-out validation metrics; the anchoring approach (§6, §5.8) removes the need for a separate extrapolation window. The archive is truncated at 2026-07-20T00:00Z.
 
 Everything else — grid conventions, direction encoding, NaN policy, path layout, Poetry/black/isort tooling — carries over unchanged.
@@ -142,26 +142,26 @@ def snapshot_path(data_dir: Path, t: datetime, variable: str) -> Path:
 
 The `f"{t:%Y/%m/%d/%H}"` idiom produces zero-padded output on every locale — do not refactor to manual string concatenation without keeping the padding.
 
-### 2.2 Three grids
+### 2.2 Two grids, not three — "wave" and "wind" are the same product
 
-The archive is not one uniform grid. Variables live on three:
+**A prior version of this doc described three grids (wave, wind, ocean), treating "wave" and "wind" as physically separate sources needing cross-grid reprojection. That's wrong and is corrected here.** Per `docs/noaa_etl/pipeline.md` and `docs/noaa_etl/noaa_transform.md`, all wave *and* wind variables (`sigwh`, `wsh`, `wsp`, `wsd`, `pwh`, `pwp`, `pwd`, `pswh`, `pswp`, `pswd`, `was`, `wad`, `wad_come_from` — 13 in total) are decoded from **one GFS Wave GRIB2 file per cycle/forecast-hour** (`gfswave.t{cycle}z.global.0p25.f{fff}.grib2`); GFS Wave outputs the surface wind fields it uses to force the wave model alongside the wave-state fields, all on the identical 0.25° grid. There is no separate "wind model" or "wind grid" in the archive's origin — only the ocean (HYCOM/RTOFS) variables come from a genuinely different source and grid. This matters architecturally: §3.6/§5.2's `Reprojector` has no work to do for wind (it's already on the wave grid) — only ocean needs reprojecting.
 
-| Grid       | Shape (rows × cols) | Resolution | Lat range      | Lon range        | Row 0 | Variables |
-|------------|---------------------|------------|----------------|------------------|-------|-----------|
-| **Wave**   | 721 × 1440          | 0.25°      | [−90°, +90°]   | [0°, 359.75° E]  | south | `sigwh`, `wsh`, `wsp`, `wsd`, `pwh`, `pwp`, `pwd`, `pswh`, `pswp`, `pswd` |
-| **Wind**   | 721 × 1440          | 0.25°      | [−90°, +90°]   | [0°, 359.75° E]  | south | `was`, `wad`, `wad_come_from` |
-| **Ocean**  | 1121 × 2880         | 0.125°     | (verify §2.7)  | [0°, 359.875° E] | (verify §2.7) | `sst`, `ocs`, `ocd` |
+| Grid            | Shape (rows × cols) | Resolution | Lat range      | Lon range        | Row 0 | Variables | Source |
+|------------------|---------------------|------------|----------------|------------------|-------|-----------|--------|
+| **GFS Wave** (wave + wind) | 721 × 1440 | 0.25°      | [−90°, +90°]   | [0°, 359.75° E]  | south | `sigwh`, `wsh`, `wsp`, `wsd`, `pwh`, `pwp`, `pwd`, `pswh`, `pswp`, `pswd`, `was`, `wad`, `wad_come_from` | GFS Wave GRIB2 (NOAA NOMADS) |
+| **Ocean**        | 1121 × 2880         | 0.125°     | (verify §2.7)  | [0°, 359.875° E] | (verify §2.7) | `sst`, `ocs`, `ocd` | RTOFS/HYCOM (NOAA NOMADS), remapped from a native tripolar mesh — see §2.7 |
 
-Row indexing (**both wave and wind grids — this is the non-standard part**):
+Row indexing for the GFS Wave grid (**the non-standard part**):
 
 ```
-wave grid:  lat = -90.0 + row * 0.25    row ∈ [0, 720]
-wind grid:  lat = -90.0 + row * 0.25    row ∈ [0, 720]
+lat = -90.0 + row * 0.25    row ∈ [0, 720]
 ```
 
-Longitude for both: `lon = col * 0.25`, `col ∈ [0, 1439]`, spanning `[0°, 359.75° E]`.
+This matches NOAA's published grid definition for `gfswave.global.0p25` (`Ni=1440`, `Nj=721`, 0.25° spacing, `La1=90°`, `Lo1=0°`, `La2=-90°`, `Lo2=359.75°`), confirmed in `docs/noaa_etl/noaa_transform.md`. As delivered by `pygrib`, row 0 is the north pole and row index increases southward; the ETL's `flip_latitude` step reverses this for every GFS variable before it's written to `.npy`, which is why row 0 = south (−90°) in the *stored* archive.
 
-**Row 0 = south is critical.** Most gridded earth-science datasets follow the opposite convention. See §2.7 for how this was established empirically and how to re-verify it for the ocean grid.
+Longitude: `lon = col * 0.25`, `col ∈ [0, 1439]`, spanning `[0°, 359.75° E]` (eastward, `[0°, 360°)` convention, not `[-180°, 180°]`).
+
+**Row 0 = south is critical.** Most gridded earth-science datasets follow the opposite convention. This doc previously described establishing it purely via an empirical land-mask correlation study (§2.7's method below); it's now also directly confirmed by the ETL's documented `flip_latitude` behavior, which is the authoritative account of how the stored orientation came to be. See §2.7 for the empirical cross-check and how to extend it to the ocean grid.
 
 #### 2.2.1 The table above now describes era 3 (current) — the archive has three eras
 
@@ -185,47 +185,54 @@ Era 3's finding is now wired into `core.config` — `WAVE_GRID_SHAPE`/`WAVE_GRID
 
 Two dtype conventions in the archive:
 
-- **Continuous fields** (`sigwh`, `wsh`, `wsp`, `pwh`, `pwp`, `pswh`, `pswp`, `was`, `sst`, `ocs`): stored as `float16` on disk.
+- **Continuous fields** (`sigwh`, `wsh`, `wsp`, `pwh`, `pwp`, `pswh`, `pswp`, `was`, `sst`, `ocs`): stored as `float16` on disk. **Units, per `docs/noaa_etl/noaa_transform.md`:** `was` and `ocs` (speeds) are in **knots** (`ms_to_knots`, factor `1.943845249222`, applied at transform time — the raw GRIB/HYCOM values are m/s); wave heights (`sigwh`, `wsh`, `pwh`, `pswh`) are in meters (no unit conversion applied); periods (`wsp`, `pwp`, `pswp`) are in seconds (no conversion); `sst` unit needs verification (§10) — the ETL applies no explicit conversion, so it is presumably the HYCOM native unit.
 - **Direction fields** (`wsd`, `pwd`, `pswd`, `wad`, `wad_come_from`, `ocd`): stored as `int8` 16-point-compass codes (22.5° steps), not raw degrees.
 
 **Immediately on load, upcast everything to `float64`.** `float16` overflows in arithmetic at surprisingly small values (`(300.0)²` overflows).
 
-**Compass code decoding.** Each field has two orthogonal pieces of metadata that must both be respected: the **origin code** (which int8 value represents 0°) and the **native convention** (whether the decoded angle means "the wind/wave is coming *from* this direction" or "going *to* this direction"). Both differ per variable. The full table below — and every convention determination in it — comes from an empirical check against known wind/current climatology (trade winds, Southern Ocean westerlies, Antarctic Circumpolar Current, equatorial currents) in `notebooks/verify_direction_convention.ipynb`. That check used **one snapshot**; re-run it against more snapshots/seasons before treating any row as final, particularly `ocd` (see below):
+**Compass code decoding — corrected against `docs/noaa_etl/noaa_transform.md`.** A prior version of this section described two different origin codes (`0` for `wsd`/`pwd`/`pswd`, `1` for `wad`/`wad_come_from`/`ocd`) with two different decode formulas. **That table was wrong.** The ETL's own documentation of `calculate_16degree` — the function that actually produces every direction field in the archive — shows all six direction fields share **one** encoding: sectors `1–16`, each spanning 22.5°, centered on `sector * 22.5°`, with **sector 16 = North** (wrapping the 0°/360° boundary), not sector 0 or sector 1. Concretely: sector 1 = 22.5° (NNE), sector 4 = 90° (E), sector 8 = 180° (S), sector 12 = 270° (W), sector 16 = 0°/360° (N). There is no per-field origin code — every direction field decodes the same way.
 
-| Field            | Code range  | Origin code (North = 0°) | Decode formula            | Native convention                                |
-|------------------|-------------|--------------------------|---------------------------|--------------------------------------------------|
-| `wsd`            | 0–15        | `0`                      | `code * 22.5`             | `coming_from`                                    |
-| `pwd`            | 0–15        | `0`                      | `code * 22.5`             | `coming_from` (assumed, pending expert)          |
-| `pswd`           | 0–15 assumed| `0`                      | `code * 22.5`             | `coming_from` (assumed, pending expert)          |
-| `wad`            | 1–16        | `1`                      | `(code - 1) * 22.5`       | `going_to`                                       |
-| `wad_come_from`  | 1–16        | `1`                      | `(code - 1) * 22.5`       | `coming_from`                                    |
-| `ocd`            | 1–16        | `1` (same as `wad`)      | `(code - 1) * 22.5`       | `going_to` (pending §2.7 ocean-grid verification) |
+What genuinely differs per field is the **native convention** (whether the decoded angle means "coming *from*" or "going *to*" this direction) — that part of the prior table is directionally correct and is now further corroborated (not just by the single-snapshot empirical check in `notebooks/verify_direction_convention.ipynb`) by NOAA's own documentation, cited in `docs/noaa_etl/noaa_transform.md`: NCEP GRIB2 Code Table 4.2-0-2 defines raw `wdir` as "wind direction (from which blowing)", and NDBC's glossary defines the wave-direction parameters underlying `pwd`/`wsd`/`pswd` the same way, while ocean current direction is NDBC's one documented exception (direction flowing *toward*). `pwd` and `pswd` are therefore confirmed `coming_from`, not merely assumed pending expert review:
 
-**The archive does not use a single uniform convention.** Wave directions are coming-from; ocean current direction is going-to; wind is stored twice (once as going-to in `wad`, once as coming-from in `wad_come_from`). Both origin code and convention must be verified per variable — do not generalize from one field to another. Note that `wad` and `ocd` need *no* origin-code correction relative to each other — `ocd` decodes correctly with the exact same `origin_code=1` already assigned to `wad`; the only difference between the two fields is the convention label, not the decode.
+| Field            | Code range | Decode formula (uniform) | Native convention                    |
+|------------------|------------|---------------------------|----------------------------------------|
+| `wsd`            | 1–16       | `(code % 16) * 22.5`      | `coming_from` (confirmed — NCEP/NDBC) |
+| `pwd`            | 1–16       | `(code % 16) * 22.5`      | `coming_from` (confirmed — NCEP/NDBC) |
+| `pswd`           | 1–16       | `(code % 16) * 22.5`      | `coming_from` (confirmed — NCEP/NDBC) |
+| `wad`            | 1–16       | `(code % 16) * 22.5`      | `going_to` (deliberate ±180° flip of `wad_come_from`, applied by the ETL for consistency with `ocd`'s convention when overlaying wind/current arrows) |
+| `wad_come_from`  | 1–16       | `(code % 16) * 22.5`      | `coming_from` (confirmed — raw `wdir`, unconverted) |
+| `ocd`            | 1–16       | `(code % 16) * 22.5`      | `going_to` (confirmed — NDBC ocean-current convention; derived directly from `atan2(u, v)` on HYCOM's native velocity vector — this determination does **not** depend on the ocean grid's row/col-to-lat/lon orientation, which is a separate, still-unverified concern, §2.7) |
 
-**`ocd`'s `going_to` finding is conditional on the ocean grid's orientation, which is still unverified (§2.7).** The check that established it used a lightweight, self-derived equator/hemisphere determination (via `sst`'s zonal-mean peak and open-ocean fraction at 40-60°), not the full Natural-Earth land-correlation study §2.7 calls for. Treat `ocd`'s convention as provisional until `tests/core/test_grid_ocean.py::test_orientation` (§12) passes — the same caveat `pwd`/`pswd` carry for a different reason applies here too. There is also no `ocd_come_from` sibling field on disk (unlike `wad`), so the fix for `ocd` is necessarily a convention flag in `GoingToToUV`, not a field swap.
+**Missing/invalid sentinel: `-1`.** `-1` is a valid in-range `int8` value in this store, used by the ETL as the explicit missing-value marker for every direction field — it is **not** a real sector and must be filtered out (via the paired float field's NaN mask, §2.5) before decoding, not passed through the formula above. Feeding `-1` through `(code % 16) * 22.5` silently produces a plausible-looking but meaningless angle (`337.5°`) instead of erroring.
+
+**The archive does not use a single uniform *convention*, even though it now uses a single uniform *code-to-degree formula*.** Wave directions are coming-from; ocean current direction is going-to; wind is stored twice (once as going-to in `wad`, once as coming-from in `wad_come_from`). Convention must still be chosen per variable — do not generalize the convention from one field to another, even though the decode formula itself no longer varies.
 
 Canonical decoder (lives in `core.io`):
 
 ```python
-def decode_compass_code(codes: np.ndarray, origin_code: int) -> np.ndarray:
+def decode_compass_code(codes: np.ndarray) -> np.ndarray:
     """Decode int8 16-point compass codes to degrees (float64, [0, 360)).
+
+    Every direction field in the archive (wsd, pwd, pswd, wad, wad_come_from, ocd)
+    uses the identical sector encoding: codes 1-16, sector 16 = North (§2.3). -1 is
+    a missing-value sentinel and must be masked out by the caller before calling this
+    function, not passed through it.
 
     Returns raw decoded angle in the archive's native convention for that field —
     either "coming from" or "going to". The convention is a separate concern from
     decoding and is handled downstream by the ComingFromToUV or GoingToToUV
     transformers (see §5.3).
     """
-    return ((codes.astype(np.int32) - origin_code) * 22.5).astype(np.float64) % 360.0
+    return ((codes.astype(np.int32) % 16) * 22.5).astype(np.float64) % 360.0
 ```
 
 The decoder is convention-agnostic on purpose. Convention handling lives in the preprocessing Pipeline (§3.7, §5.3) so that adding a directional variable requires explicitly choosing which transformer it belongs to — no silent defaulting.
 
 Test cases (must pass):
-- `decode_compass_code(np.array([[0]], dtype=np.int8), origin_code=0)` → `[[0.0]]` (North).
-- `decode_compass_code(np.array([[4]], dtype=np.int8), origin_code=0)` → `[[90.0]]` (East).
-- `decode_compass_code(np.array([[1]], dtype=np.int8), origin_code=1)` → `[[0.0]]` (North, `wad` convention).
-- `decode_compass_code(np.array([[5]], dtype=np.int8), origin_code=1)` → `[[90.0]]` (East, `wad` convention).
+- `decode_compass_code(np.array([[16]], dtype=np.int8))` → `[[0.0]]` (North).
+- `decode_compass_code(np.array([[4]], dtype=np.int8))` → `[[90.0]]` (East).
+- `decode_compass_code(np.array([[8]], dtype=np.int8))` → `[[180.0]]` (South).
+- `decode_compass_code(np.array([[12]], dtype=np.int8))` → `[[270.0]]` (West).
 
 ### 2.4 Direction conventions — mixed across the archive
 
@@ -298,10 +305,10 @@ Downstream consumers read each variable in its native archive convention. If a c
 
 ### 2.5 NaN policy
 
-- **Wave grid** — `float` fields carry NaN for land and persistent ice cover. Authoritative land mask for the wave grid.
-- **Wind grid** — has *no* NaN. Winds are defined over land in the GFS product. Mask via a Natural Earth land polygon rasterized to the wind grid.
+- **Wave-state variables** (`sigwh`, `wsh`, `wsp`, `wsd`, `pwh`, `pwp`, `pwd`, `pswh`, `pswp`, `pswd`) — `float` fields carry NaN for land and persistent ice cover. Authoritative land mask for the GFS Wave grid (§2.2).
+- **Wind variables** (`was`, `wad`, `wad_come_from`) — from the same GFS Wave grid/product (§2.2), but have *no* NaN. Winds are defined over land in the GFS product. Mask via a Natural Earth land polygon rasterized to the grid.
 - **Ocean grid** — `sst` almost certainly carries NaN for land; `ocs`/`ocd` behavior needs verification.
-- **Direction fields** — `int8`, no NaN. Masking comes from the paired float field.
+- **Direction fields** — `int8`, no float NaN, but **do** carry an explicit missing-value sentinel, `-1` (§2.3) — a valid in-range `int8` value, not decodable via the compass formula. Filter `-1` explicitly before decoding; don't rely solely on the paired float field's mask, since the two are not guaranteed to be pixel-identical in provenance even though they're masked together in practice for the stochastic model (§2.5 below, ocean-mask intersection).
 
 **Every accumulation guarded with `np.isnan`.** NaN in → NaN through. Never coerce NaN to zero.
 
@@ -318,16 +325,18 @@ def pad_lon(field: np.ndarray, pad: int = 2) -> np.ndarray:
 
 ### 2.7 How grid orientation was established (and how to verify it)
 
-The row-0-is-south convention was originally documented as the opposite and turned out to be wrong. The correction came from an empirical study:
+The row-0-is-south convention was originally documented as the opposite and turned out to be wrong. The correction is now doubly confirmed: `docs/noaa_etl/noaa_transform.md` documents that raw `pygrib` output has row 0 at the north pole and that the ETL's `flip_latitude` step reverses this for every GFS Wave variable (both wave-state and wind fields, since they're one product per §2.2) before writing to `.npy` — this is the authoritative account. It's also independently corroborated by this repo's own empirical study:
 
-- **Wave grid.** Correlate the real NaN pattern in `sigwh` against a rasterized coastline from Natural Earth, across multiple days and every plausible row offset and row order. The correct convention appears as a sharp single peak in agreement (~92.6% match). Verified visually.
-- **Wind grid.** Has no NaN mask. Confirmed by visual landmark displacement matching the wave grid, and by winter storm wind maxima landing at plausible North Pacific / North Atlantic cyclone latitudes.
+- **GFS Wave grid (wave-state fields).** Correlate the real NaN pattern in `sigwh` against a rasterized coastline from Natural Earth, across multiple days and every plausible row offset and row order. The correct convention appears as a sharp single peak in agreement (~92.6% match). Verified visually.
+- **GFS Wave grid (wind fields).** No NaN mask of their own to correlate against (§2.5). Confirmed by visual landmark displacement matching the wave-state fields on the same grid, and by winter storm wind maxima landing at plausible North Pacific / North Atlantic cyclone latitudes.
 
-**The ocean grid orientation has not been verified. Do it before including SST or currents.** Method: correlate `sst` NaN pattern against a Natural Earth land polygon rasterized at 0.125°, across (row 0 south vs. north) × (rows increase vs. decrease). Correct convention should show ≥ 85% agreement; alternatives ≤ 60%. Independently confirm with warm-pool location.
+**The ocean grid's geographic orientation (row/col → lat/lon) has not been verified. Do it before including SST or currents.** Per `docs/noaa_etl/noaa_transform.md`, this genuinely cannot be derived from the codebase alone: HYCOM/RTOFS's native grid is **tripolar** (a real pole at the South Pole plus two displaced poles over land in the Northern Hemisphere, avoiding a coordinate singularity over open Arctic ocean), so rows/columns in the raw decoded array don't correspond to a uniform `lat = f(row)` formula the way the GFS grid does. The ETL's `hycom_index` step resamples this onto the uniform `(1121, 2880)` output grid using a precomputed nearest-neighbor lookup table (`hycom_satocean_idx.npy`, generated *outside* this codebase), and this repo contains only the index table, not the geographic (lat/lon-in-degrees) definition of the grid it targets — so `[0, 0]`'s real-world coordinates are opaque from the ETL alone and must be established empirically, same as this doc already prescribed. Method: correlate `sst` NaN pattern against a Natural Earth land polygon rasterized at 0.125°, across (row 0 south vs. north) × (rows increase vs. decrease). Correct convention should show ≥ 85% agreement; alternatives ≤ 60%. Independently confirm with warm-pool location.
+
+**This is a narrower open question than a prior version of this doc implied.** `ocd`'s `going_to` *directional convention* is now confirmed independently of this grid-orientation question (§2.3): `docs/noaa_etl/noaa_transform.md` shows `ocd` is derived directly from `atan2(u, v)` on HYCOM's native `(u, v)` velocity components — the tripolar-to-regular remap (`hycom_index`) only rearranges which array cell a value lives at, it does not rotate the velocity vector itself, so the angle's *meaning* ("going to") holds regardless of how `[row, col]` maps to `(lat, lon)`. What genuinely still depends on this section's unresolved orientation study is purely spatial: which real-world `(lat, lon)` a given `sst`/`ocs`/`ocd` cell represents, needed for masking, reprojection onto the wave grid, and any lat/lon-dependent climatology term.
 
 Encode result in `core/config.py` as `OCEAN_GRID_LAT_AT_ROW0` and `OCEAN_GRID_LAT_STEP_DEG`.
 
-**TASK — do this before writing any ocean-grid-dependent logic.** Add `notebooks/verify_ocean_grid_orientation.ipynb` implementing the method above (Natural Earth correlation, all four `(row 0 south/north) × (increasing/decreasing)` candidates, ≥30 arbitrary days per the original methodology, warm-pool cross-check) and confirm it passes the ≥85%/≤60% thresholds before implementing `Reprojector`'s ocean-grid path, `ClimatologyRemover`/`GaussianCopula` for `sst`, or `GoingToToUV`'s `ocd` pair. This supersedes the lightweight, single-snapshot, self-derived orientation check used in `notebooks/verify_direction_convention.ipynb` to establish `ocd`'s `going_to` convention (§2.3, §2.4) — that check is good evidence the convention finding is directionally right (see the reasoning there: both physical tests used are robust even to a hemisphere-sign error), but it is not a substitute for this notebook, and `ocd`'s convention should be treated as provisional until this notebook exists and passes. Once it does, encode the result in `core/config.py` and close out `tests/core/test_grid_ocean.py::test_orientation` (§12).
+**TASK — do this before writing any ocean-grid-dependent logic.** Add `notebooks/verify_ocean_grid_orientation.ipynb` implementing the method above (Natural Earth correlation, all four `(row 0 south/north) × (increasing/decreasing)` candidates, ≥30 arbitrary days per the original methodology, warm-pool cross-check) and confirm it passes the ≥85%/≤60% thresholds before implementing `Reprojector`'s ocean-grid path or `ClimatologyRemover`/`GaussianCopula` for `sst`/`ocs`/`ocd` (anything that needs to know which lat/lon a cell is). `GoingToToUV`'s `ocd` pair no longer needs to wait on this notebook specifically for its *convention* (that's settled, §2.3) — but it still needs an ocean-cell mask with correct lat/lon labels to be meaningfully composed with the rest of the pipeline, so in practice `ocd` stays gated on this notebook regardless. Once it passes, encode the result in `core/config.py` and close out `tests/core/test_grid_ocean.py::test_orientation` (§12).
 
 ### 2.8 Python conventions for this repo
 
@@ -395,9 +404,9 @@ DMD and OU are linear-Gaussian; weather variables are skewed and bounded. Interp
 
 Handles positivity/boundedness implicitly. Known limitation: zero joint tail dependence. Fix later per §3.13 escalation.
 
-### 3.6 Cross-grid handling: reproject to wave grid
+### 3.6 Cross-grid handling: reproject the ocean grid onto the wave grid
 
-Three grids of different sizes need reconciliation. Reproject wind and ocean grids onto the wave grid (bilinear, clipping to `lat ∈ [−75°, +80°]`) as v1. Simpler than fitting three separate models with cross-grid coupling at OU level (§3.13 escalation).
+**Corrected from a prior version of this doc, which described reprojecting both "wind" and "ocean" grids onto the "wave" grid, treating wind as a third, separately-gridded source.** Per §2.2, wind and wave-state fields come from the same GFS Wave product on the identical grid — there is nothing to reproject between them, only a pass-through. The only genuine cross-grid reconciliation needed is **ocean (HYCOM/RTOFS, 1121×2880, 0.125°) → wave/wind (721×1440, 0.25°)**. Reproject the ocean grid onto the wave grid (bilinear, clipping to `lat ∈ [−75°, +80°]`) as v1. Simpler than fitting a separate ocean model with cross-grid coupling at OU level (§3.13 escalation).
 
 ### 3.7 Directional variables via `(u, v)` — two transformers, convention in the pipeline
 
@@ -645,8 +654,8 @@ Each `.npy` upcast to `float64` immediately. int8 direction fields decoded via `
 ```python
 def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
     """Guard against upstream archive convention drift (§3.7, §5.1)."""
-    wad = decode_compass_code(load_raw(data_dir, t, "wad"), origin_code=1)
-    wad_from = decode_compass_code(load_raw(data_dir, t, "wad_come_from"), origin_code=1)
+    wad = decode_compass_code(load_raw(data_dir, t, "wad"))
+    wad_from = decode_compass_code(load_raw(data_dir, t, "wad_come_from"))
     diff = np.abs(((wad - wad_from - 180.0 + 180.0) % 360.0) - 180.0)   # min circular distance
     max_dev = float(np.nanmax(diff))
     if max_dev > 5.0:   # tolerance for 22.5° discretization + rounding
@@ -656,11 +665,11 @@ def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
         )
 ```
 
-Log the max deviation on success. Rerun on the last snapshot too — if the archive convention changed *within* the training window, the second check catches it.
+Log the max deviation on success. Rerun on the last snapshot too — if the archive convention changed *within* the training window, the second check catches it. Per `docs/noaa_etl/noaa_transform.md`, `wad` is deterministically derived from `wad_come_from` by a `±180°` transform at ETL transform time, so in the current pipeline this check should always pass; it exists as a guard against a future change to that ETL transform, not as evidence the archive is currently noisy.
 
 **Archive-era consistency check, before any file I/O at all (§2.2.1).** The real archive's grid shape and snapshot cadence are not constant over its full history (§2.2.1, `core.archive_eras.ARCHIVE_ERAS`). Before the wad/wad_come_from check above even runs, `load_training_window` resolves `era_for_timestamp(times[0])` and `era_for_timestamp(times[-1])` and raises `ValueError` immediately if they differ — a cross-era window cannot be loaded into one consistent `Dataset` (shape and/or cadence would differ mid-array). Within a confirmed single-era window, each loaded snapshot's shape is further checked against that era's canonical shape and against the window's own first-loaded shape, so an unexpected shape change (corruption, or an undocumented additional era boundary) fails with a clear diagnostic rather than an opaque numpy broadcast error. `core.io.enumerate_snapshots` is itself era-aware (6-hourly within era 1, 3-hourly within eras 2/3) — it does not reject cross-era windows itself (that stays `load_training_window`'s job), it just enumerates each timestamp at its own era's native cadence.
 
-**Implementation prerequisite: `core/io.py` currently refuses to load `wad_come_from` and `ocd` at all.** `_DIRECTION_ORIGIN_CODES` deliberately omits both (per the v1 design, back when `wad_come_from` was believed to be a redundant duplicate and `ocd`'s convention was unverified), so `load_snapshot` raises `ValueError` for either today. `load_raw` above is *not* `core.io.load_snapshot` — it's a lower-level raw-array read that must be added (or `load_snapshot`'s allowlist extended) before any of §3.7/§5.3's pipeline wiring can run. Add `"wad_come_from": 1` and `"ocd": 1` to `_DIRECTION_ORIGIN_CODES` as part of implementing this section, not as an afterthought.
+**Implementation prerequisite: `core/io.py` currently refuses to load `wad_come_from` and `ocd` at all.** `_DIRECTION_FIELDS` (an allowlist of decodable direction-field names — no per-field origin code needed now that §2.3 established one uniform decode formula) deliberately omits both (per the v1 design, back when `wad_come_from` was believed to be a redundant duplicate and `ocd`'s convention was unverified), so `load_snapshot` raises `ValueError` for either today. `load_raw` above is *not* `core.io.load_snapshot` — it's a lower-level raw-array read that must be added (or `load_snapshot`'s allowlist extended) before any of §3.7/§5.3's pipeline wiring can run. Add `"wad_come_from"` and `"ocd"` to `_DIRECTION_FIELDS` as part of implementing this section, not as an afterthought.
 
 **Gap handling:** missing file → log to stderr, mark NaN. Gap of 24 h+ → abort. Gap 6–24 h → warn.
 
@@ -670,11 +679,16 @@ Log the max deviation on success. Rerun on the last snapshot too — if the arch
 
 ### 5.2 Reprojection (`Reprojector` transformer)
 
-Wind (721 × 1440) and ocean (1121 × 2880) fields resampled to the wave grid (721 × 1440, `lat ∈ [−90°, +90°]`).
+**Corrected (§3.6): wind needs no reprojection.** Wind (`was`, `wad`/`wad_come_from`) is already on the wave grid — same GFS Wave product, same 721 × 1440 array (§2.2) — so `Reprojector` is a no-op pass-through for wind variables. Only ocean (1121 × 2880, HYCOM/RTOFS) fields are actually resampled, onto the 721 × 1440 wave/wind grid (`lat ∈ [−90°, +90°]`).
 
 ```python
 class Reprojector(BaseEstimator, TransformerMixin):
-    """Reproject wind/ocean grids onto the wave grid (§3.6, §5.2)."""
+    """Reproject the ocean grid onto the wave grid (§3.6, §5.2).
+
+    Wind and wave-state variables share the wave grid already (§2.2) and pass
+    through unchanged; only ocean variables (sst, u_current, v_current) are
+    actually resampled.
+    """
     def __init__(self, target_grid: str = "wave") -> None:
         self.target_grid = target_grid
     def fit(self, X: xr.Dataset, y: None = None) -> Self:
@@ -746,8 +760,8 @@ class GoingToToUV(BaseEstimator, TransformerMixin):
 `ComingFromToUV`:
 - `(wsh, wsd, u_wsea, v_wsea)` — tier 1
 - `(was, wad_come_from, u_wind, v_wind)` — tier 1. Source of truth for wind; `wad` is not used.
-- `(pwh, pwd, u_peak, v_peak)` — tier 2 (pending expert verification of `pwd` convention).
-- `(pswh, pswd, u_pswell, v_pswell)` — tier 3 (pending expert verification of `pswd` convention).
+- `(pwh, pwd, u_peak, v_peak)` — tier 2. `pwd`'s `coming_from` convention is confirmed (NCEP/NDBC, §2.3), no longer pending expert verification.
+- `(pswh, pswd, u_pswell, v_pswell)` — tier 3. `pswd`'s `coming_from` convention is confirmed (NCEP/NDBC, §2.3), no longer pending expert verification.
 
 `GoingToToUV`:
 - `(ocs, ocd, u_current, v_current)` — tier 3.
@@ -1230,7 +1244,7 @@ Applied on both windows.
 None of 1-17 specifically exercises tropical cyclones. The held-out metrics window (2026 H1, Jan-Jul) misses North Atlantic hurricane season (peaks Aug-Oct) entirely — it falls in the extrapolation-only window, §6.B, where there's no ground truth. For a maritime-routing consumer this is arguably the highest-stakes season the model needs to get right, so it gets its own pair of checks rather than relying on the generic ones above to catch a problem here incidentally.
 
 **Storm-signature detector (shared by both checks below).** A candidate tropical cyclone, per 3h snapshot, is a contiguous patch of ocean cells in the tropical/subtropical North Atlantic (~8-35°N, 15-100°W) where:
-- `was` ≥ 17 m/s (tropical-storm force) over a minimum contiguous area, co-located with elevated `sigwh` (wave energy ∝ Hs², so this is the "high energy density" criterion).
+- `was` ≥ 34 knots (tropical-storm force) over a minimum contiguous area, co-located with elevated `sigwh` (wave energy ∝ Hs², so this is the "high energy density" criterion). **Units corrected:** per `docs/noaa_etl/noaa_transform.md`, `was` is stored in **knots**, not m/s — the transform chain applies `ms_to_knots` (factor `1.943845249222`) to the raw GRIB `ws` field. A prior version of this doc used a `17 m/s` threshold directly against `was`'s stored (knots) values, which would silently misclassify ordinary wind as tropical-storm force; the standard NHC tropical-storm threshold of 17.2 m/s converts to ≈33.4 kt, rounded to the conventional 34 kt cutoff used here.
 - A coherent cyclonic (positive, NH) vorticity maximum, computed from `(u_wind, v_wind)`, co-located with the patch — the rotational structure that distinguishes an actual cyclone from "it's just windy here," and the specific structure plain EOF+AR can't represent but DMD's complex-conjugate modes should (§3.3's rejection rationale — this check directly stress-tests that choice).
 - Tracked across consecutive snapshots, the patch/vorticity-max centroid persists ≥24h and translates at a physically plausible speed (~10-30 km/h) — the "moving front" criterion, distinguishing a genuine storm from a flickering isolated extreme value.
 
@@ -1669,10 +1683,7 @@ Ordered by expected pain if missed.
 
 4. **Directional interpolation must go through `(u, v)`.** Enforce by running **both** `ComingFromToUV` and `GoingToToUV` **before** `Reprojector` in the Pipeline. Every directional variable must belong to exactly one of the two transformers; nothing should reach `Reprojector` as a raw angle.
 
-5. **Compass code origins AND native conventions both differ per field.**
-   - Origins: `wsd`/`pwd`/`pswd` use code 0 = North (`origin_code=0`); `wad`/`wad_come_from`/`ocd` use code 1 = North (`origin_code=1`).
-   - Conventions: `wsd`/`pwd`/`pswd`/`wad_come_from` are `coming_from`; `wad`/`ocd` are `going_to`.
-   Both are handled by keeping the decoder convention-agnostic (§2.3) and pushing convention handling into the two transformer classes (§3.7, §5.3). Never combine origin and convention decisions in the same function — separation is what prevents entangled bugs.
+5. **All direction fields share one decode formula; only native convention differs per field.** A prior version of this doc claimed two different origin codes (`wsd`/`pwd`/`pswd` = code 0 North; `wad`/`wad_come_from`/`ocd` = code 1 North) — wrong; corrected in §2.3 against `docs/noaa_etl/noaa_transform.md`'s `calculate_16degree`. All six fields decode as `(code % 16) * 22.5`, codes 1–16, sector 16 = North. What genuinely differs per field is only the convention: `wsd`/`pwd`/`pswd`/`wad_come_from` are `coming_from`; `wad`/`ocd` are `going_to`. This is handled by keeping the decoder convention-agnostic (§2.3) and pushing convention handling into the two transformer classes (§3.7, §5.3). Also remember the `-1` missing-value sentinel (§2.3) — mask it out before decoding, in every field, not just the ones you happen to test first.
 
 5a. **`wad` is not read by the pipeline; `wad_come_from` is the source of truth.** Adding a pair `("was", "wad", ...)` to `GoingToToUV` would produce mathematically valid samples but bypass the point of using `wad_come_from` (to avoid a flip that might drift). The runtime `wad`/`wad_come_from` consistency check (§5.1) exists to catch upstream drift; do not remove it as "unnecessary." If it ever fails, that's the signal — not a false alarm — that the archive convention changed.
 
@@ -1719,26 +1730,26 @@ Ordered by expected pain if missed.
 
 ## 10. Variable table
 
-Directions decoded per §2.3 (origin code) then handled by the appropriate transformer per §5.3 (native convention). The "Modeled as" column shows the final internal representation after preprocessing.
+Directions decoded per §2.3 (one uniform formula, `(code % 16) * 22.5`) then handled by the appropriate transformer per §5.3 (native convention). The "Modeled as" column shows the final internal representation after preprocessing. **Grid and origin-code columns corrected against `docs/noaa_etl/noaa_transform.md`**: `wave` and `wind` are the same GFS Wave grid (§2.2), not two grids, and there is no per-field origin code (§2.3) — all direction fields use code range 1–16.
 
-| File            | Meaning                            | On-disk dtype | Grid  | Origin | Native conv.   | Transformer         | Modeled as                                 | Tier |
-|-----------------|------------------------------------|---------------|-------|--------|----------------|---------------------|--------------------------------------------|------|
-| `sigwh.npy`     | Significant wave height            | float16       | wave  | —      | —              | (pass-through)      | scalar                                     | 1    |
-| `wsh.npy`       | Wind-sea wave height               | float16       | wave  | —      | —              | (pass-through)      | scalar                                     | 1    |
-| `wsp.npy`       | Wind-sea period                    | float16       | wave  | —      | —              | (pass-through)      | scalar                                     | 1    |
-| `wsd.npy`       | Wind-sea direction                 | int8 (0–15)   | wave  | 0      | `coming_from`  | `ComingFromToUV`    | paired with `wsh` → `(u_wsea, v_wsea)`     | 1    |
-| `was.npy`       | Wind speed at surface              | float16       | wind  | —      | —              | (pass-through)      | scalar                                     | 1    |
-| `wad_come_from.npy` | Wind direction, coming from    | int8 (1–16)   | wind  | 1      | `coming_from`  | `ComingFromToUV`    | paired with `was` → `(u_wind, v_wind)`     | 1    |
-| `wad.npy`       | Wind direction, going to           | int8 (1–16)   | wind  | 1      | `going_to`     | (consistency check only, §5.1) | **not modeled** — raw codes are `wad_come_from` shifted 180° (0% cell-identical; *not* a duplicate); same wind vector, opposite convention | 1    |
-| `pwh.npy`       | Peak wave height                   | float16       | wave  | —      | —              | (pass-through)      | scalar                                     | 2    |
-| `pwp.npy`       | Peak wave period                   | float16       | wave  | —      | —              | (pass-through)      | scalar                                     | 2    |
-| `pwd.npy`       | Peak wave direction                | int8 (0–15)   | wave  | 0      | `coming_from` *(pending expert confirm)* | `ComingFromToUV` | paired with `pwh` → `(u_peak, v_peak)` | 2    |
-| `sst.npy`       | Sea surface temperature            | float16       | ocean | —      | —              | (pass-through, verify units K/°C) | scalar                              | 2    |
-| `pswh.npy`      | Primary swell height               | float16       | wave  | —      | —              | (pass-through)      | scalar                                     | 3    |
-| `pswp.npy`      | Primary swell period               | float16       | wave  | —      | —              | (pass-through)      | scalar                                     | 3    |
-| `pswd.npy`      | Primary swell direction            | int8 (0–15) assumed | wave | 0 assumed | `coming_from` *(pending expert confirm)* | `ComingFromToUV` | paired with `pswh` → `(u_pswell, v_pswell)` | 3 |
-| `ocs.npy`       | Ocean current speed                | float16       | ocean | —      | —              | (pass-through)      | scalar                                     | 3    |
-| `ocd.npy`       | Ocean current direction            | int8 (1–16)   | ocean | 1 (same as `wad`) | `going_to` *(pending §2.7 ocean-grid verification)* | `GoingToToUV` | paired with `ocs` → `(u_current, v_current)`; no `ocd_come_from` sibling exists | 3    |
+| File            | Meaning                            | On-disk dtype | Units    | Source grid | Native conv.   | Transformer         | Modeled as                                 | Tier |
+|-----------------|------------------------------------|---------------|----------|-------------|----------------|---------------------|--------------------------------------------|------|
+| `sigwh.npy`     | Significant wave height            | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 1    |
+| `wsh.npy`       | Wind-sea wave height                | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 1    |
+| `wsp.npy`       | Wind-sea period                    | float16       | s        | GFS Wave    | —              | (pass-through)      | scalar                                     | 1    |
+| `wsd.npy`       | Wind-sea direction                 | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | paired with `wsh` → `(u_wsea, v_wsea)`     | 1    |
+| `was.npy`       | Wind speed at surface              | float16       | **knots** | GFS Wave   | —              | (pass-through)      | scalar                                     | 1    |
+| `wad_come_from.npy` | Wind direction, coming from    | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — raw `wdir`) | `ComingFromToUV`    | paired with `was` → `(u_wind, v_wind)`     | 1    |
+| `wad.npy`       | Wind direction, going to           | int8 (1–16)   | —        | GFS Wave    | `going_to` (deliberate ±180° flip of `wad_come_from`) | (consistency check only, §5.1) | **not modeled** — raw codes are `wad_come_from` shifted 180° (0% cell-identical; *not* a duplicate); same wind vector, opposite convention | 1    |
+| `pwh.npy`       | Peak wave height                   | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 2    |
+| `pwp.npy`       | Peak wave period                   | float16       | s        | GFS Wave    | —              | (pass-through)      | scalar                                     | 2    |
+| `pwd.npy`       | Peak wave direction                | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | paired with `pwh` → `(u_peak, v_peak)` | 2    |
+| `sst.npy`       | Sea surface temperature            | float16       | verify K/°C (no conversion applied by the ETL) | Ocean (HYCOM/RTOFS) | —              | (pass-through)      | scalar                              | 2    |
+| `pswh.npy`      | Primary swell height               | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 3    |
+| `pswp.npy`      | Primary swell period               | float16       | s        | GFS Wave    | —              | (pass-through)      | scalar                                     | 3    |
+| `pswd.npy`      | Primary swell direction            | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | paired with `pswh` → `(u_pswell, v_pswell)` | 3 |
+| `ocs.npy`       | Ocean current speed                | float16       | **knots** | Ocean (HYCOM/RTOFS) | —              | (pass-through)      | scalar                                     | 3    |
+| `ocd.npy`       | Ocean current direction            | int8 (1–16)   | —        | Ocean (HYCOM/RTOFS) | `going_to` (confirmed — NDBC ocean-current convention, derived from `atan2(u, v)` on native HYCOM velocity, independent of grid orientation, §2.3/§2.7) | `GoingToToUV` | paired with `ocs` → `(u_current, v_current)`; no `ocd_come_from` sibling exists | 3    |
 
 ---
 
@@ -1786,8 +1797,8 @@ A tagged v0.1.0 release providing:
 3. The public API from §8.4, with docstrings and full type hints.
 4. Green CI on Python 3.14: `black --check src/ tests/`, `isort --check-only src/ tests/`, `mypy --strict src/`, `pytest --cov=src` (coverage ≥ 85%).
 5. Unit test coverage:
-   - `tests/core/test_io.py::test_wsd_compass_codes` — known code → degree pairs (§2.3).
-   - `tests/core/test_io.py::test_wad_compass_codes` — 1-indexed origin.
+   - `tests/core/test_io.py::test_direction_decode_uniform_formula` — known code → degree pairs for all six direction fields against the single `(code % 16) * 22.5` formula (§2.3); confirms `wsd`/`pwd`/`pswd`/`wad`/`wad_come_from`/`ocd` all decode identically.
+   - `tests/core/test_io.py::test_direction_decode_missing_sentinel` — `-1` raises/is masked, not silently decoded to `337.5°` (§2.3).
    - `tests/train/test_directional.py::test_cardinal_signs` (ComingFromToUV) — four `θ_from ∈ {0°, 90°, 180°, 270°}` cases from §2.4 (coming-from table). **Load-bearing.**
    - `tests/train/test_directional.py::test_uv_roundtrip` (ComingFromToUV) — `(speed, θ_from) → (u, v) → (speed', θ_from')` reproduces input within `1e-10`.
    - `tests/train/test_directional.py::test_inverse_transform_returns_native_convention` (ComingFromToUV) — inversion reconstructs `θ_from` (not `θ_to`), matching archive.
@@ -1826,8 +1837,7 @@ A tagged v0.1.0 release providing:
 6. Grid convention verification tests, required only if the corresponding tier is enabled:
    - `tests/core/test_grid_wave.py::test_row0_is_south`.
    - `tests/core/test_grid_ocean.py::test_orientation` — required before enabling `sst`/`ocs`/`ocd`. Evidence comes from `notebooks/verify_ocean_grid_orientation.ipynb` (§2.7 TASK — not yet started); do not write this test (or any ocean-grid pipeline code) before that notebook exists and passes its ≥85%/≤60% thresholds.
-   - `tests/train/test_directional.py::test_pwd_convention_expert_verified` — required before enabling `pwd` (tier 2).
-   - `tests/train/test_directional.py::test_pswd_convention_expert_verified` — required before enabling `pswd` (tier 3).
+   - `pwd`/`pswd` convention is now confirmed against NOAA's own NCEP GRIB2 Code Table 4.2-0-2 and NDBC documentation (§2.3, via `docs/noaa_etl/noaa_transform.md`), so the `test_pwd_convention_expert_verified` / `test_pswd_convention_expert_verified` gating tests a prior version of this doc required are no longer blocking — write ordinary regression tests (e.g. `tests/train/test_directional.py::test_pwd_pswd_cardinal_signs`, reusing §2.4's coming-from cardinal-direction cases) instead of a "pending confirmation" gate.
 7. Integration tests (marked `@pytest.mark.integration`):
    - `tests/weather/test_integration.py::test_end_to_end_marginal_fit` — trains on 3 months of synthetic archive data, simulates 1 month of overlapping period, asserts per-cell mean and std within 10% of held-out truth.
    - `tests/weather/test_integration.py::test_extrapolation_no_drift` — trains on 3 months, extrapolates 6 months past the training end (no ground truth), asserts per-cell simulated mean over the extrapolation window is within 3σ of the seasonal expectation from the fitted climatology. Guards against runaway DMD modes (`Re(lam_cont) > 0`) that would produce unbounded growth on long extrapolation.
