@@ -1,5 +1,5 @@
 # Data and trained models — never versioned
-data/
+data
 models/
 reports/
 cache/
