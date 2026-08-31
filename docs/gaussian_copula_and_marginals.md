@@ -426,6 +426,19 @@ $$
 No other variable, and no flattened reshaping of this tensor, ever enters
 the fit or transform for $v$.
 
+**Composes independently with the `log` pre-transform.** For height/period
+variables, `variable_taxonomy.md` §3.4 applies a `log` transform ($\log E$,
+$T$) *before* this document's machinery runs, regardless of which
+placement (i/ii/iii, §6.1) is chosen for Gaussianization itself — "where
+along the chain Gaussianization sits" and "whether a physical `log`
+pre-transform happens at the very start" are independent design axes. In
+particular, this does not weaken the case for Gaussianization: rank-based
+Gaussianization (empirical CDF → inverse-normal) is invariant to any
+strictly monotonic pre-transform of its own input, so `log`'s only effect
+here is on what $X_v$ numerically *is* by the time it reaches whichever
+stage is chosen — it changes nothing about this section's fit/transform
+mechanics themselves.
+
 **Fit.** Compute, for a chosen set of bin probabilities $p_0,\ldots,p_{n_{\text{bins}}-1}$,
 $$
 \text{LUT}_v[k, i, j] = \widehat{F_{v,i,j}}^{-1}(p_k),

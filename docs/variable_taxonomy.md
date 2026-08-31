@@ -102,7 +102,14 @@ distinct classes:
 |---|---|---|---|
 | **(A) Pure scalar** | `sigwh`, `sst` | 1 | Magnitude only — no direction, no period |
 | **(B) Vector** | `was`+`wad_come_from` (wind); `ocs`+`ocd` (current) | 2 | Magnitude + direction, no period |
-| **(C) Triplet** | `wsh`/`wsd`/`wsp` (wind-sea); `pwh`/`pwd`/`pwp` (peak wave); `pswh`/`pswd`/`pswp` (primary swell) | 3 | Magnitude(height) + direction + period, all three derived from one directional spectrum |
+| **(C) Triplet** | `wsh`/`wsd`/`wsp` (wind-sea); `pwh`\*/`pwd`/`pwp` (peak wave); `pswh`/`pswd`/`pswp` (primary swell) | 3 (2 for peak wave — see \*) | Magnitude(height) + direction + period, all three derived from one directional spectrum |
+
+\* **`pwh` is not an independent measurement — see §3.3.** It is a literal
+byte-for-byte duplicate of `sigwh` at the ETL level, confirmed both in
+`noaa-etl`'s own transform table and in NOAA's official GRIB2 parameter
+definitions (there is no "primary wave height" field to begin with — only
+`DIRPW`/`PERPW`). The "peak wave" row genuinely contributes 2 independent
+degrees of freedom (direction, period), not 3.
 
 The classification is not cosmetic. It determines which quantities may be
 treated as ordinary real numbers (heights, periods, sst) and which are
@@ -232,16 +239,48 @@ and this archive) sidestep the order-statistic derivation and instead
 $$
 H_{m0} \;:=\; 4\sqrt{m_0},
 $$
-which is what `sigwh`, `wsh`, `pwh`, and `pswh` report. This is why a
-partition's height is fundamentally a functional of the *whole* spectrum
-restricted to that partition's support — an $L^2$-type norm, not a
-"typical wave" measurement.
+which is what `sigwh`, `wsh`, and `pswh` report — each computed from its
+own partition's (or the combined spectrum's) $m_0$. `pwh` is the one
+exception: it reports `sigwh`'s value verbatim rather than an independent
+$H_{m0}$ computed over a "peak wave" partition's own support, because no
+such NOAA-defined field exists to compute it from (§3.3 explains why).
+This is why a partition's height is fundamentally a functional of the
+*whole* spectrum restricted to that partition's support — an $L^2$-type
+norm, not a "typical wave" measurement — for every field in this list
+except `pwh`.
 
-**Peak period, $T_p$.** Let $E(f) = \int_0^{360°} S(f,\theta)\,d\theta$ be
-the (direction-integrated) 1D frequency spectrum. The peak frequency is
-$f_p = \arg\max_f E(f)$, and $T_p = 1/f_p$. (Other period statistics exist
-— e.g. mean period $T_{m01} = m_0/m_1$ — but this archive's `*p` fields
-are peak periods.)
+**Correction: mean period, $T_{m01}$ — not peak period.** An earlier
+version of this section claimed this archive's `*p` fields are peak
+periods, $T_p = 1/f_p$ where $f_p = \arg\max_f E(f)$ is the single
+frequency at which the direction-integrated spectrum $E(f) =
+\int_0^{360°}S(f,\theta)\,d\theta$ is largest. **That is wrong**, checked
+directly against source and NOAA documentation rather than assumed from
+field naming. `noaa-etl`'s `gfs_transform.py` derives this archive's three
+period fields from GRIB `shortName`s `mpww` → `wsp`, `perpw` → `pwp`,
+`mpts` → `pswp`. Cross-checked against NCEP's own
+[GRIB2–GRIB1 parameter conversion table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/GRIB2_parmeter_conversion_table.html),
+these are explicitly named **"Mean period of wind waves"** (GRIB2
+10-0-6), **"Primary wave mean period"** (10-0-11), and **"Mean period of
+total swell"** respectively — distinct, separately-numbered parameters
+from NOAA's own "Peak Wave Period"/"Peak Period of Wind Waves"/"Peak
+Period of Total Swell" family, which this archive's ETL never reads at
+all. The physical quantity these mean-period fields report, confirmed
+against [WAVEWATCH III's own user manual](https://polar.ncep.noaa.gov/waves/wavewatch/manual.v5.16.pdf)
+and standard oceanographic convention, is
+
+$$T_{m01} = \frac{m_0}{m_1},$$
+
+the ratio of the zeroth and first spectral moments — an energy-weighted
+*mean* frequency across the whole partition's spectrum, inverted. This is
+a materially different statistic from $T_p = 1/f_p$: $T_{m01}$ is pulled
+toward wherever the bulk of spectral energy sits, while $T_p$ tracks only
+the single largest bin. The two coincide only in the idealized limit of an
+infinitely narrow spectral peak; for a broad or multi-modal spectrum
+(routine for a combined or swell-dominated sea state) they can diverge
+meaningfully. Every downstream use of "period" in this document series
+should be read as $T_{m01}$, not $T_p$ — this has concrete consequences
+for `physical_consistency_constraints.md` §2.3 and `correlated_variables.md`
+§3.3, both corrected alongside this document.
 
 **Mean/peak direction — and its tie back to §2.1.** The mean direction of
 a spectrum (or a partition of one) is *itself* a circular-mean problem,
@@ -352,6 +391,18 @@ a linear decomposition or spatial interpolation can safely act on. Speed
 is recoverable exactly at any point via `hypot(u, v)` (§2.1); it need not
 be separately retained.
 
+**Open question, not resolved here: should a `log`-magnitude tensor be
+added alongside `u, v` for this class too, mirroring §3.3's resolution for
+Class C heights?** §3.3 below adds an explicit `log`-transformed magnitude
+tensor for wave heights, both to tame Tucker/DMD's sensitivity to a wide,
+right-skewed dynamic range and to serve as an authoritative,
+`hypot`-reconstruction-bias-free magnitude source. Wind speed (`was`) is
+plausibly heavy-tailed enough for the same argument to apply; current
+speed (`ocs`) plausibly is not — it has a much narrower physical dynamic
+range, and whether the same treatment earns its keep here is genuinely
+unclear rather than assumed. Left open (§6) pending the same kind of
+archive-specific check §3.3's resolution was based on.
+
 ### 3.3 Class (C) — full triplet (height + direction + period)
 
 One triplet per WAVEWATCH III partition of the same underlying $S(f,\theta)$:
@@ -369,13 +420,54 @@ same empirical trade-wind / westerlies check that settled `wad` vs.
 which tests `was`/`wad`, `wsh`/`wsd`, and `ocd`, but not `pwd`/`pswd`
 directly). Treat this as an open item (§6), not a settled fact.
 
+**Correction: `pwh` is not a genuine height measurement of a "peak wave"
+partition — it is `sigwh` restated.** This is not an approximation or a
+naming quirk; it is a hard identity at the ETL level. Two independent
+lines of evidence confirm it:
+
+1. **Source-code level.** `noaa-etl`'s `gfs_transform.py` contains two
+   separate `VARIABLE_TRANSFORMATION` entries that both read GRIB
+   `shortName: "swh"` and apply the *identical* transform chain
+   (`[flip_latitude, round_2]`) — one producing `sigwh`, the other `pwh`.
+   They are the same array on disk, not two measurements that happen to
+   agree.
+2. **NOAA-documentation level (checked independently of the code, per the
+   user's request to verify this against the authoritative source rather
+   than trust the ETL alone).** NCEP's own GRIB2 parameter table
+   ([Table 4.2-10-0, "Oceanographic — Waves"](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-10-0.shtml))
+   defines `DIRPW` ("Primary Wave Direction") and `PERPW` ("Primary Wave
+   Mean Period") as real, independent parameters — but defines **no
+   corresponding height parameter** anywhere in the table. Every other
+   height in this archive traces to a real NOAA height field (`HTSGW` →
+   `sigwh`, `WVHGT` → wind-sea height, numbered swell-partition heights →
+   `pswh`); `pwh` cannot, because NOAA never defined a "primary wave
+   height" field for it to come from. Reusing `sigwh`/`HTSGW`'s value for
+   `pwh` was very likely a naming-compatibility stand-in for a field that
+   structurally does not exist upstream, not an ETL bug or a coincidence.
+
+**Consequence for this taxonomy.** The "peak wave" row of the Class (C)
+table above is not a genuine 3-DOF triplet the way wind-sea and primary
+swell are. `pwd` and `pwp` are independent, real fields (`DIRPW`,
+`PERPW`); `pwh` carries zero information beyond what `sigwh` (Class A)
+already provides. Any downstream stage that treats `pwh` as an independent
+observable — e.g. summing it in quadrature against `wsh`/`pswh` as though
+it were a third, disjoint partition height (§6, and see
+`docs/physical_consistency_constraints.md`'s energy-budget constraint,
+corrected alongside this document) — is double-counting `sigwh`. The
+correct treatment is to keep `pwd`/`pwp` as the genuinely independent
+members of this group, and treat `pwh` as redundant with the Class (A)
+`sigwh` tensor that already exists — not as this triplet's own height.
+
 As derived in §2.2, height/period/direction of one partition are three
 different functionals of the *same* $S(f,\theta)$ restricted to that
 partition's support — not three independent draws. The representation
 should reflect that coupling as far as the tensor design allows:
 
-- **Period** ($T_p$) is an ordinary positive scalar — never circular —
-  and stays its own scalar tensor.
+- **Period is `log`-transformed before it becomes a tensor: $T := \log
+  T_{m01}$, not raw $T_{m01}$.** $T_{m01}$ is an ordinary positive
+  scalar — never circular — but is left in raw units nowhere in this
+  design; see the new subsection below for why, and for the matching
+  height treatment.
 - **Height and direction are embedded jointly**, exactly as in §3.2's
   vector case but using the partition's height as the magnitude:
 $$
@@ -388,20 +480,186 @@ $$
   height-scaled direction vector shrinks toward the origin exactly when
   a partition carries negligible energy on a given day, which is also
   when its direction estimate is least meaningful — a desirable property,
-  not an accident). $H$ is recovered exactly via `hypot(u_dir, v_dir)`
-  and need not be separately retained, by the same argument as §3.2.
+  not an accident, and one a plain unit-direction vector would lose — so
+  this embedding is kept magnitude-scaled, not switched to a unit vector,
+  despite the redundancy the next point introduces).
 
-  *Caveat for later documents:* if $u_{\text{dir}}$ and $v_{\text{dir}}$
-  are independently low-rank-approximated (as Error 2 requires — each is
-  its own tensor), `hypot` of the two *reconstructions* is only an
-  approximation to a directly-decomposed $H$, since low-rank
-  approximation does not commute with a nonlinear map like `hypot`. Note
-  this as an open question for the Tucker document (§6) rather than
-  resolving it here.
+  **Resolved (was an open caveat for the Tucker document): a fourth
+  tensor, $\log E := 2\log H = \log(H^2)$, is the authoritative source for
+  reconstructing $H$ — not `hypot(u_dir, v_dir)`.** The caveat this
+  section previously left open — that `hypot` of two independently
+  low-rank-approximated reconstructions is only an approximation to a
+  directly-decomposed $H$, since low-rank approximation does not commute
+  with a nonlinear map like `hypot` — is resolved by retaining $\log E$ as
+  its own, separately Tucker-fit tensor, and reconstructing $H =
+  \exp(\log E/2)$ from *its own* compressed reconstruction rather than
+  from `hypot`'s biased combination of two others. See the new subsection
+  below for the full justification (why `log`, not raw $H$) and for why
+  this is worth the resulting redundancy (`hypot(u_dir,v_dir)` and
+  $\exp(\log E/2)$ now both estimate $H$, and are expected to disagree
+  slightly after independent low-rank compression — by design, use the
+  $\log E$-derived value).
 
-Per triplet, this produces **3 tensors**: $T_p$, $u_{\text{dir}}$,
-$v_{\text{dir}}$ — replacing the 3 raw archived fields (height, direction,
-period) one-for-one in count, but not in kind.
+Per triplet, this produces **4 tensors**: $\log E$, $T$ ($=\log T_{m01}$),
+$u_{\text{dir}}$, $v_{\text{dir}}$ — one more than the 3 raw archived
+fields (height, direction, period), the added tensor being the price of
+an unbiased magnitude-reconstruction path. For the peak-wave triplet
+specifically, no separate $\log E$ tensor is created: `pwh` is `sigwh`
+restated (above), so the Class-A `sigwh` tensor's own $\log E$ (added
+alongside it, per the subsection below) already serves as the
+authoritative height source for reconstructing `pwh` too — creating one
+would just be `sigwh`'s $\log E$ under a different name.
+
+### 3.3.1 Partition-absence NaN is not land/ice NaN
+
+**Finding (task 17, 2026-08-20), real archive data, `sigwh`-derived land
+mask, 6-month window, 280×230 South Pacific crop (64,400 ocean cells,
+1,448 timesteps):** every prior mention of NaN in this archive's wave
+fields (§0, §4 below; `docs/model_design.md:308,313,315`) treats it purely
+as a land/ice signal. For the partition triplets, NaN also occurs at
+genuine ocean cells whenever that specific partition simply isn't present
+— a real physical "no partition" state, not missing data. Categorized
+directly against an authoritative, variable-independent land mask (derived
+from `sigwh`'s own NaN pattern — `sigwh` is an aggregate, NaN only over
+land/ice — via `train.masking.land_mask_from_sigwh`, not from each
+variable's own NaN pattern, which conflates the two causes):
+
+| Variable | Ocean NaN fraction | Cells always-valid @ 100%/90%/70% time |
+|---|---|---|
+| `wsh` | 36.5% | 0.0% / 1.3% / 35.8% |
+| `wsp` | 36.5% (identical to `wsh`) | 0.0% / 1.3% / 35.8% |
+| `wsd` | **0.0%** | 100% / 100% / 100% |
+| `pwd` | 0.0% | 100% / 100% / 100% |
+| `pwp` | 0.0% | 100% / 100% / 100% |
+| `pswh` | 1.5% | 70.7% / 94.5% / 100% |
+| `pswp` | 1.5% (identical to `pswh`) | 70.7% / 94.5% / 100% |
+| `pswd` | 0.0% | 100% / 100% / 100% |
+
+(`pwh` excluded — degenerate/`sigwh` restated, §3.3.)
+
+**No-ocean-NaN group: all three direction fields (`wsd`, `pwd`, `pswd`)
+and the peak-partition period (`pwp`).** **Has-ocean-NaN group: both
+height/period pairs for the two "sometimes-absent" partitions** (wind-sea
+`wsh`/`wsp`; primary swell `pswh`/`pswp`, less severely). `wsh`/`wsp`'s
+identical fractions, and `pswh`/`pswp`'s identical fractions, confirm
+height and period go NaN together exactly, as expected — both are
+computed from the same partition's spectral moments (§2.2), and both
+vanish together when the partition is absent.
+
+**A genuine asymmetry, checked directly rather than assumed:** `wsd` is
+NaN 0% of the time even at cells/timesteps where `wsh` is NaN — but this
+is not a stale/backfilled filler value either
+(`train.masking.partition_companion_backfill_check`, same window):
+`wsd`'s variance during `wsh`-NaN periods (std ≈ 74.5°) is *higher*, not
+collapsed toward zero, than during `wsh`-valid periods (std ≈ 55.3°). A
+frozen filler would show near-zero variance during the gap; this doesn't.
+The archive most likely reports *some* actively-varying wind-sea direction
+value (plausibly derived from `wad`, wind direction, which has no NaN at
+all — §3.2) even when no wind-sea partition is detected, but confirming
+that exact mechanism needs a direct `wsd`-vs-`wad` correlation check, not
+yet performed — treat as a real, open data-provenance question, not a
+resolved one.
+
+**Sentinel policy** (decided, `tasks/17-partition-nan-sentinel-policy.md`
+§1, notebook/`src/train/masking.py`-scoped only — not yet wired into
+production): at a has-ocean-NaN cell, height gets sentinel `H=0` (the
+clean physical limit as $m_0\to0$, marked VALID); the corresponding
+`log E` uses a floored transform (`train.masking.height_log_energy`,
+floor `H_FLOOR_M=0.01`, i.e. 1cm — real archive data in this window never
+goes below 5cm, so the floor sits comfortably outside the real range, not
+overlapping it) rather than `log(0)=-inf`. Period has no analogous clean
+limit ($T_{m01}=m_0/m_1$ is $0/0$ as both moments vanish); see §5.6 for
+its data-derived placeholder. Direction needs no independent sentinel —
+the `(u_dir, v_dir)` embedding (§3.3 above) already shrinks to `(0,0)`
+once height's sentinel is 0, regardless of `wsd`'s own value.
+
+See `docs/open_questions.md` §5.6 for the full derivation and the
+still-open production-wiring follow-on.
+
+### 3.4 The `log`-transform convention for heights and periods
+
+**Statement.** Every height-type field in this archive (`sigwh`, `wsh`,
+`pswh` — Class A/C heights; excluding the degenerate `pwh`, §3.3) is
+represented downstream not just via its magnitude-scaled direction
+embedding (Class C) but by an additional tensor $\log E := \log(H^2) =
+2\log H$. Every period field (`wsp`, `pwp`, `pswp`, i.e. $T_{m01}$, §2.2)
+is represented as $T := \log T_{m01}$, not raw $T_{m01}$. `sst` (Class A,
+not a wave-energy quantity) is explicitly **excluded** — nothing below
+applies to it.
+
+**Floor/epsilon gap (surfaced and resolved by task 17, §3.3.1 above):**
+this convention as originally stated never specified what happens at
+$H=0$ (`log(0)=-inf`) — latent for any genuine calm-sea observation, and
+load-bearing once §3.3.1's sentinel policy deliberately introduces `H=0`
+at partition-absent cells. `train.masking.height_log_energy` floors
+before logging (`H_FLOOR_M=0.01`); no equivalent floor is needed or
+attempted for $T$'s $\log$, since $T_{m01}=m_0/m_1$'s own indeterminacy at
+the partition-absent limit means the raw sentinel there is never `0` to
+begin with (§5.6).
+
+**Why `log`, not raw units.** Two independent justifications, one
+statistical and one physical, both pointing the same direction:
+
+1. **Dynamic range and least-squares leverage.** `sigwh`-class heights
+   plausibly span roughly two orders of magnitude across the archive
+   (calm partitions a few centimeters, storm partitions several meters;
+   $H^2$, closer to the physically fundamental energy quantity, spans
+   correspondingly more). Every downstream linear stage that touches this
+   tensor before Gaussianization — Tucker's HOSVD/HOOI, harmonic
+   climatology's per-cell regression (`harmonic_climatology.md`), DMD's
+   snapshot-matrix least-squares fit — is an L2-optimal method whose
+   objective is dominated quadratically by the largest-magnitude points in
+   the data. Left in raw units, a handful of storm snapshots would
+   dominate what each of these fits considers "signal," at the expense of
+   correctly representing typical conditions. `log` compresses this range
+   before any of those stages ever see the data.
+2. **Fetch/duration-limited growth is a power law, and `log` linearizes
+   it.** Classical JONSWAP-type fetch-limited growth curves
+   (`physical_consistency_constraints.md` §2.2, `correlated_variables.md`
+   §2) describe both $H_s$ and the spectrum's characteristic period as
+   power laws in fetch $F$ (roughly $H_s\propto F^{1/2}$, period $\propto
+   F^{1/3}$) — genuinely multiplicative growth, not additive. `log`
+   converts multiplicative growth into additive/linear growth, which is
+   the natural coordinate system for any of the linear stages above to
+   operate in. This also explains, rather than just observes, why
+   period's natural dynamic range is narrower than height's: a smaller
+   growth exponent means a smaller multiplicative range for the same
+   spread of fetch/duration values encountered archive-wide — so `log`'s
+   benefit for period is real but smaller than for height, proportionally
+   to that difference in exponent.
+
+Both justifications are independent of, and unaffected by, whether a
+group's channels are ever jointly (rather than independently) decomposed
+— that is `correlated_variables.md` §6's separate, still-open question;
+this `log` convention is a per-variable marginal transform, compatible
+with strictly independent per-variable Tucker fits (`tucker_decomposition.md`
+§4.1) exactly as much as with a joint one.
+
+**Correction, at the query-time end of the pipeline: reconstruct $H =
+\exp(\log E/2)$, never $\sqrt{u_{\text{dir}}^2+v_{\text{dir}}^2}$.** Once
+`log E`'s own compressed reconstruction is available, it is the
+authoritative source of magnitude — not `hypot` of the two independently
+low-rank-approximated direction components, which (a) inherits whatever
+bias each of those two *separate* compressions introduces, compounded, and
+(b) is a nonlinear function applied *after* two independent lossy
+approximations, which does not commute with those approximations having
+been optimized in $u,v$-space rather than $H$-space. `sample_batch`/`sample`
+(`src/weather/simulate.py`) and any physical-consistency check downstream
+(`physical_consistency_constraints.md`) should read $H$ from $\exp(\log
+E/2)$, using $u_{\text{dir}}, v_{\text{dir}}$ only for `atan2`-based
+direction. Symmetrically, $T_{m01} = \exp(T)$ on reconstruction.
+
+**Where this sits relative to other pipeline stages.** The `log` transform
+is a pre-transform on physical-unit fields, applied before harmonic
+climatology removal (`harmonic_climatology.md`) — that document's own
+worked examples currently list raw `wsp` as a fitted tensor; read those as
+$T=\log(\text{wsp})$ under this correction, since the climatology
+regression is itself an L2 fit and benefits from the same dynamic-range
+argument above. It is applied before Gaussianization under every
+placement `gaussian_copula_and_marginals.md` §6.1 considers (i/ii/iii) —
+those placements are about *where along the chain* Gaussianization sits,
+not whether a physical `log` pre-transform happens first; the two
+questions compose independently.
 
 ---
 
@@ -426,7 +684,12 @@ variable set defined in §3:
   builds `ocean_mask`, and handled by mask-aware imputation inside
   whatever decomposition consumes the tensor (that notebook's
   `partial_tucker(mask=...)` pattern) — never by raveling `(lat, lon)`
-  into a single masked/dropped axis.
+  into a single masked/dropped axis. **Caveat (§3.3.1):** for the
+  partition triplets, a variable's *own* NaN pattern is not equivalent to
+  land/ice — it also fires at genuine ocean cells whose partition is
+  simply absent. This bullet's "boolean mask per grid" still describes
+  land/ice correctly; deriving that mask from the *right* variable
+  (`sigwh`, not the partition variable itself) is what §3.3.1 fixes.
 - No field's `(lat, lon, time)` tensor is ever reshaped to `(lat*lon, time)`,
   `(lat, lon*time)`, or any other 2D collapse for decomposition purposes.
   Elementwise, per-cell-independent vectorized operations (e.g. the
@@ -453,14 +716,30 @@ inventory, applying §3's rules to the archive's raw variables:
 
 | Source class | Raw fields | Tensors produced | Count |
 |---|---|---|---|
-| (A) | `sigwh` | `sigwh` | 1 |
-| (A) | `sst` | `sst` | 1 |
+| (A) | `sigwh` | $\log E_{\text{sigwh}} := \log(\text{sigwh}^2)$ | 1 |
+| (A) | `sst` | `sst` (no `log` transform — §3.4 excludes it) | 1 |
 | (B) | `was`, `wad_come_from` | `u_wind`, `v_wind` | 2 |
 | (B) | `ocs`, `ocd` | `u_current`, `v_current` | 2 |
-| (C) | `wsh`, `wsd`, `wsp` | `wsp`, `u_wsea`, `v_wsea` | 3 |
-| (C) | `pwh`, `pwd`, `pwp` | `pwp`, `u_pwave`, `v_pwave` | 3 |
-| (C) | `pswh`, `pswd`, `pswp` | `pswp`, `u_pswell`, `v_pswell` | 3 |
-| **Total** | 15 meaningful raw fields (`wad` decoy excluded) | | **15 independent tensors** |
+| (C) | `wsh`, `wsd`, `wsp` | $\log E_{\text{wsh}}$, $T_{\text{wsp}}(=\log\text{wsp})$, `u_wsea`, `v_wsea` | 4 |
+| (C) | `pwh`\*, `pwd`, `pwp` | $T_{\text{pwp}}(=\log\text{pwp})$, `u_pwave`, `v_pwave` | 3 |
+| (C) | `pswh`, `pswd`, `pswp` | $\log E_{\text{pswh}}$, $T_{\text{pswp}}(=\log\text{pswp})$, `u_pswell`, `v_pswell` | 4 |
+| **Total** | 15 meaningful raw fields (`wad` decoy excluded) | | **17 independent tensors** |
+
+\* `pwh` (≡ `sigwh`, see §3.3) is still the true (uncompressed) magnitude
+used to construct `u_pwave`/`v_pwave`'s embedding at tensor-construction
+time — that step happens before any Tucker compression, so no
+reconstruction-bias issue arises there. `pwh`'s triplet gets no separate
+$\log E$ tensor of its own (§3.3/§3.4): at *reconstruction* time, `sigwh`'s
+own $\log E_{\text{sigwh}}$ tensor is the authoritative height source for
+`pwh` too, not a new one. `pwd` and `pwp` are still real, independent
+fields requiring their own tensors — but `u_pwave`/`v_pwave` should not be
+read as carrying independent peak-wave-height information.
+
+**Tensor count went from 15 to 17** relative to the previous revision of
+this table: `wsh` and `pswh` each gained a dedicated $\log E$ tensor
+(§3.3/§3.4); `sigwh`'s own tensor is a `log`-transform of its existing
+content, not a new tensor; every period tensor's *content* changed
+(`log`-transformed) without changing the *count*.
 
 Every one of the 15 tensors has shape `(lat, lon, time)` on its native
 grid (wave/wind: `(721,1440,T)`; ocean: `(1121,2880,T)`), shares its
@@ -501,27 +780,50 @@ single `(lat, lon, time)` tensor and nothing more.
   partition's height, period, and direction are correlated functionals of
   one spectrum (e.g. wave-growth/fetch relations link height and period;
   JONSWAP-type peakedness links height and spectral shape). If the
-  Gaussian-copula stage marginally Gaussianizes $T_p$, $u_{\text{dir}}$,
+  Gaussian-copula stage marginally Gaussianizes $T_{m01}$, $u_{\text{dir}}$,
   and $v_{\text{dir}}$ independently without an explicit joint dependency
   structure across that triplet, it silently discards this coupling. This
   is a concern for the Gaussian-copula document to resolve, not this one
   — flagged here because it originates in the taxonomy, not the copula
   machinery.
-- **Low-rank approximation does not commute with `hypot`.** As noted in
-  §3.3, if a partition's height-scaled direction is decomposed as two
-  independent tensors $u_{\text{dir}}, v_{\text{dir}}$ (per Error 2, each
-  gets its own factors), `hypot` of their reconstructions only
-  approximates a directly-decomposed $H$. Whether the Tucker document
-  needs $H$ retained as an additional, separately-decomposed tensor for
-  reconstruction-accuracy reasons is an open design question left to that
-  document.
+- **Resolved (was open): low-rank approximation does not commute with
+  `hypot`.** §3.3/§3.4 now retain $\log E$ as its own, separately Tucker-fit
+  tensor and specify $H=\exp(\log E/2)$ as the authoritative
+  reconstruction, rather than leaving `hypot(u_dir,v_dir)`'s
+  reconstruction-bias unaddressed. What remains genuinely open, not
+  resolved by this: whether the same treatment is worth its cost for
+  Class B magnitudes (`was`, `ocs` — §3.2's new open note) and whether
+  `log E`'s specific compression fidelity (rather than just its
+  existence) is adequate at whatever Tucker rank is chosen — a rank-
+  selection question for `tucker_decomposition.md`, not this document.
 - **`sigwh`'s RMS relationship to partition heights assumes disjoint
-  partitions.** §2.2's derivation is exact only if the wind-sea/peak/swell
-  partitioning algorithm produces spectrally non-overlapping bins; to the
-  extent it does not, `sigwh = sqrt(wsh² + pwh² + pswh²)`-style
-  reconstructions are approximate.
+  partitions — and, separately, `pwh` must not be one of the terms.**
+  §2.2's derivation (`sigwh² ≈ wsh² + pswh² + ...`, summing genuinely
+  independent partition heights in quadrature) is exact only if the
+  partitioning algorithm produces spectrally non-overlapping bins, which
+  is itself an approximation. But there is a second, more basic problem
+  fixed by this revision (§3.3): `pwh` is not a third independent term to
+  include at all — it is `sigwh` restated (confirmed against both
+  `noaa-etl`'s transform table and NOAA's own GRIB2 parameter definitions,
+  which have no "primary wave height" field). A relation of the form
+  `sigwh = sqrt(wsh² + pwh² + pswh²)` is not merely approximate; it
+  double-counts `sigwh` on both sides and should not be used. The
+  physically meaningful quadrature relation this archive can actually
+  check is `sigwh² ≈ wsh² + pswh²` (wind-sea plus secondary/primary-swell
+  partition, whichever `pswh` represents) — still subject to the
+  disjointness caveat above, and still missing whatever energy a genuine,
+  unarchived "peak wave" partition height would have contributed.
 - **`wad` is confirmed to be a decoy.** It decodes as a plausible
   coming_from field but is actually going_to, exactly 180° from
   `wad_come_from` in every cell at the checked snapshot. It should never
   be wired into any pipeline; `wad_come_from` is the only correct
   wind-direction source.
+- **Categorized (was open): partition-absence NaN vs. land/ice NaN.**
+  §3.3.1 above resolves *which* variables carry ocean-cell NaN and gives a
+  sentinel policy for it, empirically checked against real archive data
+  (`docs/open_questions.md` §5.6, `tasks/17-partition-nan-sentinel-policy.md`).
+  What remains genuinely open: the exact mechanism behind `wsd`'s
+  always-defined-but-not-stale behavior at wind-sea-absent cells (§3.3.1),
+  and whether/how the policy gets wired into production
+  (`src/weather/model.py`, `src/train/ingest.py`) — deliberately deferred,
+  not yet approved.

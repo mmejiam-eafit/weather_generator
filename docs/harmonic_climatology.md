@@ -64,6 +64,23 @@ $$
 X(s, t) = \mu(s, t) + X'(s, t).
 $$
 
+**For height/period fields, $X$ is the `log`-transformed tensor.** Per
+`variable_taxonomy.md` §3.4, wave-height fields (`sigwh`, `wsh`, `pswh`)
+and period fields (`wsp`, `pwp`, `pswp`) enter this stage already
+`log`-transformed ($\log E$, $T$), not in raw physical units — this
+document's own per-cell regression is itself an L2/least-squares fit, so
+it benefits from the same dynamic-range/leverage argument that motivates
+the transform ahead of Tucker and DMD. This has a substantive consequence
+for §1's decomposition, worth being explicit about: a *multiplicative*
+seasonal cycle in raw units (e.g. "winter storms are systematically $k$
+times more energetic than summer's") becomes an *additive* shift in $\mu$
+under `log` — the harmonic regression below should be read as fitting that
+additive, log-space seasonal shape, not a seasonal cycle in physical wave
+height or period directly. Every other field this document discusses
+(`sst`, wind/current components) is unaffected — `variable_taxonomy.md`
+§3.4 explicitly excludes `sst`, and Class B wind/current magnitudes are
+not retained as their own tensor at all (§3.2), only as `u,v` pairs.
+
 This is the same decomposition used throughout applied math for systems
 driven by a mix of periodic and secular (slowly varying, non-periodic)
 forcing. Consider a linear, forced ODE/PDE such as a damped oscillator or a

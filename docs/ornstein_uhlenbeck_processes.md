@@ -553,6 +553,16 @@ over `(lat, lon)`, is unproblematic for exactly the reasons given in 4.1 —
 no information is lost, because there was no spatial identity left to lose
 by this stage.
 
+Nothing in this fit changes for height/period variables now entering as
+`log`-transformed tensors ($\log E$, $T$ — `variable_taxonomy.md` §3.4):
+by the time $\eta_k(t)$ exists, it is several linear stages removed from
+physical units regardless, and OU's own machinery (§2) has no notion of
+what pre-transform produced its input. The only place this matters is at
+final reconstruction, where the sampled path must be inverted through
+`log` ($H=\exp(\log E/2)$, $T_{m01}=\exp(T)$) before being read as a
+physical quantity — a `simulate.py`/sampling-layer concern, not a fitting
+concern for this document.
+
 The one design point worth stating explicitly: **this fit is per-variable**.
 Each variable $v$ has its own Tucker decomposition, its own DMD, its own
 mode index $k$, and therefore its own independent set of

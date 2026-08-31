@@ -346,6 +346,18 @@ $(R_{\text{lat}}, R_{\text{lon}}, R_{\text{time}})$ chosen independently
 (they need not match across variables — `sst` and `sigwh` have no reason to
 compress to the same ranks).
 
+**What $\mathcal{X}^{(v)}$ actually contains, for height/period variables.**
+For wave-height fields (`sigwh`, `wsh`, `pswh`) and period fields (`wsp`,
+`pwp`, `pswp`), $\mathcal{X}^{(v)}$ is the `log`-transformed tensor
+(`variable_taxonomy.md` §3.4 — $\log E := \log(H^2)$, $T:=\log T_{m01}$),
+not the raw physical-unit field. Nothing about the Tucker mechanics above
+changes because of this — it is a marginal pre-transform applied before
+this section's fit, motivated by the same L2-fit dynamic-range/leverage
+concern this document's masked-HOOI machinery is already sensitive to
+(§2.8) — but reconstructions from these particular fits must be inverted
+($H=\exp(\log E/2)$, $T_{m01}=\exp(T)$) before being read as physical
+quantities.
+
 ### 4.2 Mask construction and use
 
 For variable $v$, build the ocean mask exactly as the notebook does:

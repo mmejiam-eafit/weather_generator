@@ -11,6 +11,28 @@ that set, though several items are pushed further than their source
 document pushed them, using reasoning available from *reading the set as a
 whole* that no single document had access to on its own.
 
+**Update (`docs/noaa_etl/`).** A later pass cross-referenced this list
+against `docs/noaa_etl/` (`pipeline.md`, `noaa_ingestion.md`,
+`noaa_transform.md`, `noaa_update_data.md`) — documentation of the actual
+upstream ETL that produces this archive from raw NOAA GRIB2/HYCOM sources.
+Where that ETL's own documentation settles a question directly (source-level
+ground truth about the archive's construction, not inference from behavior),
+status was updated accordingly, and one new item it surfaced was added; see
+§1.1, §1.2, §1.4.
+
+**Scope note.** This repository (`noaa-etl`) contains only the upstream ETL
+(`src/task/{noaa_ingestion,noaa_transform,noaa_update_data}.py` and their
+`src/util/` helpers) — none of the eight sibling study guides cited above, nor
+the files they describe (`core/config.py`'s `OCEAN_GRID_SHAPE`, `core/io.py`'s
+`decode_compass_code`, `notebooks/verify_direction_convention.ipynb`), exist
+anywhere in this codebase (confirmed by a repo-wide search: zero hits, no
+`.ipynb` files at all). They belong to a separate, downstream "modeling"
+repository not checked out here. Practically: **only §1** consists of
+questions this repo's source can actually adjudicate. Sections 2–8 cite
+modules and documents this codebase doesn't contain, so nothing here can
+advance, confirm, or correct them further — a scope boundary worth stating
+up front rather than leaving implicit.
+
 **How to read the status tags:**
 
 - **OPEN** — genuinely unresolved by any document in this set; no answer is
@@ -30,7 +52,7 @@ still specification-level documents, not implementations.
 
 ## 1. Data and convention-level questions
 
-### 1.1 Is the ocean grid's row-0 latitude/orientation south-first, like the wave and wind grids? — **OPEN**
+### 1.1 Is the ocean grid's row-0 latitude/orientation south-first, like the wave and wind grids? — **ANSWERED** (yes, confirmed by direct geo-referenced lookup)
 
 Raised in: `variable_taxonomy.md` §6.
 
@@ -42,30 +64,192 @@ cheaper proxy (zonal-mean `sst` maximum for the equator row, open-ocean
 fraction at 40–60° for hemisphere sense) sufficient only to support a few
 direction-diagnostic latitude bands, not a full verification.
 
-This cannot be resolved by documentation — it requires running the same
-kind of empirical correlation study against real archive data that settled
-the wave/wind case. **Remains open**, and no `sst`/`ocs`/`ocd` field should
-be treated as geo-referenced until it is.
+**Update from `docs/noaa_etl/noaa_transform.md`:** the upstream ETL that
+produces this archive's HYCOM-sourced fields (`sst`, `ocs`, `ocd`) confirms
+this can't be settled from that codebase either — the HYCOM→uniform-grid
+remap (`hycom_index`, backed by `hycom_satocean_idx.npy`) deliberately does
+**not** go through `flip_latitude` the way every GFS-sourced field does, and
+the ETL's own documentation states plainly that "this repository only
+contains the index lookup table, not the geographic (lat/lon-in-degrees)
+definition of the output grid it targets... confirm the authoritative grid
+definition [with the consuming service] before assuming exact bounds." That
+does confirm `OCEAN_GRID_SHAPE`'s value — `hycom_satocean_idx.npy` is
+exactly `(1121, 2880, 2)` — but not its orientation.
 
-### 1.2 Is `pwd`/`pswd`'s "coming_from" convention correct? — **OPEN**
+This changes the *recommended path* to resolution, even though it doesn't
+close the question: rather than (or in addition to) an independent
+coastline-correlation study, the more direct fix is obtaining the target
+grid's geographic definition from whoever generated
+`hycom_satocean_idx.npy` — that party necessarily knows the real-world
+lat/lon each output cell corresponds to, which no amount of statistical
+inference from this archive alone can fully recover. **Remains open**, and
+no `sst`/`ocs`/`ocd` field should be treated as geo-referenced until one of
+these two paths is completed.
+
+**Additional corroborating evidence (from loading `hycom_satocean_idx.npy`
+directly, not just reading about it):** shape `(1121, 2880, 2)`, dtype
+`int16`, confirmed. One correction to the bounds cited above: `lon_idx`
+actually ranges `0–4498`, not `0–4499`. New evidence not previously noted:
+output row 0's `lat_idx` is nearly constant (~425) across every sampled
+longitude — consistent with sitting near a true, non-displaced pole, where
+all meridians converge to one point — while the opposite edge (row −1) has
+widely scattered `lat_idx` across longitude (~2836–3257 in a coarse sample),
+consistent with the warped, displaced-pole region of a tripolar mesh. This is
+internally consistent with the "one true pole at the South Pole, two
+displaced poles in the North" narrative above, but it remains internal
+grid-structure evidence only — it still doesn't anchor either edge to a real
+lat/lon, so it corroborates without closing the question.
+
+**Provenance, checked directly against `noaa-etl`'s history (not just its
+current-state docs).** `git log --follow -p` on
+`src/util/geo/hycom_satocean_idx.npy` across the entire repo history returns
+exactly one commit — `14d5c19` ("feature process rtofs", author
+`s-gonzalez <sebastian@bearing.ai>`, 2025-11-19) — which adds the file as an
+opaque binary, no accompanying generation script, README, or comment then or
+since. A repo-wide grep for `satocean`/`sat_ocean` turns up only the
+filename itself, nowhere else. This confirms, by direct inspection rather
+than trusting `noaa_transform.md`'s claim secondhand, that the grid's
+geographic definition genuinely is not recoverable from this codebase, its
+history, or any comment in it. **Actionable lead this adds beyond what the
+docs alone gave:** the commit author is a real, identifiable person at the
+same org — asking them directly (or locating whatever ticket/PR that commit
+closed) is a far more direct path to closing this than another statistical
+correlation study.
+
+**Dimension cross-check against actual usage, not just the file's own
+shape.** `hycom_index()` (`src/util/geo/grid_utils.py`) indexes a native
+HYCOM grid via `grid_arr[lat_idx, lon_idx]`, where that native grid's shape
+(`lat_size`, `lon_size`) is parsed **dynamically from each `.b` metadata
+file's header at runtime** (`read_hycom_fields` in
+`src/util/hycom/hycom_transform.py`: `lon_size = int(b_file_lines[7]...)`,
+`lat_size = int(b_file_lines[8]...)`) — never hardcoded, and never asserted
+against `HYCOM_IDX`'s bounds anywhere in the code. So `hycom_satocean_idx.npy`
+implicitly requires every incoming native HYCOM grid to satisfy
+`lat_size ≥ 3298` and `lon_size ≥ 4499` (one past each index's observed max),
+with **no explicit compatibility check anywhere** — if RTOFS's native grid
+resolution ever changed, this would raise `IndexError` rather than silently
+misalign, which is a real if minor mitigating factor, but the dependency
+itself is unvalidated in code. No test fixtures or sample `.b` files exist in
+`noaa-etl` to check this against directly, so it can't be fully verified
+without a live RTOFS file. As a plausibility check only (external knowledge,
+not verified against this repo): `3298 × 4499` is close to RTOFS/HYCOM's
+publicly documented global 1/12° operational grid dimensions (commonly cited
+as `3298 × 4500`) — consistent with this genuinely targeting the real
+operational grid rather than a stale or mismatched artifact, reassuring for
+the pipeline's general health, but it still said nothing about orientation
+**until the direct check below.**
+
+**Resolved by direct geo-referenced lookup (2026-08-11).** RTOFS publishes
+NetCDF diagnostic output (distinct from the `.a`/`.b` binaries `noaa-etl`
+parses) to a public, unauthenticated AWS bucket
+(`s3://noaa-nws-rtofs-pds/rtofs.{date}/rtofs_glo_2ds_f{fff}_diag.nc`). One
+such file (`rtofs.20240127/rtofs_glo_2ds_f000_diag.nc`) was downloaded and
+opened directly. It carries `Conventions: CF-1.0` and, critically, explicit
+CF-convention 2-D coordinate arrays — `Latitude(Y, X)` and `Longitude(Y, X)`,
+both shape `(3298, 4500)`, exactly matching `hycom_satocean_idx.npy`'s index
+bounds (`lat_idx` max `3297`, `lon_idx` max `4498`). This means the file
+gives the *exact* real-world latitude/longitude of every native HYCOM grid
+cell the index table can point to — no statistical inference needed.
+
+Doing the actual remap — `real_lat = Latitude[lat_idx, lon_idx]`,
+`real_lon = Longitude[lat_idx, lon_idx] % 360` over the full
+`(1121, 2880)` index table — gives a direct, exact geo-reference for every
+cell of the archive's `sst`/`ocs`/`ocd` output grid:
+
+- **Latitude / row axis:** row 0 (excluding one `(0,0)` sentinel/fill cell
+  per row — 113 such cells total out of 3,228,480, evidently a land/no-data
+  placeholder, not a real mapping) is ≈ constant at **−65.00°** across every
+  longitude; row 1 ≈ −64.90°; row 100 ≈ −52.51°; row 300 ≈ −27.52°; row 560
+  ≈ +4.95°; row 800 ≈ +34.96° — **strictly increasing with row index, and
+  effectively zonal (constant across longitude) for every row south of the
+  tripolar patch**, exactly as expected for the Mercator-projected part of
+  the grid. Row spacing is non-uniform in degrees (≈0.10°/row near −65°,
+  ≈0.125°/row near −50…−27°) — the correct signature of a Mercator grid
+  (uniform in projected `y`, not in latitude degrees), not an artifact.
+  North of ≈47°N (row ≈1000+), rows stop being purely zonal (row 1000 spans
+  52.8°–64.0°, row 1120 spans 50.3°–76.6°) — exactly the displaced-pole
+  tripolar-patch warping the ETL docs already said exists north of 47°N, and
+  consistent with (though not itself a repeat of) the earlier `lat_idx`
+  clustering evidence for that region. **Row index increases with latitude
+  (south → north)** — the same "row-0-south" convention already confirmed
+  for the wave and wind grids, achieved here not via `flip_latitude` (which
+  `noaa_transform.md` confirms is *not* applied to HYCOM fields) but because
+  `hycom_satocean_idx.npy` itself was evidently built with that row ordering
+  baked in.
+- **Longitude / column axis:** sampled at row 560 (a purely zonal,
+  tripolar-patch-free row), longitude runs from `0.00°` at column 0 up to
+  `359.84°` at column 2879, monotonically increasing with exactly one
+  wrap-around discontinuity — **column index increases eastward starting
+  from 0°E**, the same convention as the GFS-sourced grids
+  (`lon = j * 0.25`).
+
+This closes the question: the ocean grid's orientation is **row-0-south,
+column-0-at-0°E-increasing-eastward**, matching the wave/wind grids exactly.
+`core/config.py`'s `grid_coordinates` for the ocean grid can now be filled
+in with confidence — for the Mercator-projected majority of the grid
+(rows south of ≈47°N) coordinates are a simple, if non-uniform, per-row
+latitude lookup (not a fixed-step formula like the GFS grids); north of
+47°N, per-cell `(lat, lon)` should be taken directly from a stored copy of
+this remap (or the remap re-derived from a fresh `Latitude`/`Longitude`
+pair) rather than approximated, since the tripolar patch is not zonal there.
+The commit-author lead and the coastline-correlation study are no longer
+necessary — this direct lookup supersedes both as the authoritative answer.
+
+**Implementation gap (2026-08-16): this answer was never wired into code.**
+`src/core/config.py`'s `grid_coordinates("ocean")` still raises
+`ValueError` unconditionally, so `sst`/`ocs`/`ocd` cannot be loaded through
+`load_training_window` at all — confirmed directly, not assumed. The
+*question* this section resolves (what the real coordinates are) is
+answered; *using* that answer in loadable code is tracked separately as
+`tasks/16-ocean-grid-coordinates.md`.
+
+### 1.2 Is `pwd`/`pswd`'s "coming_from" convention correct? — **ANSWERED**
 
 Raised in: `variable_taxonomy.md` §6, `correlated_variables.md` §3.
 
-Only `wad`/`wad_come_from` (wind) and `wsd` (wind-sea) have been checked
-against known persistent wind/current patterns (trade winds, Southern Ocean
-westerlies, major equatorial currents) — a check that works because those
-fields track *local*, climatologically-persistent forcing. `pwd` (peak
-wave) and `pswd` (primary swell) describe wave partitions that can be swell
-arriving from a distant, decoupled storm system, so the same climatology
-check is not valid ground truth for them. They share `wsd`'s origin code by
-analogy only.
+Previously open because only `wad`/`wad_come_from` (wind) and `wsd`
+(wind-sea) had been checked against known persistent wind/current patterns
+(trade winds, Southern Ocean westerlies, major equatorial currents) — a
+check that works because those fields track *local*, climatologically-persistent
+forcing, but is invalid for `pwd`/`pswd` since they can be swell arriving
+from a distant, decoupled storm system (confirmed inconclusive in
+`notebooks/verify_direction_convention.ipynb`'s Tests 5–6, which got mixed
+PASS/FAIL results against the same trade-wind boxes and correctly diagnosed
+why that result wasn't diagnostic either way).
 
-This is an empirical question about the archive's encoding, not a
-theoretical one — **remains open** pending a domain-expert check or an
-equivalent empirical study (e.g. checking `pwd`/`pswd` against a case where
-the wave field is known, from independent synoptic data, to be locally
-wind-generated rather than swell-dominated, so the trade-wind-style
-consistency check becomes valid again for that specific case).
+**Resolved by `docs/noaa_etl/noaa_transform.md`'s "Direction field encoding"
+section**, which doesn't have this confound because it isn't an empirical
+behavioral test — it reads NOAA's own field definitions directly. It cites
+[NCEP GRIB2 Code Table 4.2-0-2](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-2.shtml)
+(`WDIR`: "Wind Direction (from which blowing)") and NDBC's measurement
+glossary (`MWD`/`SwD`/`WWD`, the buoy analogs of `dirpw`/`swdir`/`wvdir`,
+defined as "the direction from which the waves... are coming"), and its
+transform table confirms `pwd` (from `dirpw`) and `pswd` (from `swdir`)
+receive `calculate_16degree` only — no conversion — exactly like `wsd`. They
+inherit the source field's documented "coming from" semantics unmodified, by
+construction, independent of whether the wave field happens to be locally
+wind-generated or swell from afar. This is stronger evidence than a
+climatology check could ever provide for these two fields specifically.
+
+As a side effect, this also closes the narrower gap of whether `pwd`/`pswd`
+truly share `wsd`'s origin-code family (previously assumed by analogy, never
+directly verified): checking `src/core/io.py`'s actual `decode_compass_code`
+formula, `(code - origin_code) * 22.5 % 360`, against the ETL's documented
+sector table (sectors 1–16, sector 16 = North via wraparound) confirms
+`origin_code=0` decodes that scheme correctly. **No further empirical study
+or domain-expert check is required for this question.**
+
+**Direct source-level reconfirmation:** `src/util/gfs/gfs_transform.py`'s
+`VARIABLE_TRANSFORMATION` list (not just `noaa_transform.md`'s paraphrase of
+it) shows `dirpw`→`pwd` and `swdir`→`pswd` each get exactly `[flip_latitude,
+calculate_16degree]` — a byte-identical transform chain to `wvdir`→`wsd`.
+Executing `calculate_16degree` (`src/util/geo/coords_utils.py`) directly
+against sample angles also confirms its sector semantics match
+`noaa_transform.md`'s table exactly (sector 16 = N at 0°/360°, sector 4 = E
+at 90°, sector 8 = S at 180°, sector 12 = W at 270°). Separately: `core/io.py`
+and any `decode_compass_code`/`origin_code` do **not** exist anywhere in this
+repository — that citation above refers to the downstream consuming
+service's decoder, not to this ETL's own code, and should be read as such.
 
 ### 1.3 Is `wad` usable as a wind-direction field? — **ANSWERED** (already resolved; restated here for completeness)
 
@@ -78,6 +262,156 @@ wind-direction source and should be the only one ever wired into any
 pipeline stage. This was already a closed, confirmed finding when it was
 written into `variable_taxonomy.md` — it is listed here only so this
 document is a complete index, not because it is actually in question.
+
+**Direct source-level reconfirmation of the mechanism:** `wad_come_from` and
+`wad` both read GRIB `shortName: "wdir"` in `gfs_transform.py`'s
+`VARIABLE_TRANSFORMATION`, but `wad_come_from`'s chain is `[flip_latitude,
+calculate_16degree]` while `wad`'s is `[flip_latitude, vectorize_16degree]`.
+`vectorize_16degree` (`src/util/geo/coords_utils.py`) internally calls
+`transform_directions_to_coming_from_vectorized` (a ±180° flip) before
+bucketing; `wad_come_from`'s path never applies that flip. Since raw `wdir`
+is already "coming from" per NCEP (§1.2), the extra flip applied only to
+`wad` necessarily produces the "going to" (180°-opposite) value — a direct
+code-level explanation for *why* the decoy relationship holds, not just a
+restated confirmation that it does.
+
+### 1.4 Is `pwh` an independent wave-height measurement, distinct from `sigwh`? — **ANSWERED** (no — and this needs correcting elsewhere)
+
+Raised in: not previously identified as an open question anywhere in this
+set; surfaced by reading `docs/noaa_etl/noaa_transform.md`.
+
+No. The GFS variable-map table states `pwh` is derived from the same source
+GRIB field as `sigwh` (`swh`) through the identical transform chain, and
+labels it explicitly: "Significant/primary wave height (**duplicate of
+`sigwh`**, kept for naming compatibility)." `pwh` and `sigwh` are the same
+array. This is not true of the rest of the "peak wave" triplet — `pwd`
+(from `dirpw`) and `pwp` (from `perpw`) are genuinely independent fields —
+so the issue is specific to the height component only.
+
+**This directly undermines an assumption in two sibling documents, and both
+need a corrective pass, not just a note here:**
+- `variable_taxonomy.md`'s Class C treats `pwh`/`pwd`/`pwp` as one coherent
+  independent triplet the same way `wsh`/`wsd`/`wsp` is. That's incorrect
+  for `pwh` specifically — it carries no information beyond what `sigwh`
+  already provides.
+- `correlated_variables.md` §3.3 extends its Miche-breaking-limit
+  steepness-coupling example to "`wsh`/`wsp`, or equally `pwh`/`pwp`" — that
+  extension is misleading. `wsh`/`wsp` are two independent readouts of one
+  partition's spectrum, as claimed. `pwh`/`pwp` are not: `pwh` is just
+  `sigwh` restated, so the "coupling" there is really `sigwh`/`pwp`, a
+  different (and weaker-grounded, since `sigwh` is a composite across
+  partitions rather than one partition's own spectrum) physical claim than
+  the one actually being made.
+
+**Status: fully closed, including the corrective edits.** The fact was
+already settled when this entry was first written; the corrective passes
+to `variable_taxonomy.md`, `correlated_variables.md`, and (identified
+afterward — it has the same latent assumption and was missed in the
+original sweep) `physical_consistency_constraints.md` have now all been
+made.
+
+**Direct source-level reconfirmation** (previously only confirmed via
+`noaa_transform.md`'s table, one level removed from the pipeline itself):
+`gfs_transform.py`'s `VARIABLE_TRANSFORMATION` contains two separate dict
+entries both with `short_name: "swh"` and an identical transformation list
+`[flip_latitude, round_2]`, differing only in `variable_store_name`
+(`"sigwh"` vs `"pwh"`) and matching `store_type` (`np.float16`). This is the
+same deterministic operation sequence applied to the same input, so `pwh`
+and `sigwh` aren't merely equivalent — they're the same array.
+
+**Independent confirmation directly from NOAA's own documentation**
+(checked separately from `noaa-etl`'s code, at the user's request, since
+code-level agreement alone doesn't rule out the ETL author having
+independently made the same naming choice for unrelated reasons). NCEP's
+official GRIB2 parameter table,
+[Table 4.2-10-0 ("Oceanographic — Waves")](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-10-0.shtml),
+was fetched and its raw HTML grepped directly (not summarized secondhand).
+It defines `DIRPW` ("Primary Wave Direction") and `PERPW` ("Primary Wave
+Mean Period") as real, independent parameters, but across the table's
+entire ~80-parameter wave category — from spectral moments through
+freak-wave statistics — **there is no "primary wave height" parameter at
+all**. Every other height in this archive traces to a real, distinct NOAA
+field (`HTSGW`→`sigwh`, `WVHGT`→wind-sea height, numbered swell-partition
+heights→`pswh`); there was structurally never a `PWHGT`-equivalent for
+`pwh` to be. This is stronger than the code-level finding alone: it shows
+`pwh`'s duplication of `sigwh` isn't an ETL implementation quirk that
+happened to reuse `sigwh`, but the only coherent choice available given
+that NOAA never defined an independent field for it to measure.
+
+**Corrective edits made (2026-08-11):**
+- `variable_taxonomy.md` — Class C summary table, §2.2, §3.3 (main
+  correction, with both lines of evidence), the §5 results table, and the
+  §6 open-questions bullet on `sigwh`'s RMS relationship all updated to
+  exclude `pwh` from any independent-partition treatment.
+- `correlated_variables.md` §3.3 — the "`wsh`/`wsp`, or equally `pwh`/`pwp`"
+  claim corrected: the physically meaningful analog is `sigwh`/`pwp`, and
+  it is explicitly weaker-grounded than the `wsh`/`wsp` case, not equally
+  valid.
+- `physical_consistency_constraints.md` §2.1 (and its downstream §2.4/§5
+  tuples and formulas) — the wave-energy-budget constraint corrected from
+  the (now known to be structurally broken — it double-counts `sigwh`
+  against itself) three-term $\text{sigwh}^2\approx\text{wsh}^2+\text{pwh}^2+\text{pswh}^2$
+  to the two-term $\text{sigwh}^2\approx\text{wsh}^2+\text{pswh}^2$, with
+  the corresponding loss of a third independent check made explicit rather
+  than silently absorbed into the tolerance band.
+
+### 1.5 Are this archive's `*p` fields (`wsp`, `pwp`, `pswp`) peak periods ($T_p=1/f_p$) or mean periods ($T_{m01}=m_0/m_1$)? — **ANSWERED** (mean period — corrects an error in this same document series)
+
+Raised in: a direct challenge to `variable_taxonomy.md` §2.2's original
+claim, sourced from a separate design thread that described NOAA's period
+fields as "ratios of different momenta... not a period in the sinusoidal
+sense" — in tension with this series' own prior claim that they were peak
+periods.
+
+**Mean period, $T_{m01}=m_0/m_1$ — the other thread was right, and
+`variable_taxonomy.md` §2.2 was wrong.** Checked directly against source
+and NOAA documentation, not assumed from either side's framing.
+`noaa-etl`'s `gfs_transform.py` derives `wsp`/`pwp`/`pswp` from GRIB
+`shortName`s `mpww`/`perpw`/`mpts`. Cross-checked against NCEP's own
+[GRIB2–GRIB1 parameter conversion table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/GRIB2_parmeter_conversion_table.html),
+these are explicitly named **"Mean period of wind waves"** (10-0-6),
+**"Primary wave mean period"** (10-0-11), and **"Mean period of total
+swell"** — distinct, separately-numbered GRIB2 parameters from NOAA's own
+"Peak Wave Period"/"Peak Period of Wind Waves"/"Peak Period of Total
+Swell" family, which this archive's ETL never reads at all. Confirmed
+against [WAVEWATCH III's user manual](https://polar.ncep.noaa.gov/waves/wavewatch/manual.v5.16.pdf)
+and standard oceanographic convention, the quantity reported is
+$T_{m01}=m_0/m_1$ — an energy-weighted mean frequency across the whole
+partition spectrum, inverted — not $T_p=1/f_p$, the reciprocal of the
+single largest spectral bin. The two coincide only for an infinitely
+narrow spectral peak.
+
+**Corrective edits made (2026-08-11):**
+- `variable_taxonomy.md` §2.2 — corrected to describe $T_{m01}$, with the
+  full evidence trail; all downstream uses of the `$T_p$` symbol in that
+  document renamed to `$T_{m01}$`.
+- `physical_consistency_constraints.md` §2.3 — retitled "Mean-period
+  plausibility" (was "Peak-period plausibility"); added a correction
+  explaining that the section's plausibility-*bound* use is tolerant of
+  either statistic (both occupy the same broad physical regime), so the
+  floor/ceiling values survive essentially unchanged, but the framing was
+  corrected throughout.
+- `correlated_variables.md` §3.3 — this is where the distinction is
+  **load-bearing, not just a caveat**: the Miche-breaking-limit derivation
+  substitutes a period directly into the dispersion relation to get a
+  specific numeric wavelength, and $T_{m01}$ is not literally the period
+  of the single wave component that relation is about. Corrected to flag
+  that using `wsp` ($T_{m01}$) unmodified systematically underestimates
+  the bound (conservative/over-rejecting, not unsafe), and that a
+  shape-dependent correction factor $T_p\approx\alpha\,T_{m01}$ (commonly
+  cited in the rough range $\alpha\approx1.05\text{–}1.4$ for JONSWAP-type
+  wind-sea spectra, not independently verified against this archive) is
+  needed before the `0.14` Miche constant is applied — an empirical
+  calibration task, not resolved here.
+
+**Follow-on (2026-08-11):** confirming $T_{m01}$ as the archive's actual
+period statistic directly motivated formalizing a `log`-transform
+convention for it — $T := \log T_{m01}$, alongside a matching $\log E :=
+\log(H^2)$ for wave heights — now specified in `variable_taxonomy.md`
+§3.4. See §2.3 below for the tensor-representation consequence
+(resolves what had been an open `hypot`-reconstruction question) and
+§3.4/§3.5 for the further consequence for cross-channel coupling
+diagnostics.
 
 ---
 
@@ -128,51 +462,49 @@ a joint group is an open modeling choice (see §3.2 below), so the
 mechanism for recovering the coupling is now specified, while its exact
 scope (how many groups, how large) is not.
 
-### 2.3 Does low-rank Tucker reconstruction preserve `speed = hypot(u, v)` for a directional field? — **OPEN** (mitigation available)
+### 2.3 Does low-rank Tucker reconstruction preserve `speed = hypot(u, v)` for a directional field? — **ANSWERED** (resolved via a dedicated `log E` tensor)
 
 Raised in: `variable_taxonomy.md` §6 ("Low-rank approximation does not
 commute with `hypot`"), explicitly deferred to `tucker_decomposition.md`.
 
-`tucker_decomposition.md` does not, in fact, address this anywhere in its
-text (confirmed by reading its full "Open questions and limitations"
-section — it covers cross-variable coupling, masked-HOOI convergence, and
-rank selection, but never `hypot`/reconstruction-of-derived-magnitude). The
-deferral was not honored. **This remains genuinely open**: if a partition's
-height-scaled direction is decomposed as two independently-Tucker-compressed
-tensors $u_{\text{dir}}, v_{\text{dir}}$, then
-$\operatorname{hypot}\!\big(\widehat u_{\text{dir}}, \widehat
-v_{\text{dir}}\big)$ (hats denoting the reconstructed, truncated-rank
-tensors) is not in general equal to a directly, separately low-rank-compressed
-$\widehat H$ — matrix/tensor truncation does not commute with a nonlinear
-map like $\sqrt{u^2+v^2}$.
+`tucker_decomposition.md` did not originally address this (confirmed by
+reading its full "Open questions and limitations" section at the time).
+**Resolved (2026-08-11):** the "concrete mitigation" this entry previously
+named as unadopted — decompose height as its own separate scalar tensor,
+in addition to `u,v` — has now been adopted, with a specific, justified
+form. `variable_taxonomy.md` §3.4 specifies $\log E := \log(H^2)$ (not raw
+$H$, for the dynamic-range/power-law-growth reasons that section derives)
+as a fourth, independently Tucker-fit tensor per Class C triplet (and
+alongside `sigwh`), and designates $H=\exp(\log E/2)$ — not
+`hypot(u_dir,v_dir)` — as the authoritative magnitude-reconstruction path.
+`physical_consistency_constraints.md` §4 now requires this explicitly for
+its own inputs. The redundancy this entry flagged as a cost is accepted
+deliberately: `u_dir,v_dir` are kept magnitude-scaled (not switched to
+unit vectors) for the "shrinks to origin when energy is negligible"
+property `variable_taxonomy.md` §3.3 already valued, so magnitude is now
+represented twice by design, with $\log E$'s reconstruction the one that
+counts.
 
-A concrete mitigation exists, though no document has adopted it: **decompose
-the partition's height $H$ (or speed) as its own separate scalar tensor**, in
-addition to $u,v$, rather than relying solely on reconstructing it via
-`hypot`. This trades redundancy (the magnitude is now represented twice —
-once directly, once implicitly via $u,v$) for exactness of the physically
-important quantity, at the cost of needing some downstream reconciliation
-if the two disagree after reconstruction. Whether that redundancy is worth
-paying is an empirical/design tradeoff that has not been evaluated —
-**status remains open**, now with a named candidate solution.
-
-### 2.4 Does per-cell independent Gaussianization of $u$ and $v$ preserve `speed = hypot(u, v)`? — **OPEN** (distinct from 2.3)
+### 2.4 Does per-cell independent Gaussianization of $u$ and $v$ preserve `speed = hypot(u, v)`? — **PARTIALLY MOOT** (magnitude case resolved by 2.3; angle case remains open)
 
 Raised in: `gaussian_copula_and_marginals.md` §3 ("Known open subtlety").
 
-This is a different failure mode from §2.3 above, occurring earlier in the
-chain: even before any Tucker compression, $u$ and $v$ are each Gaussianized
-via their own *separate* per-cell empirical CDF — two different monotone
-nonlinear regradings. The exact identity $speed=\operatorname{hypot}(u,v)$
-does not survive into Gaussianized $(Z_u, Z_v)$-space, and there is no
-guarantee the reconstructed $\operatorname{hypot}(u,v)$ after inverse
-transform matches whatever speed marginal was actually fit for that
-partition. `gaussian_copula_and_marginals.md` correctly identifies this as
-an open empirical question and does not resolve it, nor does any other
-sibling document. **Remains open.** Note it compounds with §2.3: even a
-perfectly rank-preserving Tucker/DMD stage would not undo distortion already
-introduced at the Gaussianization step, so the two issues would need
-independent empirical characterization, not a single combined fix.
+This was flagged as a distinct failure mode from §2.3, occurring earlier
+in the chain: $u$ and $v$ are each Gaussianized via their own *separate*
+per-cell empirical CDF, so $speed=\operatorname{hypot}(u,v)$ does not
+survive into Gaussianized $(Z_u,Z_v)$-space either, compounding with §2.3's
+Tucker-level distortion. **§2.3's resolution changes what's actually at
+stake here.** Since $H$ is now read from $\log E$'s own reconstruction and
+`hypot(u_dir,v_dir)` is no longer the authoritative magnitude source at
+all, whether Gaussianization distorts `hypot(u,v)` specifically is
+**largely moot for magnitude** — nothing downstream is supposed to trust
+that value for magnitude anymore. What is **not** resolved, and remains a
+genuinely open question: whether independent per-cell Gaussianization of
+$u$ and $v$ distorts the **direction** $\operatorname{atan2}(v,u)$, which
+is still read from `u_dir,v_dir` (never from $\log E$) and has no analogous
+dedicated-tensor fix. This is a narrower, restated version of the original
+concern — angle preservation only, not magnitude — and it inherits §2.3's
+old status: open, unresolved by any sibling document.
 
 ---
 
@@ -254,11 +586,11 @@ aligns with wind direction from any starting offset, matching the physical
 picture $S_{in}$'s directional peaking already motivates.
 
 At $\theta=0$, the radial equation reduces to exactly the scalar energy
-ODE of §2.3–§2.4, with fixed point $r^\* = (\kappa U/c_{ds})^2$ and
+ODE of §2.3–§2.4, with fixed point $r^\star = (\kappa U/c_{ds})^2$ and
 linearized rate $-\tfrac12 \kappa U$ there (same computation as the scalar
 case). Because $\partial\dot\theta/\partial r \equiv 0$ and
 $\partial\dot r/\partial\theta|_{\theta=0}=-\kappa U r\sin\theta|_{\theta=0}=0$,
-the full 2D Jacobian at $(\theta,r)=(0,r^\*)$ is **diagonal**, with real
+the full 2D Jacobian at $(\theta,r)=(0,r^\star)$ is **diagonal**, with real
 eigenvalues $-\kappa U$ (angular) and $-\tfrac12\kappa U$ (radial). Both
 negative and real: **the aligned equilibrium is a stable node**, exactly as
 the scalar case is — and angular relaxation is exactly twice as fast as
@@ -271,11 +603,90 @@ This inherits the same caveat the scalar analysis already carries (§2.4 of
 quasi-static relative to the alignment relaxation timescale, consistent
 with how that document already treats $U$'s own dynamics elsewhere.
 
+### 3.4 Does within-group channel coupling (one partition's `u, v, E, T`) need a joint multi-channel Tucker, or is it recoverable downstream of §4's independent per-variable fits? — **OPEN**
+
+Raised in: a competing design document (`physical_handoff.md`) proposed
+stacking one wave partition's derived channels `u, v, E, T` into a single
+4-mode `(lat, lon, t, C)` tensor and fitting one joint Tucker across it,
+so the channel factor `A_C` could discover cross-channel structure (e.g. a
+steepness-like direction) directly — a real alternative to
+`tucker_decomposition.md` §4.1's strict per-variable rule and
+`correlated_variables.md` §4's downstream-joint-model proposal, not
+something dismissable by citing that rule alone.
+
+There is a genuine, structural asymmetry between the two designs: each
+independent per-variable Tucker fit truncates to its own top modes based
+on that one channel's own marginal variance, *before* any cross-channel
+structure is considered — so a coupling that is weak in each channel's
+own marginal variance but strong jointly (plausible for a steepness
+signature riding on otherwise differently-driven `E`/`T` variability)
+would be discarded before any downstream joint model ever sees it, a
+known blind spot of "reduce independently, then correlate" pipelines
+relative to genuinely joint methods (CCA/PLS/joint-tensor-factorization).
+The joint design pays for this with a real, untested cost of its own: it
+forces `u, v, E, T` to share spatial/temporal factor matrices, assuming
+their dominant EOFs coincide. Separately, the physical relationship
+motivating this (the Miche steepness bound) is a pointwise inequality
+that no linear decomposition — either architecture — can *guarantee*
+holds at every point; that enforcement job belongs to
+`physical_consistency_constraints.md`'s rejection layer regardless of how
+this question resolves, so what's actually at stake is representation
+fidelity (and possibly downstream rejection-rate reduction), not a
+substitute for that layer.
+
+**Remains open** — full derivation, the asymmetry argument, and a
+concrete, bounded experiment design (one partition — `wsh`/`wsd`/`wsp` —
+joint 4-channel Tucker vs. independent per-channel Tucker + CCA/joint-DMD
+on the coefficients) are in `correlated_variables.md` §6. **Update:** the
+experiment now checks channels `{u,v,E,F}`, not `{u,v,E,T}`, and the
+`E − 2T ≈ const` diagnostic originally proposed is no longer used as-is —
+see §3.5 below for why. This mirrors §4.1 below in requiring empirical
+validation before either design is committed to, not a decision from
+reasoning alone.
+
+### 3.5 Is the `E − 2T ≈ const` diagnostic proposed in §3.4 actually clean evidence of Miche/dispersion coupling, or a shared-moment artifact? — **ANSWERED** (artifact risk confirmed; fix proposed, itself unverified)
+
+Raised in: a direct algebraic check of §3.4's own proposed channels,
+prompted by the observation that `T = log(Tm01)` and `E = 2log(Hs)` both
+reduce to expressions in the same spectral moments.
+
+**Confirmed: `E` and `T` are not two independently-constructed channels —
+they are a linear reparametrization of the same two spectral moments,
+sharing one term with matching sign.** Using `variable_taxonomy.md`'s own
+definitions and moment convention (§2.2, ordinary frequency $f$):
+
+$$E = 2\log H_s = \log(16\,m_0) = \log16 + \log m_0, \qquad T = \log T_{m01} = \log(m_0/m_1) = \log m_0 - \log m_1.$$
+
+Both carry $\log m_0$ with coefficient $+1$, so $T = (E-\log16) - \log
+m_1$ and $\operatorname{Cov}(E,T) = \operatorname{Var}(\log m_0) -
+\operatorname{Cov}(\log m_0,\log m_1)$ — structurally present regardless
+of any real physical steepness coupling, purely because both channels
+share an overlapping moment. The specific diagnostic §3.4 proposed
+checking, $E - 2T = -\log m_0 + \log16 + 2\log m_1$, does **not** cancel
+this shared term (the $\log m_0$ coefficient flips sign but survives). So
+a joint Tucker's `A_C` — or any downstream correlation check — finding a
+strong `E`/`T`-coupled direction is not, by itself, evidence it found the
+Miche/dispersion relationship specifically; it could equally be recovering
+this algebraic artifact. This is answered as a mathematical fact; what
+remains open is only the fix below.
+
+**Proposed fix, itself open:** replace $\{E,T\}$ with $\{E,F\}$, $F := E
+- T = \log16+\log m_1$ — a basis where $E$ depends only on $m_0$ and $F$
+only on $m_1$, with no shared additive term, so any observed `E`/`F`
+correlation is attributable to genuine co-variation in the real data
+rather than guaranteed by the basis choice. **Not itself validated**
+against real archive spectra, and not established as the better channel
+choice beyond this one diagnostic. §3.4's experiment has been updated to
+run on `{u,v,E,F}` with a shuffled/synthetic null-baseline control (to
+measure how much apparent coupling survives even with no real physics
+present), rather than `{u,v,E,T}` with no baseline — see
+`correlated_variables.md` §6 for the full experiment.
+
 ---
 
 ## 4. Gaussianization placement
 
-### 4.1 Where, along each variable's independent processing chain, should Gaussianization happen? — **OPEN**
+### 4.1 Where, along each variable's independent processing chain, should Gaussianization happen? — **DECIDED** (placement i, before Tucker — design choice, not proven over ii; see 2026-08-19 update)
 
 Raised in: `gaussian_copula_and_marginals.md` §6.1 (the deepest treatment),
 echoed as a dependency in `tucker_decomposition.md`, `dynamic_mode_decomposition.md`,
@@ -298,6 +709,77 @@ statistics under each placement) that has not been performed by any
 document here, and no amount of further documentation-level reasoning
 closes it; it needs to be settled empirically, once, against real training
 data.
+
+**Update (2026-08-16): a fair placement comparison turns out to be blocked
+on §5.3, not independent of it.** An empirical run in
+`notebooks/00_gaussianization_placement.ipynb` (30-day `sigwh` training
+window, held-out 10-day test period, fixed `R_LAT=10, R_LON=20, r_dmd=20`)
+initially found placement (iii) catastrophically unstable out-of-sample
+(held-out 99th-percentile reconstruction error +255.89, vs. -0.02 for
+placement (i) and +0.15 for placement (ii)) — a result that read as strong
+evidence for Gaussianizing before any decomposition. A follow-up
+sensitivity sweep in the same notebook traced that instability to
+`dmd.Phi`'s condition number (~1.2e6 at those ranks) rather than to
+placement (iii) per se: dropping `r_dmd` from 20 to 5 on the *same* data
+cut the condition number ~5.5x and the held-out error ~100x; matching the
+Tucker core down to a 32-dimensional state (`r_lat=4, r_lon=8, r_dmd=5`)
+made the held-out reconstruction essentially exact (p99 error -0.05).
+Widening the spatial crop alone, holding rank fixed, helped much less
+(~2.5x on conditioning) — full table and derivation in §5.3's own update
+below. **Consequence: a placement-(iii) failure measured at an
+arbitrarily over-parameterized rank is not evidence against that
+placement in general, only against that rank choice.** §4.1 cannot be
+fairly re-evaluated until §5.3 has a real answer (or at minimum, until
+whoever next runs this comparison reports `dmd.Phi`'s condition number
+alongside the reconstruction error for every rank tested, rather than
+trusting one unjustified rank).
+
+**Decision (2026-08-19): adopting placement (i) — Gaussianize after
+physical transformations and climatology removal, before Tucker — as the
+standing default, without waiting for §5.3 to fully close.** This is a
+deliberate design choice, not a proven empirical result: rigorously closing
+the "before-Tucker (i) vs. after-Tucker/before-DMD (ii)" comparison would
+need task 07's rank-selection work to land first, and no evidence gathered
+so far makes that comparison decisively one way. The choice rests on two
+grounds: (a) it is the natural consequence of how the physical fields are
+already processed — fit the marginal-normalizing transform on the same
+climatology-removed, physically-transformed residual scale that all
+downstream linear compression (Tucker, then DMD) subsequently operates on,
+rather than on an opaque, rank-and-basis-dependent coefficient space; (b)
+it matches this project's own held-out empirical result immediately above:
+placements (i) and (ii) were nearly indistinguishable (<1e-2 error) once
+the DMD-rank confound was controlled for, so picking (i) costs nothing on
+the evidence actually in hand.
+
+An external check was also run before finalizing this: four independent
+multi-agent literature/experiment reviews (run outside this repo, pasted
+in for consideration) were asked the same before/after-Tucker/after-DMD
+question. Of eight distinct answers returned (four runs, one set
+duplicated by a context compaction), six favored placement (i) as a
+default, one favored placement (ii), and one refused to pick a default,
+reporting a synthetic experiment where pre-reduction Gaussianization
+*worsened* physical-space reconstruction even while improving latent
+Gaussianity/dependence diagnostics. None of the bundle's own "code
+experiments" ran the real Tucker/DMD stack — most failed outright
+(`numpy`/`scipy` unavailable in the sandbox) and the rest were toy 1-D/2-D
+synthetic analogues (rank-1 "Tucker-like" projections, scalar AR(1) in
+place of DMD) — so the bundle is literature-grounded theoretical framing,
+not independent empirical confirmation, and did not by itself decide this.
+The one point where it is consistent and useful: placement (iii)
+(Gaussianize after DMD directly) is essentially never recommended as a
+default, on the Koopman/DMD-theory grounds that a nonlinear transform
+applied after a linear operator has already been fit cannot retroactively
+linearize that fit — this reinforces, rather than newly establishes, this
+project's own finding above that placement (iii) is the one that fails
+badly at plausible ranks.
+
+**Left as pending work, deliberately not blocking:** whether placement
+(ii) is actually equivalent to, or better than, (i) once §5.3's
+rank-selection work is real. Pick this up either as a follow-on empirical
+task (re-running task 00's held-out comparison at a defensible,
+task-07-derived rank) or via a more targeted literature search than the
+one summarized above — whichever comes first. It does not need to resolve
+before implementation proceeds with (i) as the default.
 
 ### 4.2 What copula family should be used — Gaussian, or one with tail dependence? — **OPEN** (distinct axis from 4.1)
 
@@ -364,7 +846,7 @@ parameterized and sampled such that conjugation is exact rather than
 approximate) — that implementation detail is left to whatever code
 performs sampling.
 
-### 5.3 How should Tucker ranks $(r_{\text{lat}}, r_{\text{lon}}, r_{\text{time}})$ and DMD rank $r_{\text{dmd}}$ be chosen? — **OPEN**
+### 5.3 How should Tucker ranks $(r_{\text{lat}}, r_{\text{lon}}, r_{\text{time}})$ and DMD rank $r_{\text{dmd}}$ be chosen? — **OPEN** (condition-number diagnostic found; memory, not the error curve, is the binding constraint for `wsh`/`wsp`)
 
 Raised in: `tucker_decomposition.md` §6, `dynamic_mode_decomposition.md` §6
 (the same underlying issue, applied to two different decompositions).
@@ -377,6 +859,56 @@ trains the model — no document proposes a data-driven automatic rank
 selector, and none is proposed here either, since doing so responsibly
 requires empirical cross-validation this documentation-only exercise cannot
 perform.
+
+**Update (2026-08-16): empirical evidence that rank choice matters more
+than expected, plus a cheap candidate diagnostic.** A sensitivity sweep in
+`notebooks/00_gaussianization_placement.ipynb` (`sigwh`, 30-day training
+window, southeastern-tropical-Pacific crop) fit Tucker+DMD at several
+`(crop, r_lat, r_lon, r_dmd)` combinations and measured both `dmd.Phi`'s
+condition number and held-out reconstruction error at the 99th percentile:
+
+| crop cells | $r_{\text{lat}}$ | $r_{\text{lon}}$ | $r_{\text{dmd}}$ | $\operatorname{cond}(\Phi)$ | held-out p99 error |
+|---|---|---|---|---|---|
+| 6384  | 10 | 20 | 20 | 1.17e6 | +255.89 |
+| 6384  | 10 | 20 | 5  | 2.10e5 | +2.36   |
+| 6384  | 4  | 8  | 5  | 1.50e5 | -0.05   |
+| 10080 | 10 | 20 | 20 | 4.72e5 | +26.59  |
+
+`dmd.Phi`'s condition number tracks held-out reconstruction quality closely
+and, unlike the error itself, can be computed cheaply
+(`np.linalg.cond(dmd.Phi)`) with no held-out data at all — a candidate
+practical diagnostic: treat a rank choice as suspect if it leaves
+`dmd.Phi` far worse-conditioned than a smaller-rank fit on the same data
+achieves, rather than trusting whatever rank was chosen a priori. Crop size
+(spatial extent) also improves conditioning, but far less than rank choice
+does at fixed rank (~2.5x vs. ~5.5x here) — some, but not most, of the
+effect is the "narrow slice of state space" the DMD/Koopman framing would
+predict. This is not a full automatic rank-selection rule — no document
+proposes one, and this finding doesn't either — but it is a concrete,
+falsifiable signal no prior document identified, and it directly explains
+why §4.1's placement comparison was initially confounded (see that
+section's update).
+
+**Update (2026-08-20, task 07): full rank sweep on real `wsh`/`wsp`
+(task 17's corrected mask) finds no elbow at all within a feasible range —
+the binding constraint is memory, not a plateau.** Swept
+`(5,10),(10,20),(20,40),(40,80),(80,160)` on the same 280×230/`T=1448`
+crop for `sigwh`, `wsh` (log-energy, task 17's height-floor sentinel), and
+`wsp` (log-period, task 17's `T_SENTINEL_S` sentinel). All three curves
+decrease monotonically and materially at every step, steepest at the top
+of the range — `sigwh` 9.64%→0.43%, `wsh` 63.16%→23.81%, `wsp`
+14.37%→5.84% (full table: `tasks/07-tucker-dmd-rank-selection.md` §4).
+Peak memory for a single masked `partial_tucker` fit on this crop,
+measured via an isolated `RLIMIT_AS`-capped subprocess, is **~12.25–
+12.27GB and essentially rank-independent** from `(40,80)` through
+`(80,160)` — dominated by fixed per-ALS-iteration tensor
+unfolding/reconstruction cost, not by the target rank's core size (~74MB
+even at `(80,160)`). `(80,160)` is the largest candidate tested not
+because error stopped improving there, but because it is close to the
+largest rank this machine (31GB total / ~18GB available) can fit at all.
+Recommendation: `(r_lat=80, r_lon=160)` as a hardware-bounded default for
+`wsh`/`wsp`, re-evaluate on any machine with materially more available
+memory rather than trusting it as a long-term ceiling.
 
 ### 5.4 Is masked-HOOI's imputation of land cells guaranteed to converge well? — **OPEN** (mitigation available)
 
@@ -410,6 +942,61 @@ any mode whose growth exceeds a larger threshold for manual review — the
 same "detect, don't silently absorb" philosophy the physical-consistency
 document already applies to individual samples, applied here to a fitted
 model artifact instead.
+
+### 5.6 Does NaN in a partition-energy field mean land, or a genuine "no partition present" physical zero? — **DECIDED** (policy validated empirically, task 17)
+
+Raised in: task 07's `wsh` rank sweep (0-11% of cells passed even a
+90%-valid tolerance over 6 months, forcing a `sigwh`-substitution
+workaround).
+
+No document (`model_design.md:308,313,315`; `variable_taxonomy.md` §4)
+distinguished these two NaN causes before this -- both were described
+purely as land/ice. For the partition triplets (wind-sea, peak, primary
+swell), NaN also occurs at genuine ocean cells whenever that partition is
+simply absent -- a real physical state, not missing data. There is also no
+authoritative, variable-independent land mask anywhere in the codebase;
+every mask was inferred from a variable's own NaN pattern, which conflates
+the two causes for exactly the partition variables where it matters.
+
+**Decided (`tasks/17-partition-nan-sentinel-policy.md` §1, notebook +
+`src/train/masking.py`-scoped only, not yet wired into production):**
+
+1. **Sentinel semantics.** At a genuine ocean cell where a partition
+   variable is NaN, fill with a sentinel and mark **VALID** -- "no
+   partition" is a real physical observation Tucker/DMD fit directly on,
+   not missing data for masked HOOI to impute. Land cells keep today's
+   treatment (zero-filled, INVALID/imputed).
+2. **Blast radius.** `src/train/masking.py` (new module) + notebooks
+   only. `src/weather/model.py` and `src/train/ingest.py` are untouched.
+   Production wiring is a deliberately deferred follow-on task.
+3. **Log-space companions differ by variable, both decided now, not
+   deferred:** height's sentinel `H=0` is the clean physical limit as
+   $m_0\to0$ ($H_{m0}=4\sqrt{m_0}$), so only a numerical floor is needed
+   before `log E:=log(H^2)` (`H_FLOOR_M=0.01`, 1cm). Period's
+   $T_{m01}=m_0/m_1$ has no analogous clean limit -- a genuine $0/0$ form
+   -- but is not arbitrary either: if a fading partition keeps a roughly
+   fixed spectral shape while only its amplitude shrinks, the ratio
+   tends to a well-defined, shape-determined limit (an L'Hopital-style
+   cancellation), estimated empirically from real near-vanishing
+   partitions rather than invented or taken as an archive-wide typical
+   value.
+
+**Empirical categorization and validation (real archive data, 2026-08-20,
+280x230 South Pacific crop, 6-month window -- full derivation and numbers
+in `tasks/17-partition-nan-sentinel-policy.md` §4):** `wsd`, `pwd`, `pwp`,
+`pswd` carry zero ocean-cell NaN; `wsh`/`wsp` (36.5%) and `pswh`/`pswp`
+(1.5%, milder) do. `wsd` is never NaN even where `wsh` is, and is not a
+stale filler (its variance is *higher*, not collapsed, during `wsh`-NaN
+periods) -- plausibly `wad`-derived, an open data-provenance question not
+resolved here. The derived period sentinel is `T_SENTINEL_S ~= 3.84`s
+(extrapolated zero-height limit, cross-validated against a conditional-
+median estimator, 0.51s agreement at the chosen bin width). Rerunning
+`wsh`'s and `wsp`'s Tucker rank sweeps under the corrected mask fixes the
+original pathology outright: coverage goes from 7-11% to **100%**, and
+reconstruction error now **decreases** with rank (was increasing).
+
+**Still open:** whether/how this gets wired into production, and the
+`wsd`-vs-`wad` provenance question above.
 
 ---
 
@@ -493,7 +1080,7 @@ proposed here for the first time**: flag as directionally inconsistent any
 query point where the angular offset $|\theta| = |\angle(\mathbf D) -
 \angle(\mathbf U_{\text{vec}})|$ between wind-sea direction and wind
 direction exceeds a tolerance $\delta_{\text{dir}}$ — **unless** the local
-sea state is young/duration-limited (small $r/r^\*$, i.e. wave age not yet
+sea state is young/duration-limited (small $r/r^\star$, i.e. wave age not yet
 saturated), exactly mirroring the existing energy-budget constraint's
 young-sea exception, since §3.3's derivation shows magnitude and direction
 relax on the same shared timescale.
@@ -585,23 +1172,28 @@ mistaken for open items that need chasing:
 
 | # | Question | Status |
 |---|---|---|
-| 1.1 | Ocean-grid orientation | OPEN |
-| 1.2 | `pwd`/`pswd` convention | OPEN |
+| 1.1 | Ocean-grid orientation | ANSWERED (row-0-south, col-0-at-0°E-eastward, via direct RTOFS NetCDF lookup) |
+| 1.2 | `pwd`/`pswd` convention | ANSWERED |
 | 1.3 | `wad` usability | ANSWERED (no) |
+| 1.4 | `pwh` independence from `sigwh` | ANSWERED (no — confirmed via NOAA GRIB2 tables too; sibling docs corrected) |
+| 1.5 | `*p` fields: peak period or mean period? | ANSWERED (mean period, $T_{m01}$; sibling docs corrected) |
 | 2.1 | `sigwh` disjoint-partition assumption | ANSWERED |
 | 2.2 | Triplet coupling lost by independent Gaussianization | PARTIALLY ANSWERED |
-| 2.3 | `hypot` vs. low-rank Tucker | OPEN (mitigation proposed) |
-| 2.4 | `hypot` vs. independent Gaussianization | OPEN |
+| 2.3 | `hypot` vs. low-rank Tucker | ANSWERED (resolved via dedicated `log E` tensor) |
+| 2.4 | `hypot` vs. independent Gaussianization | PARTIALLY MOOT (magnitude resolved by 2.3; angle open) |
 | 3.1 | Cross-variable coupling mechanism | ANSWERED |
 | 3.2 | Joint-group selection | OPEN |
 | 3.3 | Directional-alignment equilibrium stability | ANSWERED HERE |
-| 4.1 | Gaussianization placement | OPEN (the central question) |
+| 3.4 | Joint multi-channel Tucker vs. downstream joint model for within-group coupling | OPEN (experiment updated to `{E,F}`, see 3.5) |
+| 3.5 | Is `E − 2T ≈ const` clean evidence, or a shared-moment artifact? | ANSWERED (artifact risk confirmed; `{E,F}` fix proposed, unverified) |
+| 4.1 | Gaussianization placement | DECIDED (i, before Tucker — design choice; i-vs-ii comparison left open) |
 | 4.2 | Copula family (Gaussian vs. t/GPD) | OPEN |
 | 5.1 | DMD state-vectorization | ANSWERED (recommendation) |
 | 5.2 | Conjugate-pair sampling | ANSWERED IN PRINCIPLE, procedure open |
-| 5.3 | Tucker/DMD rank selection | OPEN |
+| 5.3 | Tucker/DMD rank selection | OPEN (condition-number diagnostic found; memory-bounded default found for `wsh`/`wsp`) |
 | 5.4 | Masked-HOOI convergence | OPEN (mitigation proposed) |
 | 5.5 | Growing DMD modes | OPEN (mitigation proposed) |
+| 5.6 | Partition-absence NaN vs. land/ice NaN | DECIDED (policy validated empirically, task 17) |
 | 6.1 | OU variance-ratio floor | OPEN |
 | 7.1 | Climatology quasi-stationarity | OPEN |
 | 7.2 | Diurnal reasoning resolution-dependence | OPEN (conditional, inactive) |

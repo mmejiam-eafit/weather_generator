@@ -593,8 +593,9 @@ period) is not itself part of the reduced energy ODE, but §2.1's $S_{nl}$
 term is the physical reason a growing sea's peak period is not independent
 of its height — the same nonlinear transfer that saturates the spectrum's
 energy also migrates its peak frequency, which is why fetch-limited growth
-curves report $H_s$ and $T_p$ climbing together, not as two separately-drawn
-quantities.
+curves report $H_s$ and a characteristic period (classically $T_p$; this
+archive's own period fields are $T_{m01}$, see §3.3's correction) climbing
+together, not as two separately-drawn quantities.
 
 ### 3.2 Wind direction and wind-sea direction
 
@@ -651,6 +652,40 @@ something new introduced by the coupling proposed here.
 
 ### 3.3 Steepness/period–height coupling via dispersion and the Miche breaking limit
 
+**Correction: this archive's period fields are $T_{m01}$ (mean period),
+not $T_p$ (peak period) — the derivation below originally substituted
+`wsp` for $T_p$ without noting this, which matters here specifically.**
+Confirmed at the source level in `variable_taxonomy.md` §2.2: `wsp`/`pwp`/`pswp`
+derive from GRIB `shortName`s `mpww`/`perpw`/`mpts`, all explicitly named
+"mean period of..." by NOAA, distinct from NOAA's separately-numbered
+"Peak Wave Period" parameters, which this archive never reads. This
+matters more here than in `physical_consistency_constraints.md` §2.3's
+plausibility-*bound* use (loose enough to tolerate either statistic): the
+dispersion relation below strictly relates *one* frequency to *one*
+wavelength, and $T_{m01}$ — an energy-weighted average across the whole
+spectrum — is not literally the period of any single wave component the
+way $T_p$ is. Standard wind-sea spectral shapes (JONSWAP-type) give
+$T_p \gtrsim T_{m01}$, with the ratio depending on the spectrum's
+peakedness parameter $\gamma$ (commonly cited in the rough range
+$T_p/T_{m01}\approx 1.05\text{–}1.4$ for typical wind-sea conditions — a
+shape-dependent ratio, not a universal constant, and not independently
+verified against this archive's own spectra here). Substituting
+$T_{m01}$ directly for $T_p$ in the bound below without correction
+therefore **systematically underestimates $L$** (since $T_{m01} \le T_p$
+typically), making the resulting bound on $H_s$ tighter than the true
+Miche limit intends — i.e. a **conservative, over-rejecting** bias if
+used unmodified as a rejection-sampling check, not a bias that lets
+physically inconsistent draws through. The derivation is left in terms of
+a generic period $T$ below; §4/§5 of this document and any implementation
+of `physical_consistency_constraints.md`'s §2.1–§2.3 checks should either
+apply an empirically-calibrated correction factor $T_p \approx \alpha\,
+T_{m01}$ (fit against this archive's own paired height/period
+observations, per the same calibration principle
+`physical_consistency_constraints.md` §5 already establishes for its
+other constants) or restate the bound directly in terms of $T_{m01}$ with
+a correspondingly widened tolerance — not apply the $T_p$-derived
+constant `0.14` to a $T_{m01}$ value as if they were interchangeable.
+
 **Mechanism.** Deep-water linear dispersion, $\omega^2 = gk$
 (`physical_consistency_constraints.md` §2.3), gives wavelength in terms of
 period:
@@ -664,14 +699,18 @@ The Miche (1944) breaking criterion bounds wave steepness by depth-limited
 wavelength, $H/L \lesssim 0.14\tanh(kh)$; in the deep-water limit ($kh\to
 \infty$, $\tanh\to 1$) this reduces to a pure steepness bound $H/L\lesssim
 0.14$, and substituting the dispersion result above gives a bound relating
-significant height to peak period directly:
+significant height to period directly (written here for the peak period
+$T_p$ this derivation is physically stated in terms of, per the
+correction above — **not** to be evaluated on a raw $T_{m01}$ value
+without the $\alpha$ correction):
 
 $$
 H_s \;\lesssim\; 0.14\,L \;=\; 0.14\,\frac{g\,T_p^2}{2\pi}.
 $$
 
-Applied to this archive's wind-sea triplet ($H_s\to \mathrm{wsh}$, $T_p\to
-\mathrm{wsp}$), this is a **real, physically enforced upper bound**
+Applied to this archive's wind-sea triplet ($H_s\to \mathrm{wsh}$,
+$T_p\to \alpha\cdot\mathrm{wsp}$, i.e. `wsp` corrected toward $T_p$ before
+substitution), this is a **real, physically enforced upper bound**
 relating two members of the wind-sea Class C triplet that the current
 per-variable pipeline treats as entirely independent tensors. It is not a
 new, unrelated fact: the same crest-instability/breaking mechanism that
@@ -679,10 +718,30 @@ enforces this instantaneous steepness bound is the physical process behind
 §2.1's whitecapping dissipation term $S_{ds}$ — one is the temporal,
 energy-integrated consequence of the mechanism (§2.3's $E^{3/2}$
 saturation), the other is its instantaneous, geometric signature
-(a height/period bound). The archive's `wsh`/`wsp` pair, or equally
-`pwh`/`pwp`, should therefore be understood as two coupled readouts of one
-breaking-limited spectrum, not two independent scalar fields whose
-correlation is incidental.
+(a height/period bound). The archive's `wsh`/`wsp` pair should therefore be
+understood as two coupled readouts of one breaking-limited spectrum, not
+two independent scalar fields whose correlation is incidental — the
+$T_{m01}$-vs-$T_p$ correction above is a calibration detail this coupling
+needs to be applied correctly, not a reason to doubt the coupling itself.
+
+**Correction: `pwh`/`pwp` is not an equally valid instance of this same
+coupling, and an earlier draft of this section wrongly implied it was.**
+`wsh` and `wsp` are two genuinely independent functionals of the same
+wind-sea partition's own spectrum, so the Miche argument above applies to
+them directly. `pwh`, however, is confirmed (`docs/variable_taxonomy.md`
+§3.3; both at the `noaa-etl` source level — `sigwh` and `pwh` are derived
+from the identical GRIB `swh` field through an identical transform — and
+independently at NOAA's own GRIB2 parameter-table level, which defines
+`DIRPW`/`PERPW` for the "primary wave" but no corresponding height field
+at all) to be `sigwh` restated, not an independent height computed over
+`pwp`'s own partition. The physically meaningful version of this coupling
+for the "primary wave" pair is therefore `sigwh`/`pwp`, not `pwh`/`pwp` —
+and it is a *weaker*-grounded claim than the `wsh`/`wsp` case, because
+`sigwh` is a composite across the whole spectrum (wind-sea plus every
+swell partition), not the single-partition spectrum the Miche/dispersion
+argument above was derived for. Treat `sigwh`/`pwp` steepness coupling as
+a plausible but unverified extension, not a direct restatement of the
+`wsh`/`wsp` result.
 
 | Example | Variables | Class(es) per `variable_taxonomy.md` | Mechanism |
 |---|---|---|---|
@@ -717,6 +776,11 @@ Class-B wind vector and the entire Class-C wind-sea triplet, unified by the
 single fact that $S_{in}$ is the shared right-hand-side term driving all
 five of those tensors' evolution. The second is offered as an example of
 how the same logic extends outward, at the cost discussed in §4.3/§6.
+(`wsp`/`pwp` here denote the tensors actually fit — per
+`variable_taxonomy.md` §3.4, that is $T=\log(\text{wsp})$/$\log(\text{pwp})$,
+not the raw field; the wind-sea group could also include `log E_wsh`,
+§3.4's added height tensor, as a candidate member, not listed above since
+neither this table nor §5's diagnostics have been re-evaluated with it yet.)
 
 ### 4.2 Build the joint state from already-compressed coefficients
 
@@ -912,3 +976,173 @@ available $T$ can support (§6).
   interesting rotational approach (a Kuramoto-oscillator-style phase
   equation is the natural further reduction, if directional alignment
   dynamics are ever specified with the same rigor as §2) is left open.
+
+- **Notation, stated precisely to avoid a collision with §2.3's own use of
+  $E$.** `variable_taxonomy.md` §3.4 now formalizes a `log`-transformed
+  tensor representation for wave heights, $\log E := \log(H^2) = 2\log H$
+  — using exactly *this* document's own §2.3 energy proxy $E := \mathrm
+  {wsh}^2$, `log`-transformed for the reasons given there (dynamic range,
+  power-law-growth linearization). It is not a second, competing
+  definition of $E$: every occurrence of bare $E$ below and throughout §2
+  still means $\mathrm{wsh}^2$ in physical units; the tensor actually fit
+  by Tucker is always written $\log E$, never bare $E$.
+
+- **The $\log E$/$T$ channel pair the question below relies on is not two
+  independently-constructed physical channels — it is a linear
+  reparametrization of the same two spectral moments, sharing one term
+  with matching sign, which confounds the diagnostic that question
+  proposes.** Using $E=\mathrm{wsh}^2=16m_0$ (§2.3, via $H_s=4\sqrt{m_0}$)
+  and $T_{m01}=m_0/m_1$ (§3.4's period correction): $\log E =
+  \log(16\,m_0) = \log 16 + \log m_0$, and $T = \log T_{m01} =
+  \log(m_0/m_1) = \log m_0 - \log m_1$. Both carry $\log m_0$ with
+  coefficient $+1$:
+
+  $$T = (\log E-\log16) - \log m_1 \quad\Longleftrightarrow\quad \log m_1 = \log E - T - \log 16.$$
+
+  Consequently $\operatorname{Cov}(\log E,T) = \operatorname{Var}(\log
+  m_0) - \operatorname{Cov}(\log m_0,\log m_1)$ — not automatically zero
+  or large, but structurally present *regardless of any real physical
+  steepness coupling*, purely because both channels are built from an
+  overlapping moment. Even the specific diagnostic combination the
+  question below checks for, $\log E-2T = -\log m_0 + \log16 + 2\log m_1$,
+  does not cancel this shared term (the $\log m_0$ coefficient flips sign
+  but does not vanish). So a joint Tucker's `A_C` — or a downstream
+  correlation check — finding a strong $\log E$/$T$-coupled direction is
+  not, by itself, evidence it discovered the Miche/dispersion steepness
+  relationship specifically; it could equally well be recovering this
+  algebraic artifact.
+
+  **Proposed decorrelated alternative, itself unverified.** Replace
+  $\{\log E,T\}$ with $\{\log E,F\}$, $F := \log E - T = \log16 + \log
+  m_1$ — a basis where $\log E$ depends only on $m_0$ and $F$ only on
+  $m_1$, with no shared additive term. Any correlation observed between
+  $\log E$ and $F$ is then attributable to genuine co-variation between
+  $\log m_0$ and $\log m_1$ in the real data (itself plausibly physical —
+  a more energetic sea may well carry systematically different frequency
+  content — but at least not a basis-induced certainty). **This fix is
+  not itself validated** — it removes the mechanical confound but has not
+  been checked against real archive spectra to confirm it sharpens the
+  diagnostic, nor is it established that $\{\log E,F\}$ is the better
+  channel choice generally (rather than just for this one diagnostic).
+  The experiment specified below should therefore be run on
+  $\{u,v,\log E,F\}$, not $\{u,v,\log E,T\}$, with a null-baseline
+  control (shuffled/synthetic data preserving each channel's own marginal
+  but destroying genuine cross-channel physics) to establish how much
+  residual $\log E$/$F$ correlation the real archive shows above whatever
+  the shuffle alone produces, before attributing any of it to the Miche
+  steepness law.
+
+- **Whether within-group channel coupling (a single partition's derived
+  `u, v, log E, T`) requires a joint multi-channel Tucker, or is
+  recoverable from §4.2's independently-fit per-variable cores plus a
+  downstream joint model — genuinely open, not settled by
+  `tucker_decomposition.md` §4.1's per-variable rule alone.** This
+  question was raised from outside this document, in response to a
+  competing design proposal (`physical_handoff.md`, since found to
+  conflict with this project's established design on several other,
+  unrelated points, and since reformalized as `variable_taxonomy.md`
+  §3.4's `log E`/`T` marginal pre-transform convention) that stacks one
+  partition's `u, v, log E, T` into a single 4-mode tensor `(lat, lon, t,
+  C)` and fits one joint Tucker across it, with the channel factor `A_C`
+  intended to discover cross-channel structure — e.g. a steepness-like
+  direction close to the `log E − 2T ≈ const` combination §3.3's
+  Miche-breaking-limit argument motivates — directly. That is a real
+  architectural alternative to §4's proposal of fitting each channel as
+  its own independent 3-mode Tucker and only introducing joint structure
+  downstream, on the compressed coefficients.
+
+  **Why this is a genuinely open question and not resolved by citing the
+  per-variable rule.** There is a real, structural asymmetry between the
+  two designs, not just a stylistic preference:
+  - Each of §4's independent per-variable Tucker fits truncates to its own
+    top `(R_lat, R_lon, R_t)` modes based on *that one channel's own*
+    marginal variance, before any cross-channel structure is considered.
+    If the physical coupling between, say, `log E` and `T` lives in a
+    direction that is weak in each channel's own marginal variance
+    individually but strong jointly across the two — plausible for a
+    subtle steepness signature riding on top of each channel's own
+    larger-scale, independently-driven variability (`log E`'s dominant
+    modes plausibly storm/energy-driven, `T`'s plausibly fetch/dispersion-driven,
+    per the different physical processes in §2.1's balance equation) —
+    that direction is discarded by each channel's own independent
+    truncation *before* any downstream joint model (§4.2's joint DMD, or a
+    simpler CCA/PLS step) ever sees it. No amount of joint modeling
+    afterward can recover a direction that residual truncation has already
+    removed. A joint channel-mode Tucker does not have this blind spot: its
+    channel-mode unfolding's SVD sees the raw cross-channel covariance
+    directly, before any channel-specific truncation happens. This is the
+    same reason joint/multi-view dimensionality reduction (CCA, PLS, joint
+    tensor factorization) is generally preferred over "reduce each view
+    independently, then correlate" pipelines in the wider multi-view
+    statistical-learning literature — the asymmetry here is a specific
+    instance of that general phenomenon, not a novel claim about this
+    archive.
+  - The countervailing cost, which the joint-channel proposal does not
+    itself account for: a joint 4-mode Tucker forces `u`, `v`, `log E`,
+    `T` to share the *same* spatial factors `A_lat`, `A_lon` and temporal factor
+    `A_t` — i.e. it assumes their dominant spatiotemporal EOFs coincide,
+    which is a real, untested assumption, and one the fully independent
+    per-variable design never has to make.
+  - **A separate, likely more fundamental limitation applies regardless of
+    which architecture wins this comparison.** The Miche steepness bound
+    motivating this whole question (§3.3) is a *pointwise* physical
+    inequality, evaluated at each individual `(lat, lon, t)` — not a
+    global correlation or EOF pattern. Any linear (Tucker-based)
+    decomposition, joint-channel or independent-per-variable alike, is an
+    L2-optimal *soft, statistical* summary; neither can *guarantee* a hard
+    physical inequality holds at every reconstructed point. Even a fully
+    successful joint-channel Tucker would only produce an approximate soft
+    correlation the model tends toward, not an enforced bound — that job
+    already correctly belongs to
+    `physical_consistency_constraints.md`'s rejection-sampling layer
+    (§2.3), independent of this decision. So the value of resolving this
+    question is about representation fidelity and (plausibly) reduced
+    downstream rejection rates from better-correlated draws pre-filter —
+    not a substitute for that constraint layer, under either design.
+
+  **What is needed to empirically test and answer this.** A small, bounded
+  experiment, not a full re-architecture or a decision made by reasoning
+  alone:
+  1. **Scope to one partition.** Use wind-sea (`wsh`/`wsd`/`wsp`), not the
+     peak-wave or primary-swell groups — it has a genuinely independent
+     height (unlike `pwh`, see `variable_taxonomy.md` §3.3) and the
+     clearest-motivated steepness relationship (§3.3 derives it for
+     `wsh`/`wsp` directly), so the comparison isn't confounded by a
+     degenerate input.
+  2. **Fit (a):** one joint 4-channel Tucker on that partition's `u, v,
+     log E, F` — **`F`, not `T`**, per the decorrelated-basis bullet
+     above — at a modest, fixed rank budget `(R_lat, R_lon, R_t, R_C)`.
+  3. **Fit (b):** four fully independent per-channel 3-mode Tucker
+     decompositions on the same `u, v, log E, F`, at a comparable total
+     rank budget, then run CCA (simplest first check) or §4.2's joint-DMD
+     construction (fuller check, since it also tests temporal dynamics, not
+     just static correlation) on the resulting compressed coefficient time
+     series.
+  4. **Diagnostic, with a null baseline.** Does (a)'s fitted `A_C` contain
+     a column indicating genuine `log E`/`F` coupling? Does (b)'s downstream
+     joint model recover a comparably strong version of the same
+     relationship, or a materially weaker one? Run both against the
+     shuffled/synthetic null baseline from the bullet above first, so a
+     positive finding on real data can be judged against how much
+     coupling appears even with no real physics present — a step the
+     original `{E,T}` version of this experiment did not specify and
+     needed, precisely because `{E,T}` had a built-in confound `{E,F}`
+     removes but does not itself guarantee a clean null.
+  5. **Decision rule.** If (b) recovers the coupling about as well as (a),
+     the independent per-variable design (§4) is safe to keep as the
+     default — it is cheaper and avoids the shared-basis assumption above,
+     with no loss. If (a) finds a materially stronger relationship that
+     (b) misses, that is a specific, checkable justification for a
+     narrowly scoped exception — restricted to one partition's own already
+     physically-related channels, never extended across unrelated
+     variables (which would reproduce Error 2's original violation at full
+     scale, the thing this whole document series exists to prevent).
+
+  This experiment is cheap relative to the full pipeline — one partition's
+  four derived fields at modest rank, not the full 15-tensor archive — and
+  can be run at notebook scale (comparable to `notebooks/01` and `02`'s
+  existing Tucker/DMD understanding notebooks) before any production-code
+  commitment either way. It mirrors, in both spirit and required rigor, how
+  `open_questions.md` §4.1 (Gaussianization placement) has already been
+  left explicitly unresolved pending equivalent empirical validation,
+  rather than decided by argument alone.

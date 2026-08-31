@@ -412,6 +412,20 @@ Each time slice $C^{(v)}_{:,:,t} \in \mathbb R^{r_{\mathrm{lat}} \times
 r_{\mathrm{lon}}}$ is the "state" at time $t$ in this variable's own
 Tucker-compressed coordinates.
 
+For height/period variables specifically, $C^{(v)}$ traces back to the
+`log`-transformed tensor `tucker_decomposition.md` §4.1 now specifies
+($\log E$, $T$ — `variable_taxonomy.md` §3.4), not raw physical units.
+This is relevant to DMD in particular, beyond just Tucker: `log`
+converts the archive's genuinely multiplicative, power-law fetch/duration
+growth (§2.1's `correlated_variables.md`-derived motivation) into additive
+growth, which is the regime a linear operator fit (this document's whole
+subject) is best justified in — a DMD eigenvalue fit directly on raw,
+multiplicatively-growing $H^2$ would be fitting a single linear rate to a
+process whose absolute growth increment scales with its own current
+amplitude, exactly the kind of misspecification this document's rank- and
+mode-selection guidance (§4.3, §6) assumes has already been avoided
+upstream.
+
 ### 4.2 The state-vectorization tension, addressed honestly
 
 Exact DMD (§2.2) is defined on a snapshot **matrix**: it needs each $x_t$
