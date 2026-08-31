@@ -22,9 +22,11 @@ _CONTINUOUS_VARIABLES: Final[frozenset[str]] = frozenset(
 # Direction fields stored as int8 16-point compass codes, keyed to the code that
 # represents North (see docs/model_design.md §2.3). `wad` is still origin-code
 # decodable but unused downstream (`wad_come_from` is the source of truth for
-# wind direction — see task 02). `ocd`'s `going_to` convention is provisional
-# pending §2.7 ocean-grid re-verification, but the *decode* (origin code `1`,
-# same as `wad`) is settled regardless of that open question.
+# wind direction -- confirmed decoy, exactly 180° off; see
+# docs/open_questions.md §1.3). `ocd`'s decode (origin code `1`, same as
+# `wad`) is settled independent of the ocean grid's orientation, which is
+# itself now confirmed too (docs/open_questions.md §1.1) -- the "provisional"
+# hedge this comment used to carry no longer applies.
 _DIRECTION_ORIGIN_CODES: Final[dict[str, int]] = {
     "wsd": 0,
     "pwd": 0,

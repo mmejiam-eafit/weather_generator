@@ -95,6 +95,8 @@ def test_grid_coordinates_wind() -> None:
 
 
 def test_grid_coordinates_ocean_raises() -> None:
-    """Ocean grid orientation is unverified; requesting it raises (§2.7)."""
-    with pytest.raises(ValueError, match="unverified"):
+    """Ocean grid orientation is confirmed (open_questions.md §1.1), but the
+    grid is non-linear (Mercator/tripolar) with no 2D coordinate support
+    yet; requesting it still raises."""
+    with pytest.raises(ValueError, match="not a linear"):
         grid_coordinates("ocean")

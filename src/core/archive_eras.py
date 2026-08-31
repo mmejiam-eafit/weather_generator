@@ -44,8 +44,10 @@ class ArchiveEra:
     rather than a single shape, because era 1's ocean grid is internally
     inconsistent: `sst` differs from `ocs`/`ocd`. Ocean shapes are recorded
     here for future use only — `core.config.grid_coordinates` still does not
-    support `"ocean"` (§2.7 orientation is separately unverified); nothing in
-    this module wires ocean loading through.
+    support `"ocean"`, not because orientation is unknown (confirmed,
+    docs/open_questions.md §1.1) but because the grid is non-linear
+    (Mercator/tripolar) and has no 2D per-cell coordinate support yet;
+    nothing in this module wires ocean loading through.
 
     `lat0`/lon-step coordinate convention is deliberately NOT modeled here:
     only *shape* was empirically confirmed for era 1 and era 3 via land-mask

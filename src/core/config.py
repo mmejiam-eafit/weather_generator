@@ -45,10 +45,18 @@ OCEAN_GRID_SHAPE: Final[tuple[int, int]] = (1121, 2880)  # era 2 & 3 -- see modu
 
 WAVE_GRID_LAT_AT_ROW0: Final[float] = -90.0
 WIND_GRID_LAT_AT_ROW0: Final[float] = -90.0
-# OCEAN_GRID_LAT_AT_ROW0 is intentionally unset: the ocean grid's row/lat
-# orientation has not been empirically verified (see docs/model_design.md
-# §2.7). Do not assume it matches the wave/wind convention by analogy — set
-# this constant only after running the correlation study described there.
+# OCEAN_GRID_LAT_AT_ROW0 is intentionally unset -- but not because the
+# orientation is unknown. docs/open_questions.md §1.1 confirms it directly
+# (row 0 = south, column 0 = 0°E increasing eastward, matching the wave/wind
+# convention exactly), via a real RTOFS NetCDF Latitude/Longitude lookup
+# remapped through hycom_satocean_idx.npy. What blocks this constant is a
+# different problem: the ocean grid's row spacing is non-uniform in degrees
+# (Mercator projection south of ~47°N; ~0.10°/row near -65°, ~0.125°/row near
+# -50..-27°) and the region north of ~47°N is not zonal at all (tripolar
+# patch) -- so it cannot be expressed as `lat0 + row * step` the way the
+# wave/wind grids are. Setting a single lat0 here would be actively wrong,
+# not merely unverified. Real per-cell 2D coordinate data is required
+# instead; see the derivation in docs/open_questions.md §1.1.
 #
 # WAVE_GRID_LAT_AT_ROW0 is era 3's empirically verified value (identical to
 # WIND_GRID_LAT_AT_ROW0's convention — see
@@ -108,8 +116,13 @@ def grid_coordinates(grid: str) -> tuple[np.ndarray, np.ndarray]:
     Parameters
     ----------
     grid : str
-        One of ``"wave"``, ``"wind"``. ``"ocean"`` is not yet supported: its
-        row/latitude orientation is unverified (see §2.7).
+        One of ``"wave"``, ``"wind"``. ``"ocean"`` is not yet supported --
+        not because its orientation is unknown (docs/open_questions.md §1.1
+        confirms row 0 = south, column 0 = 0°E increasing eastward), but
+        because it is not a linear `lat0 + row * step` grid: row spacing is
+        non-uniform (Mercator) south of ~47°N and non-zonal (tripolar patch)
+        north of it. Real per-cell 2D coordinate data is required; see
+        `OCEAN_GRID_LAT_AT_ROW0`'s comment above.
 
     Returns
     -------
@@ -130,7 +143,10 @@ def grid_coordinates(grid: str) -> tuple[np.ndarray, np.ndarray]:
     else:
         raise ValueError(
             f"grid {grid!r} is not supported; the ocean grid's orientation is "
-            "unverified (see docs/model_design.md §2.7)."
+            "confirmed (see docs/open_questions.md §1.1) but it is not a "
+            "linear lat0+step grid (Mercator south of ~47°N, tripolar patch "
+            "north of it) -- real per-cell 2D coordinate data is required "
+            "and not yet implemented."
         )
     lats = lat0 + np.arange(n_rows, dtype=np.float64) * lat_step
     lons = np.arange(n_cols, dtype=np.float64) * GRID_LON_STEP_DEG
