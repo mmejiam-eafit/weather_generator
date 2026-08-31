@@ -124,9 +124,11 @@ def test_load_training_window_unknown_variable_raises(tmp_path: Path) -> None:
 
 
 def test_load_training_window_ocean_variable_raises(tmp_path: Path) -> None:
-    """An ocean-grid variable raises because its orientation is unverified (§2.7)."""
+    """An ocean-grid variable raises: orientation is confirmed
+    (open_questions.md §1.1) but the grid is non-linear (Mercator/tripolar)
+    with no 2D coordinate support yet."""
     _write_snapshot(tmp_path, _T0, "sst", np.full((2, 2), 15.0), np.float16)
-    with pytest.raises(ValueError, match="unverified"):
+    with pytest.raises(ValueError, match="not a linear"):
         load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["sst"])
 
 
@@ -211,6 +213,49 @@ def test_load_training_window_wad_consistency_check_passes_silently(
 
     assert ds["sigwh"].shape == (n_times, 1, 2)
     assert "consistency check passed" in capsys.readouterr().err
+
+
+def test_load_training_window_wad_consistency_check_ignores_land_cells(tmp_path: Path) -> None:
+    """Land cells with identical wad/wad_come_from fill codes don't trip the
+    check; only ocean cells (masked via `was`'s NaN pattern) are checked
+    (tasks/15-wad-consistency-check-land-mask-artifact.md).
+
+    Reproduces the real-archive false positive found 2026-08-14: without
+    masking, this window's land cells alone (deviation 180° from the
+    expected 180° relationship) would raise, even though the ocean cells
+    are cleanly 180° apart.
+    """
+    was = np.array([[np.nan, 5.0, np.nan, 3.0]], dtype=np.float16)
+    wad = np.array([[1, 1, 1, 5]], dtype=np.int8)  # land fill code (1) repeated at idx 0/2
+    # land: same fill code as wad (idx 0/2); ocean: 180 deg apart (idx 1/3)
+    wad_come_from = np.array([[1, 9, 1, 13]], dtype=np.int8)
+
+    _write_snapshot(tmp_path, _T0, "was", was, np.float16)
+    _write_snapshot(tmp_path, _T0, "wad", wad, np.int8)
+    _write_snapshot(tmp_path, _T0, "wad_come_from", wad_come_from, np.int8)
+
+    ds = load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["was"])
+
+    assert ds["was"].shape == (1, 1, 4)
+
+
+def test_load_training_window_wad_consistency_check_still_detects_ocean_drift(
+    tmp_path: Path,
+) -> None:
+    """A genuine mismatch at an ocean cell still raises even with land-cell masking.
+
+    Confirms the tasks/15 fix doesn't make the check vacuous.
+    """
+    was = np.array([[np.nan, 5.0]], dtype=np.float16)  # idx 0 land, idx 1 ocean
+    wad = np.array([[1, 1]], dtype=np.int8)
+    wad_come_from = np.array([[1, 1]], dtype=np.int8)  # idx 1 ocean: same code -> not 180 apart
+
+    _write_snapshot(tmp_path, _T0, "was", was, np.float16)
+    _write_snapshot(tmp_path, _T0, "wad", wad, np.int8)
+    _write_snapshot(tmp_path, _T0, "wad_come_from", wad_come_from, np.int8)
+
+    with pytest.raises(ValueError, match="do not differ by 180"):
+        load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["was"])
 
 
 # --- Archive era drift (see tasks/16-archive-grid-resolution-drift.md) ---

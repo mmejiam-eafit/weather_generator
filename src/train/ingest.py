@@ -17,19 +17,41 @@ _WARN_GAP_SNAPSHOTS = 2  # 6 h at 3 h cadence
 
 
 def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
-    """Guard against upstream archive convention drift (§3.7, §5.1)."""
+    """Guard against upstream archive convention drift (§3.7, §5.1).
+
+    Restricted to ocean cells, masked via `was`'s NaN pattern (same wind
+    grid as `wad`/`wad_come_from`). Land cells store an identical raw fill
+    code in both `wad` and `wad_come_from`, which decodes to the same
+    degrees value in both and would otherwise always trip this check
+    regardless of any real archive drift -- see
+    tasks/15-wad-consistency-check-land-mask-artifact.md, found on first
+    validation against the real archive: over ocean cells the deviation
+    from 180° is exactly 0.0° on every real date checked, but the
+    previous whole-grid check failed on every one of them due to land.
+    If `was` isn't present at `t` (e.g. a synthetic test archive that
+    never wrote it), falls back to checking the whole grid unmasked.
+    """
     wad = decode_compass_code(load_raw(data_dir, t, "wad"), origin_code=1)
     wad_from = decode_compass_code(load_raw(data_dir, t, "wad_come_from"), origin_code=1)
     diff = np.abs(((wad - wad_from - 180.0 + 180.0) % 360.0) - 180.0)  # min circular distance
-    max_dev = float(np.nanmax(diff))
+
+    try:
+        ocean_mask = ~np.isnan(load_snapshot(data_dir, t, "was"))
+    except FileNotFoundError:
+        ocean_mask = np.ones_like(diff, dtype=bool)
+    if not np.any(ocean_mask):
+        return
+
+    max_dev = float(np.nanmax(diff[ocean_mask]))
     if max_dev > 5.0:  # tolerance for 22.5° discretization + rounding
         raise ValueError(
             f"wad and wad_come_from do not differ by 180° at {t.isoformat()}. "
-            f"Max deviation: {max_dev:.2f}°. Archive convention may have changed."
+            f"Max deviation: {max_dev:.2f}° (ocean cells only; land excluded via "
+            "`was`'s NaN mask). Archive convention may have changed."
         )
     print(
         f"wad/wad_come_from consistency check passed at {t.isoformat()}: "
-        f"max deviation {max_dev:.2f}°",
+        f"max deviation {max_dev:.2f}° (ocean cells only)",
         file=sys.stderr,
     )
 
@@ -254,8 +276,10 @@ def load_training_window(
         one archive era (§2.2), if a loaded snapshot's shape is inconsistent
         with its era or with earlier snapshots in the same window, if a
         variable is not in the §10 variable table, if a variable's grid is
-        not yet supported (e.g. an ocean-grid variable before §2.7
-        verification), or if `wad` and `wad_come_from` do not differ by 180°
+        not yet supported (e.g. an ocean-grid variable -- orientation is
+        confirmed, docs/open_questions.md §1.1, but the grid is non-linear
+        and 2D per-cell coordinate support doesn't exist yet), or if `wad`
+        and `wad_come_from` do not differ by 180°
         at the first or last checked snapshot (§5.1: archive convention
         drift).
     RuntimeError
