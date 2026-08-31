@@ -1,6 +1,8 @@
 """Tests for train.masking (see docs/variable_taxonomy.md §3.3.1,
 tasks/17-partition-nan-sentinel-policy.md)."""
 
+from typing import cast
+
 import numpy as np
 from numpy.testing import assert_allclose
 
@@ -113,9 +115,10 @@ def test_ocean_nan_report_restricted_to_ocean() -> None:
     report = ocean_nan_report(X, land_mask, valid_time_fracs=(1.0, 0.5))
 
     assert report["n_ocean_cells"] == 1
-    assert_allclose(report["ocean_nan_fraction"], 0.25)
-    assert report["always_valid_cell_fraction"][1.0] == 0.0
-    assert report["always_valid_cell_fraction"][0.5] == 1.0
+    assert_allclose(cast(float, report["ocean_nan_fraction"]), 0.25)
+    always_valid_frac = cast("dict[float, float]", report["always_valid_cell_fraction"])
+    assert always_valid_frac[1.0] == 0.0
+    assert always_valid_frac[0.5] == 1.0
 
 
 def test_partition_companion_backfill_check_no_primary_nan() -> None:
@@ -127,7 +130,7 @@ def test_partition_companion_backfill_check_no_primary_nan() -> None:
     result = partition_companion_backfill_check(primary, companion, land_mask)
 
     assert result["n_primary_nan_ocean"] == 0
-    assert np.isnan(result["companion_also_nan_fraction"])
+    assert np.isnan(cast(float, result["companion_also_nan_fraction"]))
 
 
 def test_partition_companion_backfill_check_detects_stale_companion() -> None:
@@ -147,8 +150,8 @@ def test_partition_companion_backfill_check_detects_stale_companion() -> None:
 
     assert result["n_primary_nan_ocean"] == 20
     assert result["companion_also_nan_fraction"] == 0.0
-    assert result["mean_companion_std_when_primary_nan"] < 1e-9
-    assert result["mean_companion_std_when_primary_valid"] > 0.1
+    assert cast(float, result["mean_companion_std_when_primary_nan"]) < 1e-9
+    assert cast(float, result["mean_companion_std_when_primary_valid"]) > 0.1
 
 
 def test_period_sentinel_from_archive_recovers_known_intercept() -> None:
