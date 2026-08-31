@@ -1,17 +1,22 @@
-# Implementation tasks: v1 → v2 migration
+# Open-question resolution tasks
 
-Derived from `model_design_v2.md` (repo root, to be moved to `docs/model_design.md`
-by task 00 — that's the source of truth for every formula/signature cited
-below; read the referenced section before implementing, this index does not
-repeat rationale). Ordered by dependency; do not skip ahead within a chain.
+This index tracks experiments that answer the 15 currently OPEN /
+PARTIALLY ANSWERED / PARTIALLY MOOT questions in `docs/open_questions.md`
+(§2.2, §2.4, §3.2, §3.4/§3.5, §4.1, §4.2, §5.3, §5.4, §5.5, §6.1, §7.1,
+§7.2, §8.1, §8.2, §8.3). Each task produces a reproducible, notebook-backed
+experiment against real archive data, with a place to record what was
+found.
 
-Legend: **(new)** file doesn't exist yet. **(rewrite)** replaces existing
-content wholesale. **(edit)** modifies part of an existing file. **(delete)**
-removed entirely.
+**This replaces the previous v1→v2 code-migration task list**, which
+predated the current `docs/` series (`variable_taxonomy.md`,
+`tucker_decomposition.md`, ..., `correlated_variables.md`,
+`open_questions.md`) and referenced a since-superseded
+`docs/model_design.md`. That list is not discarded — it's moved to
+[`tasks/tbd/`](tbd/v1_v2_migration_index.md), deprioritized rather than
+deleted, since it may still inform an eventual implementation plan once
+these open questions are resolved.
 
-**Status column** (emoji conventions per [gitmoji.dev](https://gitmoji.dev)
-where a direct match exists; two entries have no gitmoji equivalent and are
-noted as such):
+**Status column** (same legend as the previous index):
 
 | Emoji | Meaning |
 |---|---|
@@ -22,60 +27,64 @@ noted as such):
 | ♻️ | Refactored (`:recycle:`) — done, but the approach changed materially from this file's spec; check the task file's notes before trusting it verbatim |
 | ⚰️ | Dropped (`:coffin:`) — deliberately not doing this; reason belongs in the task file, not just this table |
 
+**✅ Task 15 (fixed 2026-08-14)** — `load_training_window` previously
+crashed on all real era-3 data due to a land-cell false positive in its
+`wad`/`wad_come_from` consistency guard (found on first real-archive
+validation after the data disk was reconnected). It's filed as task **15**
+(not renumbered to 00, to avoid churning 14 files' names and
+cross-references) but is listed first here since it blocked every task
+below it. Now fixed — tasks 00–14 are unblocked and can run their
+notebooks against real data.
+
 | # | Status | Task | Depends on | Key files |
 |---|---|---|---|---|
-| 00 | ✅ | Bootstrap: docs, AGENTS.md, tooling | — | `docs/model_design.md`, `AGENTS.md` |
-| 01 | ✅ | `core/io.py` direction codes | 00 | `src/core/io.py` (edit) |
-| 02 | ✅ | `ComingFromToUV`/`GoingToToUV` transformers | 01 | `src/train/directional.py` (rewrite) |
-| 03 | ✅ | Ingest: `wad`/`wad_come_from` consistency check | 01 | `src/train/ingest.py` (edit) |
-| 04 | ✅ | Climatology linear trend term | — | `src/train/climatology.py` (edit) |
-| 05 | ✅ | Tucker → TensorLy wrapper | — | `src/train/tucker.py` (rewrite) |
-| 06 | ✅ | DMD → PyDMD wrapper + mode-OU | — | `src/train/dmd.py` (rewrite), `src/train/ou.py` (delete) |
-| 07 | ✅ | Local residual OU layer | 05, 06 | `src/train/local_residual.py` (new) |
-| 08 | ✅ | `WeatherModel` rewrite | 02, 03, 04, 05, 06, 07 | `src/weather/model.py` (rewrite) |
-| 09 | ⬜ | Sampling rewrite (coherent + local) | 08 | `src/weather/simulate.py` (rewrite) |
-| 10 | ⬜ | Validation: hurricane-season checks + step-name fixes | 08, 09 | `src/weather/validate.py` (edit) |
-| 11 | ⬜ | Notebooks | 08, 09, 10 | `notebooks/verify_ocean_grid_orientation.ipynb` (new), `notebooks/test_pipeline.ipynb` (rewrite) |
-| 12 | ⬜ | Integration tests + import boundaries | 10 | `tests/weather/test_integration.py` (new), `tests/test_import_boundaries.py` (new) |
-| 13 | ⬜ | Final docs + release | all | `README.md`, `CHANGELOG.md` |
-| 14 | ✅ | Verify `copulas` dev dependency isolation | — | `src/train/copula.py` (verify only), `pyproject.toml` (verify only) |
-| 15 | ✅ | Evaluate `copulas` as a replacement for `train/copula.py` | — | `notebooks/evaluate_copulas_replacement.ipynb` (new; verdict only, no `src/` change) |
-| 16 | ✅ | Archive grid/cadence drift: era registry + ingest/model fixes | 01, 03, 08 | `src/core/archive_eras.py` (new), `src/train/ingest.py` (edit), `src/core/io.py` (edit), `src/weather/model.py` (edit) |
+| 15 | ✅ | Fixed `wad`/`wad_come_from` check's land-mask false positive | — | `15-wad-consistency-check-land-mask-artifact.md` |
+| 00 | ✅ | Gaussianization placement (`open_questions.md` §4.1) — decided (i, before Tucker); i-vs-ii left as deferred follow-on | 07 (soft, deferred) | `00-gaussianization-placement.md`, `notebooks/00_gaussianization_placement.ipynb` |
+| 01 | ⬜ | Copula family / tail dependence (§4.2) | — | `01-copula-family-tail-dependence.md`, `notebooks/01_copula_family_tail_dependence.ipynb` |
+| 02 | ⬜ | Rejection sampling vs. copula fix (§8.3) | 01 | `02-rejection-sampling-vs-copula-fix.md`, *shares* `notebooks/01_copula_family_tail_dependence.ipynb` |
+| 03 | ⬜ | Direction preservation under Gaussianization (§2.4) | 00 (soft) | `03-direction-gaussianization-angle-preservation.md`, `notebooks/03_direction_gaussianization_angle_preservation.ipynb` |
+| 04 | ⬜ | Joint-group selection (§3.2) | — | `04-joint-group-selection.md`, `notebooks/04_joint_group_selection.ipynb` |
+| 05 | ⬜ | Triplet coupling lost to independent Gaussianization (§2.2) | 04 | `05-triplet-coupling-gaussianization.md`, *shares* `notebooks/04_joint_group_selection.ipynb` |
+| 06 | ⬜ | Joint multi-channel Tucker vs. downstream, `{u,v,logE,F}` (§3.4/§3.5) | — | `06-joint-channel-tucker-vs-downstream.md`, `notebooks/06_joint_channel_tucker_vs_downstream.ipynb` |
+| 07 | ✅ | Tucker/DMD rank selection (§5.3) | 00 (soft), 17 (soft) | `07-tucker-dmd-rank-selection.md`, `notebooks/07_tucker_dmd_rank_selection.ipynb` |
+| 08 | ⬜ | Masked-HOOI convergence (§5.4) | — | `08-masked-hooi-convergence.md`, `notebooks/08_masked_hooi_convergence.ipynb` |
+| 09 | ⬜ | Growing DMD modes (§5.5) | — | `09-growing-dmd-modes.md`, `notebooks/09_growing_dmd_modes.ipynb` |
+| 10 | ⬜ | OU variance-ratio floor (§6.1) | — | `10-ou-variance-floor-validation.md`, `notebooks/10_ou_variance_floor_sensitivity.ipynb` |
+| 11 | ⬜ | Climatology quasi-stationarity (§7.1) | — | `11-climatology-quasi-stationarity.md`, `notebooks/11_climatology_trend_window_sensitivity.ipynb` |
+| 12 | ⬜ | Directional-consistency tolerance, $\delta_{dir}$ (§8.1) | — | `12-directional-consistency-tolerance.md`, `notebooks/12_directional_consistency_tolerance.ipynb` |
+| 13 | ⬜ | Diurnal-signal monitoring trigger (§7.2) | — | `13-diurnal-signal-monitoring-trigger.md`, `notebooks/13_diurnal_signal_monitoring_trigger.ipynb` |
+| 14 | ⬜ | Cross-cell/cross-time consistency: build-or-defer scoping (§8.2) | — | `14-spatiotemporal-consistency-scoping.md`, `notebooks/14_spatiotemporal_consistency_scoping.ipynb` |
+| 16 | ⬜ | Implement real per-cell ocean-grid coordinates (blocks `sst`/`ocs`/`ocd` loading) | — | `16-ocean-grid-coordinates.md` |
+| 17 | ✅ | Partition-absence NaN vs. land/ice NaN sentinel policy (new §5.6) — validated, notebook/`src`-helper scope only | 07 (soft), 08 (soft) | `17-partition-nan-sentinel-policy.md`, `notebooks/17_partition_nan_sentinel_policy.ipynb` |
+| 18 | ⬜ | Cloud migration of experiments (full-grid rank sweep hit a wall-clock wall locally, not memory) | — | `18-cloud-migration-of-experiments.md`, `18-cloud-migration-of-experiments_plan.md` |
 
-Update the status cell as work proceeds — this table is the at-a-glance
-index; each task file is the detail. Keep them in sync: if a task's approach
-changes materially from its file's original spec (♻️), note *why* in that
-file, not just here.
+Tasks 01/02 and 04/05 deliberately share one notebook each — `open_questions.md`
+itself states these pairs are the same underlying experiment viewed from
+two angles (§4.2/§8.3), or that one question's unresolved residual *is*
+the other (§2.2's gap is §3.2). Writing two separate experiments would
+duplicate work for no benefit.
 
-Each task file states: current state, exact changes, new/updated tests (file
-+ test name, cross-referenced to `model_design_v2.md` §12's exhaustive list),
-and acceptance criteria. Tests belonging to a module are specified inside
-that module's task file, not gathered into a separate pass — the exceptions
-are import-boundary enforcement and multi-module integration tests (task 12),
-which don't belong to any single module.
+Update the status cell as work proceeds. Each task file's own **Conclusion**
+section is where the actual finding goes — this table only tracks whether
+that section has been filled in, not what it says.
 
-## Section-number trap
+## Data-availability note
 
-Once task 00 lands, `docs/model_design.md` *is* v2 — cite its numbering, not
-whatever a stale v1 comment in the current source says. Three places the
-numbering shifted between v1 and v2:
+**Update, 2026-08-14:** the archive disk is reconnected and mounted at
+`./data`. Verified directly: `Settings().data_dir` needs no override, all
+16 variables' dtypes/shapes match `core.config`/`core.io` expectations, and
+a full snapshot-by-snapshot scan of 2025-11-01 → 2026-05-01 (the superset
+of every task's chosen window) found zero missing variables and zero
+contiguous gaps. The archive itself goes empty after 2026-08-05T00:00Z (no
+task's window reaches that far). Task 15 (above) is now fixed and verified
+against real data, so `load_training_window` loads real era-3 windows
+cleanly.
 
-- v1 §3.9 ("three-package split") is v2 **§3.14** — v2 inserts five new
-  subsections (§3.9-§3.13: climatology trend, hierarchical decomposition,
-  library adoption, sklearn hybrid, escalation paths) before it.
-- v1 §5.7 was "OU fit" (the mode-level fit). In v2, that content moved into
-  **§5.6.1** (a subsection of DMD, since the mode-OU fit now lives in
-  `train/dmd.py` — task 06). v2's **§5.7** is an entirely different, new
-  section: the local-residual layer (task 07).
-- v1 §6 was one flat numbered list. v2 §6 is split into **§6.A/§6.B/§6.C/§6.D**
-  with items 1-19 running continuously across the split.
-
-## Known doc bug to work around, not propagate
-
-§8.6's "Production runs" one-liner example lists
-`variables=["sigwh", "wsh", "wsp", "was", "wad", "wsd"]` — that `"wad"` is a
-leftover from before the direction-convention finding was integrated into
-this document. Every other section (§3.7, §3.8, §5.3, §10) is explicit that
-`wad` is unused and `wad_come_from` is the source of truth for wind. Tasks 08
-and 11 call this out at the point it matters; do not copy that one example
-line literally.
+Every new notebook uses real, current package APIs (`core.io`,
+`core.config`, `train.ingest`, and the relevant `train.*` transformers) and
+was checked for syntax validity and import resolution against this repo's
+Poetry environment at reorg time. Each notebook's starter-code cells
+(imports, `load_training_window` call, mask construction) should now run
+without further changes; the experiment-specific analysis cells past that
+point are the actual work each task still requires — none of them have
+been run end-to-end yet.
