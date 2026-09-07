@@ -1,0 +1,6 @@
+$schema: https://azuremlschemas.azureedge.net/latest/azureBlob.schema.json
+name: training_data
+type: azure_blob
+description: NOAA GFS-Wave training archive (2025-11 through 2026-07), uploaded from the local archive per tasks/18-cloud-migration-of-experiments.md
+account_name: wxgenarchivee2
+container_name: training-data

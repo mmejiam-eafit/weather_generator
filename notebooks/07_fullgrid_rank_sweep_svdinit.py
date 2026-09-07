@@ -20,6 +20,7 @@ next step: rerun the crop at T=96 to isolate it). Run directly:
 """
 
 import argparse
+import csv
 import resource
 import sys
 import time
@@ -41,6 +42,31 @@ SEED = 42
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 T_START = datetime(2025, 11, 1, tzinfo=timezone.utc)
 T_END = datetime(2025, 11, 13, tzinfo=timezone.utc)
+CSV_FIELDS = [
+    "timestamp", "tag", "config", "r_lat", "r_lon", "init", "n_iter_max",
+    "elapsed_s", "peak_rss_gb", "n_iters", "final_err",
+]
+
+
+def log_result(out_dir, tag, config, r_lat, r_lon, init, n_iter_max, elapsed, peak_rss_gb, rec_errors, final_err):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if rec_errors is not None:
+        np.save(out_dir / f"{tag}_rec_errors.npy", np.asarray(rec_errors))
+    csv_path = out_dir / "log.csv"
+    is_new = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tag": tag, "config": config, "r_lat": r_lat, "r_lon": r_lon,
+            "init": init, "n_iter_max": n_iter_max, "elapsed_s": f"{elapsed:.1f}",
+            "peak_rss_gb": f"{peak_rss_gb:.2f}",
+            "n_iters": len(rec_errors) if rec_errors is not None else -1,
+            "final_err": f"{final_err:.4f}",
+        })
 
 
 def load_var(name):
@@ -56,6 +82,7 @@ def main():
     p.add_argument("--r_lon", type=int, required=True)
     p.add_argument("--mem_cap_gb", type=float, default=26.0)
     p.add_argument("--n_iter_max", type=int, default=300)
+    p.add_argument("--out_dir", type=str, default=str(Path(__file__).resolve().parents[1] / "results" / "task07"))
     args = p.parse_args()
 
     cap_bytes = int(args.mem_cap_gb * (1024 ** 3))
@@ -84,6 +111,12 @@ def main():
     n_iters = len(rec_errors) if rec_errors is not None else -1
     print(f"RESULT fullgrid-svdinit wsh rank=({args.r_lat},{args.r_lon}) err={err:.4f} "
           f"peak_rss_gb={peak_rss_gb:.2f} elapsed_s={elapsed:.1f} n_iters={n_iters}")
+
+    tag = f"fullgrid_r{args.r_lat}x{args.r_lon}_iter{args.n_iter_max}"
+    log_result(
+        args.out_dir, tag, "fullgrid-svdinit-wsh", args.r_lat, args.r_lon,
+        "svd", args.n_iter_max, elapsed, peak_rss_gb, rec_errors, err,
+    )
 
 
 if __name__ == "__main__":
