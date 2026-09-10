@@ -258,6 +258,76 @@ def test_load_training_window_wad_consistency_check_still_detects_ocean_drift(
         load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["was"])
 
 
+def test_load_training_window_wad_consistency_check_tolerates_rare_sector_rounding(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A handful of cells landing on a compass-code sector boundary and
+    rounding into an adjacent sector must not fail the whole window --
+    this is floating-point quantization noise, not archive drift (see
+    project_wad_consistency_check_flaky_quantization memory / module
+    docstring on `_WAD_MAX_OFF_SECTOR_CELL_FRACTION`).
+
+    2000 ocean cells, all cleanly 180° apart except 1 cell that's exactly
+    one 22.5° sector off (0.05% of cells) -- well under the 0.1% tolerance.
+    """
+    shape = (2, 1000)  # within era2's (721, 1440) wind-grid bound; 2000 cells total
+    was = np.full(shape, 5.0, dtype=np.float16)  # all ocean
+    wad = np.ones(shape, dtype=np.int8)  # every cell: code 1 -> 0 deg
+    wad_come_from = np.full(shape, 9, dtype=np.int8)  # code 9 -> 180 deg, consistent
+    wad_come_from[0, 0] = 8  # one cell: code 8 -> 157.5 deg, i.e. 22.5 deg off from consistent
+
+    _write_snapshot(tmp_path, _T0, "was", was, np.float16)
+    _write_snapshot(tmp_path, _T0, "wad", wad, np.int8)
+    _write_snapshot(tmp_path, _T0, "wad_come_from", wad_come_from, np.int8)
+
+    ds = load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["was"])
+
+    assert ds["was"].shape == (1, *shape)
+    assert "consistency check passed" in capsys.readouterr().err
+
+
+def test_load_training_window_wad_consistency_check_rejects_too_many_off_sector_cells(
+    tmp_path: Path,
+) -> None:
+    """Too many sector-boundary cells (beyond the tolerance fraction) still raises.
+
+    Confirms the quantization tolerance doesn't become a blanket bypass:
+    2/100 cells (2%) off by one sector is far above the 0.1% tolerance.
+    """
+    n = 100
+    was = np.full((1, n), 5.0, dtype=np.float16)
+    wad = np.ones((1, n), dtype=np.int8)
+    wad_come_from = np.full((1, n), 9, dtype=np.int8)
+    wad_come_from[0, 0:2] = 8  # 2 cells one sector off
+
+    _write_snapshot(tmp_path, _T0, "was", was, np.float16)
+    _write_snapshot(tmp_path, _T0, "wad", wad, np.int8)
+    _write_snapshot(tmp_path, _T0, "wad_come_from", wad_come_from, np.int8)
+
+    with pytest.raises(ValueError, match="do not differ by 180"):
+        load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["was"])
+
+
+def test_load_training_window_wad_consistency_check_rejects_multi_sector_deviation(
+    tmp_path: Path,
+) -> None:
+    """A single cell off by more than one sector still raises, even among
+    many cells -- that pattern can't be explained by boundary rounding.
+    """
+    shape = (2, 1000)  # within era2's (721, 1440) wind-grid bound; 2000 cells total
+    was = np.full(shape, 5.0, dtype=np.float16)
+    wad = np.ones(shape, dtype=np.int8)
+    wad_come_from = np.full(shape, 9, dtype=np.int8)
+    wad_come_from[0, 0] = 7  # code 7 -> 135 deg, i.e. 45 deg off (two sectors) from consistent
+
+    _write_snapshot(tmp_path, _T0, "was", was, np.float16)
+    _write_snapshot(tmp_path, _T0, "wad", wad, np.int8)
+    _write_snapshot(tmp_path, _T0, "wad_come_from", wad_come_from, np.int8)
+
+    with pytest.raises(ValueError, match="do not differ by 180"):
+        load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["was"])
+
+
 # --- Archive era drift (see tasks/16-archive-grid-resolution-drift.md) ---
 
 _ERA1_T0 = datetime(2022, 6, 1, 0, tzinfo=timezone.utc)

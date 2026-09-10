@@ -15,6 +15,22 @@ from core.io import decode_compass_code, enumerate_snapshots, load_raw, load_sna
 _ABORT_GAP_SNAPSHOTS = 8  # 24 h at 3 h cadence (see §5.1)
 _WARN_GAP_SNAPSHOTS = 2  # 6 h at 3 h cadence
 
+_WAD_ROUNDING_TOLERANCE_DEG = 5.0  # simple floating-point rounding near a clean 180°
+# Beyond one 22.5° sector (with margin) can't be explained by boundary
+# rounding -- see _MAX_OFF_SECTOR_CELL_FRACTION below.
+_WAD_MAX_SINGLE_CELL_DEVIATION_DEG = 30.0
+# A handful of cells landing exactly on a 22.5°-sector boundary can
+# legitimately round into adjacent sectors between wad's encoding path
+# (vectorize_16degree + a +/-180 transform) and wad_come_from's
+# (calculate_16degree directly) -- floating-point quantization noise, not
+# archive drift. A scan of 488 consecutive era-2 snapshots (2026-09-10)
+# found this affects 1-2 cells out of 700K+ ocean cells on ~15.6% of
+# arbitrary snapshots, each off by exactly one sector, never more. 1e-3
+# (0.1%) is ~5-10x the largest observed rate, leaving real margin while
+# still catching genuine drift (which would affect far more than a
+# handful of cells).
+_WAD_MAX_OFF_SECTOR_CELL_FRACTION = 1e-3
+
 
 def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
     """Guard against upstream archive convention drift (§3.7, §5.1).
@@ -26,8 +42,17 @@ def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
     regardless of any real archive drift -- see
     tasks/15-wad-consistency-check-land-mask-artifact.md, found on first
     validation against the real archive: over ocean cells the deviation
-    from 180° is exactly 0.0° on every real date checked, but the
+    from 180° is exactly 0.0° on almost every real date checked, but the
     previous whole-grid check failed on every one of them due to land.
+
+    Tolerates a small fraction of ocean cells (see
+    `_WAD_MAX_OFF_SECTOR_CELL_FRACTION`) landing on a compass-code sector
+    boundary and rounding into an adjacent sector -- see the module-level
+    constants' docstrings for the rate this was measured at. Any cell off
+    by more than one sector (`_WAD_MAX_SINGLE_CELL_DEVIATION_DEG`), or too
+    many cells in the tolerable range, still raises -- that pattern can't
+    be explained by boundary rounding and indicates real drift.
+
     If `was` isn't present at `t` (e.g. a synthetic test archive that
     never wrote it), falls back to checking the whole grid unmasked.
     """
@@ -42,16 +67,22 @@ def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
     if not np.any(ocean_mask):
         return
 
-    max_dev = float(np.nanmax(diff[ocean_mask]))
-    if max_dev > 5.0:  # tolerance for 22.5° discretization + rounding
+    ocean_diff = diff[ocean_mask]
+    max_dev = float(np.nanmax(ocean_diff))
+    n_off = int(np.sum(ocean_diff > _WAD_ROUNDING_TOLERANCE_DEG))
+    frac_off = n_off / ocean_diff.size
+
+    if max_dev > _WAD_MAX_SINGLE_CELL_DEVIATION_DEG or frac_off > _WAD_MAX_OFF_SECTOR_CELL_FRACTION:
         raise ValueError(
             f"wad and wad_come_from do not differ by 180° at {t.isoformat()}. "
-            f"Max deviation: {max_dev:.2f}° (ocean cells only; land excluded via "
-            "`was`'s NaN mask). Archive convention may have changed."
+            f"Max deviation: {max_dev:.2f}°, {n_off}/{ocean_diff.size} ocean cells "
+            f"({frac_off:.4%}) beyond {_WAD_ROUNDING_TOLERANCE_DEG}° tolerance "
+            "(land excluded via `was`'s NaN mask). Archive convention may have changed."
         )
     print(
         f"wad/wad_come_from consistency check passed at {t.isoformat()}: "
-        f"max deviation {max_dev:.2f}° (ocean cells only)",
+        f"max deviation {max_dev:.2f}°, {n_off}/{ocean_diff.size} cells beyond tolerance "
+        "(ocean cells only)",
         file=sys.stderr,
     )
 
