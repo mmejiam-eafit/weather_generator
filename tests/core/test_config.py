@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
+import numpy as np
 import pytest
+import xarray as xr
 from numpy.testing import assert_allclose
 
 from core.config import (
@@ -10,6 +12,7 @@ from core.config import (
     OCEAN_GRID_LAT_STEP_DEG,
     OCEAN_GRID_SHAPE,
     SNAPSHOT_CADENCE_SECONDS,
+    TIME_AXIS,
     VARIABLE_GRID,
     WAVE_GRID_LAT_AT_ROW0,
     WAVE_GRID_LAT_STEP_DEG,
@@ -17,6 +20,8 @@ from core.config import (
     WIND_GRID_LAT_AT_ROW0,
     WIND_GRID_SHAPE,
     Settings,
+    canonical_dims,
+    check_canonical,
     grid_coordinates,
 )
 
@@ -100,3 +105,46 @@ def test_grid_coordinates_ocean_raises() -> None:
     yet; requesting it still raises."""
     with pytest.raises(ValueError, match="not a linear"):
         grid_coordinates("ocean")
+
+
+def _dataset(dims: tuple[str, str, str], shape: tuple[int, int, int]) -> xr.Dataset:
+    return xr.Dataset({"sigwh": (dims, np.zeros(shape))})
+
+
+def test_canonical_dims_names_the_grid() -> None:
+    """`canonical_dims` spells the per-grid dim tuple (see CANONICAL_DIM_TEMPLATE)."""
+    assert canonical_dims("wave") == ("time", "wave_lat", "wave_lon")
+    assert canonical_dims("wind") == ("time", "wind_lat", "wind_lon")
+    assert TIME_AXIS == 0
+
+
+def test_check_canonical_accepts_time_first() -> None:
+    """The production order passes unchanged."""
+    check_canonical(_dataset(("time", "wave_lat", "wave_lon"), (4, 3, 5)))
+
+
+def test_check_canonical_rejects_time_last() -> None:
+    """`(lat, lon, time)` must raise, not silently reduce over the wrong axis.
+
+    This is the regression guard for the whole canonical-order convention:
+    the transformers infer the time axis positionally, so before this check
+    a transposed Dataset produced a wrongly-shaped `sigma_cell_`/LUT with no
+    error at all (see `core.config.CANONICAL_DIM_TEMPLATE`).
+    """
+    transposed = _dataset(("wave_lat", "wave_lon", "time"), (3, 5, 4))
+    with pytest.raises(ValueError, match="expected canonical"):
+        check_canonical(transposed)
+
+
+def test_check_canonical_reports_variable_and_context() -> None:
+    """The error names the offending variable and the caller."""
+    transposed = _dataset(("wave_lat", "wave_lon", "time"), (3, 5, 4))
+    with pytest.raises(ValueError, match="'sigwh'.* in GaussianCopula.fit"):
+        check_canonical(transposed, context="GaussianCopula.fit")
+
+
+def test_check_canonical_rejects_non_3d() -> None:
+    """A 2D variable is not a field array and must not slip through."""
+    flat = xr.Dataset({"sigwh": (("wave_lat", "wave_lon"), np.zeros((3, 5)))})
+    with pytest.raises(ValueError, match="expected canonical"):
+        check_canonical(flat)

@@ -9,6 +9,8 @@ from scipy.stats import norm
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
+from core.config import check_canonical
+
 _EPS: Final[float] = 1e-6
 
 
@@ -168,6 +170,7 @@ class GaussianCopula(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         -------
         self
         """
+        check_canonical(X, context="GaussianCopula.fit")
         self.bin_probs_ = (np.arange(self.n_bins, dtype=np.float64) + 0.5) / self.n_bins
         self.sorted_anomalies_binned_: dict[str, np.ndarray] = {}
         for name, da in X.data_vars.items():
@@ -195,6 +198,7 @@ class GaussianCopula(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             `X` with each variable replaced by its Gaussianized value.
         """
         check_is_fitted(self, "sorted_anomalies_binned_")
+        check_canonical(X, context="GaussianCopula.transform")
         result = X.copy()
         for variable, binned in self.sorted_anomalies_binned_.items():
             if variable not in result.data_vars:
@@ -222,6 +226,7 @@ class GaussianCopula(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             `X` with each variable replaced by its physical-anomaly value.
         """
         check_is_fitted(self, "sorted_anomalies_binned_")
+        check_canonical(X, context="GaussianCopula.inverse_transform")
         result = X.copy()
         for variable, binned in self.sorted_anomalies_binned_.items():
             if variable not in result.data_vars:

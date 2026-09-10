@@ -39,20 +39,26 @@ core/factors estimate every single iteration (600x over a full run) --
 losing 5 extra rounds of it at init only, before any factors even exist,
 is a rounding error by comparison.
 
-Decomposes only `modes=[0, 1]` (lat, lon) -- NOT `modes=[0, 1, 2]` as
-earlier full-grid scripts did. Passing mode 2 (time) with `rank[2] ==
-x.shape[-1]` (the full length, since we never intend to compress time)
-asked HOOI for a *full-rank* factor on that axis every iteration, which is
-a mathematical no-op (a full-rank orthonormal factor changes nothing on
-reconstruction -- confirmed empirically: identical error with 2 vs 3
-factors on a synthetic case) but not a computational no-op: it's a
-near-full SVD of a (lat*lon, T) matrix. At T=96 this was cheap enough to
-go unnoticed; at T~2184 it forced `numpy.linalg.qr` to upcast a
-(1,038,240, 2184) array to float64 (17GB) inside the "randomized" SVD's
-own power iteration, since requesting essentially-full rank defeats the
-whole point of a randomized/truncated method. Dropping mode 2 entirely
-(tensorly's `multi_mode_dot` leaves un-listed modes untouched on
-reconstruction) removes this cost completely with no change in result.
+Arrays here are canonical `(time, lat, lon)` -- time is axis 0, per
+`core.config.CANONICAL_DIM_TEMPLATE` -- so this decomposes `modes=[1, 2]`
+(lat, lon) and never lists mode 0, exactly as production's `train.tucker`
+does. Time is left full-rank because we never intend to compress it.
+
+Listing the time mode with `rank == x.shape[time]` is a mathematical no-op
+(a full-rank orthonormal factor changes nothing on reconstruction --
+confirmed empirically: identical error with 2 vs 3 factors on a synthetic
+case) but not a computational one: it's a near-full SVD of a (lat*lon, T)
+matrix. At T=96 that was cheap enough to go unnoticed; at T~2184 it forced
+`numpy.linalg.qr` to upcast a (1,038,240, 2184) array to float64 (17GB)
+inside the "randomized" SVD's own power iteration, since requesting
+essentially-full rank defeats the whole point of a randomized method.
+Simply not listing that mode removes the cost with no change in result.
+
+Reconstruction must therefore use `multi_mode_dot(core, factors,
+modes=[1, 2])`, **not** `tl.tucker_to_tensor((core, factors))` -- the
+latter applies factors to modes 0 and 1 by default, which with lat/lon
+factors would silently reconstruct against the time axis. This mirrors
+production's `train.tucker.tucker_inverse`.
 
 Also casts `mask` to `int8` and drops the `sentinel` object once `x` and
 `mask` are extracted from it. Every main-loop iteration reconstructs the
@@ -70,8 +76,8 @@ redundant copy of what became `x` and was never freed.
 
 Saves the final `core`/`factors` to `{tag}_tucker.npz` at the end of the
 run. Earlier runs only ever persisted the scalar error curve -- `core` and
-`factors` (the only inputs `tl.tucker_to_tensor` needs to reconstruct the
-full tensor) lived in-process and were discarded on exit, so there was no
+`factors` (the only inputs a reconstruction needs) lived in-process and
+were discarded on exit, so there was no
 way to reconstruct and visually compare against the real data after the
 fact. Both arrays are small relative to the raw tensor (e.g. at 20% rank,
 `core` is ~362MB vs. the 8.45GB raw `x`), so saving them is effectively
@@ -93,13 +99,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
 import tensorly as tl
 from tensorly.decomposition import partial_tucker
+from tensorly.tenalg import multi_mode_dot
 
+from core.config import canonical_dims
 from train.ingest import load_training_window
 from train.masking import apply_partition_sentinel_policy, height_log_energy, land_mask_from_sigwh
 
 tl.set_backend("numpy")
 
 SEED = 42
+SPATIAL_MODES = [1, 2]  # (time, lat, lon) -- time (mode 0) stays full-rank
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DEFAULT_T_START = "2025-11-01"
 DEFAULT_T_END = "2025-11-13"
@@ -111,13 +120,13 @@ def parse_date(s):
 
 def load_var(name, t_start, t_end):
     ds = load_training_window(DATA_DIR, t_start, t_end, [name])
-    arr = ds[name].transpose("wave_lat", "wave_lon", "time").values.astype(np.float32)
+    arr = ds[name].transpose(*canonical_dims("wave")).values.astype(np.float32)
     del ds
     return arr
 
 
 def true_masked_err(x, mask, core, factors):
-    recon = tl.tucker_to_tensor((core, factors))
+    recon = multi_mode_dot(core, factors, modes=SPATIAL_MODES)
     return float(np.linalg.norm((recon - x) * mask) / np.linalg.norm(x * mask))
 
 
@@ -165,7 +174,7 @@ def main():
     while done_iters < args.total_iters:
         chunk = min(args.checkpoint_every, args.total_iters - done_iters)
         (core, factors), _ = partial_tucker(
-            x, modes=[0, 1], rank=rank,
+            x, modes=SPATIAL_MODES, rank=rank,
             init=init, tol=1e-5, n_iter_max=chunk, random_state=SEED, mask=mask,
             svd="randomized_svd", svd_mask_repeats=0,
         )

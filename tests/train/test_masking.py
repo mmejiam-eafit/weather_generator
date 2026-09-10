@@ -18,9 +18,9 @@ from train.masking import (
 
 def test_land_mask_from_sigwh_strict() -> None:
     """A cell counts as ocean only if non-NaN at every timestep (default valid_frac=1.0)."""
-    sigwh = np.zeros((3, 3, 4))
-    sigwh[0, 0, :] = np.nan  # land: NaN every timestep
-    sigwh[1, 1, 2] = np.nan  # ocean, but NaN at one timestep -- still land under strict mode
+    sigwh = np.zeros((4, 3, 3))  # (time, lat, lon)
+    sigwh[:, 0, 0] = np.nan  # land: NaN every timestep
+    sigwh[2, 1, 1] = np.nan  # ocean, but NaN at one timestep -- still land under strict mode
 
     mask = land_mask_from_sigwh(sigwh)
 
@@ -32,7 +32,7 @@ def test_land_mask_from_sigwh_strict() -> None:
 
 def test_land_mask_from_sigwh_tolerant() -> None:
     """A looser valid_frac lets an occasionally-NaN cell still count as ocean."""
-    sigwh = np.zeros((1, 1, 10))
+    sigwh = np.zeros((10, 1, 1))  # (time, lat, lon)
     sigwh[0, 0, 0] = np.nan  # 90% valid
 
     assert not land_mask_from_sigwh(sigwh, valid_frac=1.0)[0, 0]
@@ -43,33 +43,33 @@ def test_apply_partition_sentinel_policy_ocean_nan_is_valid() -> None:
     """The one behavior that differs from today's `valid = ~isnan(X)` notebook
     pattern: an ocean cell that was NaN in X must be VALID (1) in tucker_mask,
     not imputed like land."""
-    X = np.full((2, 2, 3), 1.5)
-    X[0, 0, 1] = np.nan  # ocean cell, partition-absent at one timestep
+    X = np.full((3, 2, 2), 1.5)  # (time, lat, lon)
+    X[1, 0, 0] = np.nan  # ocean cell, partition-absent at one timestep
     land_mask = np.array([[True, True], [False, True]])  # (1,0) is land
 
     result = apply_partition_sentinel_policy(X, land_mask, sentinel_value=0.0)
 
-    assert result.tucker_mask[0, 0, 1] == 1.0
-    assert result.filled[0, 0, 1] == 0.0
+    assert result.tucker_mask[1, 0, 0] == 1.0
+    assert result.filled[1, 0, 0] == 0.0
     assert result.n_ocean_nan == 1
 
 
 def test_apply_partition_sentinel_policy_land_stays_invalid() -> None:
     """Land cells keep today's treatment: zero-filled and marked INVALID (imputed)."""
-    X = np.full((2, 2, 3), 1.5)
-    X[1, 0, :] = np.nan  # land cell, NaN every timestep
+    X = np.full((3, 2, 2), 1.5)  # (time, lat, lon)
+    X[:, 1, 0] = np.nan  # land cell, NaN every timestep
     land_mask = np.array([[True, True], [False, True]])
 
     result = apply_partition_sentinel_policy(X, land_mask)
 
-    assert np.all(result.tucker_mask[1, 0, :] == 0.0)
-    assert np.all(result.filled[1, 0, :] == 0.0)
+    assert np.all(result.tucker_mask[:, 1, 0] == 0.0)
+    assert np.all(result.filled[:, 1, 0] == 0.0)
     assert result.n_ocean_nan == 0
 
 
 def test_apply_partition_sentinel_policy_real_values_untouched() -> None:
     """Non-NaN values, ocean or land, pass through unchanged."""
-    X = np.full((2, 2, 3), 2.5)
+    X = np.full((3, 2, 2), 2.5)  # (time, lat, lon)
     land_mask = np.ones((2, 2), dtype=bool)
 
     result = apply_partition_sentinel_policy(X, land_mask)
@@ -80,7 +80,7 @@ def test_apply_partition_sentinel_policy_real_values_untouched() -> None:
 
 def test_apply_partition_sentinel_policy_custom_sentinel() -> None:
     """A non-default sentinel_value (e.g. a derived period placeholder) fills ocean NaN."""
-    X = np.array([[[np.nan, 5.0, 6.0]]])
+    X = np.array([[[np.nan]], [[5.0]], [[6.0]]])  # (time=3, lat=1, lon=1)
     land_mask = np.array([[True]])
 
     result = apply_partition_sentinel_policy(X, land_mask, sentinel_value=7.5)
@@ -107,9 +107,9 @@ def test_height_log_energy_real_values_unchanged() -> None:
 
 def test_ocean_nan_report_restricted_to_ocean() -> None:
     """NaN fraction and always-valid fraction are computed only over ocean cells."""
-    X = np.zeros((2, 1, 4))
-    X[0, 0, :] = np.nan  # land, all NaN -- must not count toward "ocean NaN"
-    X[1, 0, 0] = np.nan  # ocean, one NaN out of 4 timesteps
+    X = np.zeros((4, 2, 1))  # (time, lat, lon)
+    X[:, 0, 0] = np.nan  # land, all NaN -- must not count toward "ocean NaN"
+    X[0, 1, 0] = np.nan  # ocean, one NaN out of 4 timesteps
     land_mask = np.array([[False], [True]])
 
     report = ocean_nan_report(X, land_mask, valid_time_fracs=(1.0, 0.5))
@@ -123,8 +123,8 @@ def test_ocean_nan_report_restricted_to_ocean() -> None:
 
 def test_partition_companion_backfill_check_no_primary_nan() -> None:
     """No primary NaN at ocean cells -> nan-filled, non-crashing result."""
-    primary = np.ones((2, 2, 3))
-    companion = np.ones((2, 2, 3))
+    primary = np.ones((3, 2, 2))  # (time, lat, lon)
+    companion = np.ones((3, 2, 2))
     land_mask = np.ones((2, 2), dtype=bool)
 
     result = partition_companion_backfill_check(primary, companion, land_mask)
@@ -138,12 +138,12 @@ def test_partition_companion_backfill_check_detects_stale_companion() -> None:
     shows near-zero std there, vs. real variation when primary is valid."""
     rng = np.random.default_rng(0)
     T = 40
-    primary = rng.normal(size=(1, 1, T))
-    companion = rng.normal(size=(1, 1, T))
+    primary = rng.normal(size=(T, 1, 1))  # (time, lat, lon)
+    companion = rng.normal(size=(T, 1, 1))
 
     nan_idx = slice(0, 20)
-    primary[0, 0, nan_idx] = np.nan
-    companion[0, 0, nan_idx] = 99.0  # stale filler, constant during the gap
+    primary[nan_idx, 0, 0] = np.nan
+    companion[nan_idx, 0, 0] = 99.0  # stale filler, constant during the gap
     land_mask = np.array([[True]])
 
     result = partition_companion_backfill_check(primary, companion, land_mask)

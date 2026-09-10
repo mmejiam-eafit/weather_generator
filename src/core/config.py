@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Final
 
 import numpy as np
+import xarray as xr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 WAVE_GRID_SHAPE: Final[tuple[int, int]] = (721, 1440)  # era 3 -- see module docstring
@@ -79,6 +80,27 @@ GRID_LON_STEP_DEG: Final[float] = 0.25  # wave and wind; ocean is 0.125
 # (e.g. notebooks) pinned to the current cadence.
 SNAPSHOT_CADENCE_SECONDS: Final[float] = 3.0 * 3600.0  # Δt = 3h (see docs/model_design.md §5)
 
+# ---------------------------------------------------------------------------
+# Canonical field-array axis order.
+#
+# Every multi-timestep field array in this codebase is `(time, <grid>_lat,
+# <grid>_lon)` -- time is axis 0. This is not merely a convention: the
+# preprocessing transformers (`train.climatology`, `train.standardize`,
+# `train.copula`) all infer the time axis *positionally* and validate
+# nothing, so an array in the wrong order does not raise -- it silently
+# computes per-cell statistics over the wrong axis. A `(lat, lon, time)`
+# array fed to `PerCellStandardizer` produced a `sigma_cell_` of shape
+# `(2, 300)` instead of `(3, 5)`, with no error. `check_canonical` below
+# exists to turn that class of bug into an exception.
+#
+# Scope: *field* arrays only. Arrays whose spatial axes have already been
+# raveled keep their own documented layouts -- the stacked Tucker/DMD input
+# is `(T, N_ocean, V)` (still time-first), and fitted parameter arrays are
+# reduced-axis-first (`ClimatologyRemover.coeffs_` is `(n_terms, lat, lon)`,
+# `GaussianCopula`'s LUT is `(n_bins, lat, lon)`).
+TIME_AXIS: Final[int] = 0
+CANONICAL_DIM_TEMPLATE: Final[tuple[str, str, str]] = ("time", "{grid}_lat", "{grid}_lon")
+
 # Which grid each archive variable's magnitude lives on (see docs/model_design.md
 # §2.2, §10). `wad_come_from` is the source of truth for wind direction (§3.7,
 # §9 gotcha 5a) — `core.io.load_snapshot` loads it like any other direction field.
@@ -100,6 +122,66 @@ VARIABLE_GRID: Final[dict[str, str]] = {
     "ocs": "ocean",
     "ocd": "ocean",
 }
+
+
+def canonical_dims(grid: str) -> tuple[str, str, str]:
+    """Return the canonical field dim names for a named grid.
+
+    (see `CANONICAL_DIM_TEMPLATE`)
+
+    Parameters
+    ----------
+    grid : str
+        One of ``"wave"``, ``"wind"``, ``"ocean"``.
+
+    Returns
+    -------
+    tuple[str, str, str]
+        ``("time", f"{grid}_lat", f"{grid}_lon")``.
+    """
+    return ("time", f"{grid}_lat", f"{grid}_lon")
+
+
+def check_canonical(ds: xr.Dataset, *, context: str = "") -> None:
+    """Raise if any data variable is not canonical ``(time, *_lat, *_lon)``.
+
+    (see `CANONICAL_DIM_TEMPLATE` for why this exists)
+
+    The preprocessing transformers infer the time axis positionally, so a
+    transposed input silently produces per-cell statistics reduced over the
+    wrong axis rather than an error. Call this at the top of any `fit` or
+    `transform` that assumes `TIME_AXIS`.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset whose `data_vars` should all be canonical field arrays.
+    context : str
+        Optional caller name, included in the error message.
+
+    Raises
+    ------
+    ValueError
+        If any data variable is not 3D, or its dims are not ordered
+        ``(time, <something>_lat, <something>_lon)``.
+    """
+    where = f" in {context}" if context else ""
+    for name, da in ds.data_vars.items():
+        dims = tuple(str(d) for d in da.dims)
+        ok = (
+            len(dims) == 3
+            and dims[0] == "time"
+            and dims[1].endswith("_lat")
+            and dims[2].endswith("_lon")
+        )
+        if not ok:
+            raise ValueError(
+                f"variable {name!r}{where} has dims {dims}, expected canonical "
+                f'("time", "<grid>_lat", "<grid>_lon") with time as axis '
+                f"{TIME_AXIS}. Transpose before calling -- these transformers "
+                "infer the time axis positionally and would otherwise reduce "
+                "over the wrong axis without raising."
+            )
 
 
 def grid_coordinates(grid: str) -> tuple[np.ndarray, np.ndarray]:

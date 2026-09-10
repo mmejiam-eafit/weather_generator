@@ -32,13 +32,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
 import tensorly as tl
 from tensorly.decomposition import partial_tucker
+from tensorly.tenalg import multi_mode_dot
 
+from core.config import canonical_dims
 from train.ingest import load_training_window
 from train.masking import apply_partition_sentinel_policy, height_log_energy, land_mask_from_sigwh
 
 tl.set_backend("numpy")
 
 SEED = 42
+SPATIAL_MODES = [1, 2]  # (time, lat, lon) -- time (mode 0) stays full-rank
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 T_START = datetime(2025, 11, 1, tzinfo=timezone.utc)
 T_END = datetime(2025, 11, 13, tzinfo=timezone.utc)
@@ -71,7 +74,7 @@ def log_result(out_dir, tag, config, r_lat, r_lon, init, n_iter_max, elapsed, pe
 
 def load_var(name):
     ds = load_training_window(DATA_DIR, T_START, T_END, [name])
-    arr = ds[name].transpose("wave_lat", "wave_lon", "time").values.astype(np.float32)
+    arr = ds[name].transpose(*canonical_dims("wave")).values.astype(np.float32)
     del ds
     return arr
 
@@ -100,11 +103,11 @@ def main():
 
     t0 = time.time()
     (core, factors), rec_errors = partial_tucker(
-        x, modes=[0, 1, 2], rank=[args.r_lat, args.r_lon, x.shape[-1]],
+        x, modes=SPATIAL_MODES, rank=[args.r_lat, args.r_lon],
         init="svd", tol=1e-5, n_iter_max=args.n_iter_max, random_state=SEED, mask=mask,
     )
     elapsed = time.time() - t0
-    recon = tl.tucker_to_tensor((core, factors))
+    recon = multi_mode_dot(core, factors, modes=SPATIAL_MODES)
     err = np.linalg.norm((recon - x) * mask) / np.linalg.norm(x * mask)
 
     peak_rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6

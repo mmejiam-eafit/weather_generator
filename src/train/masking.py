@@ -6,6 +6,13 @@ Notebook/src-helper scope only per task 17 -- NOT wired into
 src/weather/model.py's `_mask_and_stack` or src/train/ingest.py's existing
 mask logic. Promotion to production is deliberately deferred pending this
 policy's empirical validation (task 17 §4).
+
+All field arrays here are canonical `(time, lat, lon)` -- time is axis 0,
+matching `core.config.CANONICAL_DIM_TEMPLATE` and everything these helpers
+compose with (`train.ingest.load_training_window`'s output, the
+`ClimatologyRemover`/`PerCellStandardizer`/`GaussianCopula` chain, and
+`train.tucker`, which decomposes `modes=[1, 2]` and leaves time full-rank).
+Derived *spatial* masks stay `(lat, lon)`.
 """
 
 from dataclasses import dataclass
@@ -17,8 +24,8 @@ import numpy as np
 class SentinelMaskResult:
     """Result of `apply_partition_sentinel_policy` (see module docstring)."""
 
-    filled: np.ndarray  # (lat, lon, time), every NaN -> 0.0 (land) or sentinel_value (ocean)
-    tucker_mask: np.ndarray  # (lat, lon, time) float32 {0,1}: 0=land, 1=ocean(incl. sentinel)
+    filled: np.ndarray  # (time, lat, lon), every NaN -> 0.0 (land) or sentinel_value (ocean)
+    tucker_mask: np.ndarray  # (time, lat, lon) float32 {0,1}: 0=land, 1=ocean(incl. sentinel)
     n_ocean_nan: int  # diagnostic: ocean-cell/timestep NaNs zero-filled as valid
 
 
@@ -36,7 +43,7 @@ def land_mask_from_sigwh(sigwh: np.ndarray, *, valid_frac: float = 1.0) -> np.nd
 
     Parameters
     ----------
-    sigwh : (lat, lon, time) float
+    sigwh : (time, lat, lon) float
         Total significant wave height. Unlike the partition triplets
         (wsh/wsp/wsd, etc.), `sigwh` is an aggregate quantity with no
         partition-absence NaN -- it is NaN only over land/ice
@@ -59,7 +66,7 @@ def land_mask_from_sigwh(sigwh: np.ndarray, *, valid_frac: float = 1.0) -> np.nd
         `True` = ocean.
     """
     valid = ~np.isnan(sigwh)
-    result: np.ndarray = valid.mean(axis=-1) >= valid_frac
+    result: np.ndarray = valid.mean(axis=0) >= valid_frac
     return result
 
 
@@ -75,7 +82,7 @@ def apply_partition_sentinel_policy(
 
     Parameters
     ----------
-    X : (lat, lon, time) float
+    X : (time, lat, lon) float
         A single variable's raw values.
     land_mask : (lat, lon) bool
         MUST come from an independent source (`land_mask_from_sigwh` or
@@ -94,7 +101,7 @@ def apply_partition_sentinel_policy(
     SentinelMaskResult
     """
     nan_mask = np.isnan(X)
-    ocean_3d = np.broadcast_to(land_mask[:, :, None], X.shape)
+    ocean_3d = np.broadcast_to(land_mask[None, :, :], X.shape)
 
     filled = np.where(nan_mask & ocean_3d, sentinel_value, X)
     filled = np.where(nan_mask & ~ocean_3d, 0.0, filled)
@@ -143,7 +150,7 @@ def ocean_nan_report(
 
     Parameters
     ----------
-    X : (lat, lon, time) float
+    X : (time, lat, lon) float
     land_mask : (lat, lon) bool
         `True` = ocean. See `land_mask_from_sigwh`.
     valid_time_fracs : tuple[float, ...]
@@ -159,10 +166,10 @@ def ocean_nan_report(
         raise ValueError("land_mask has no ocean cells")
 
     valid = ~np.isnan(X)
-    ocean_valid = valid[land_mask]  # (n_ocean_cells, time)
+    ocean_valid = valid[:, land_mask]  # (time, n_ocean_cells)
 
     nan_fraction = float(1.0 - ocean_valid.mean())
-    per_cell_valid_frac = ocean_valid.mean(axis=-1)
+    per_cell_valid_frac = ocean_valid.mean(axis=0)
     always_valid_frac = {f: float((per_cell_valid_frac >= f).mean()) for f in valid_time_fracs}
 
     return {
@@ -188,8 +195,8 @@ def partition_companion_backfill_check(
 
     Parameters
     ----------
-    primary : (lat, lon, time) float
-    companion : (lat, lon, time) float
+    primary : (time, lat, lon) float
+    companion : (time, lat, lon) float
     land_mask : (lat, lon) bool
         `True` = ocean.
 
@@ -202,7 +209,7 @@ def partition_companion_backfill_check(
     primary_nan = np.isnan(primary)
     companion_nan = np.isnan(companion)
 
-    mask_primary_nan_ocean = primary_nan & land_mask[:, :, None]
+    mask_primary_nan_ocean = primary_nan & land_mask[None, :, :]
     n_primary_nan = int(mask_primary_nan_ocean.sum())
     if n_primary_nan == 0:
         return {
@@ -217,9 +224,9 @@ def partition_companion_backfill_check(
     std_when_nan: list[float] = []
     std_when_valid: list[float] = []
     for i, j in np.argwhere(land_mask):
-        p_nan = primary_nan[i, j]
-        c = companion[i, j]
-        c_finite = ~companion_nan[i, j]
+        p_nan = primary_nan[:, i, j]
+        c = companion[:, i, j]
+        c_finite = ~companion_nan[:, i, j]
         nan_vals = c[p_nan & c_finite]
         valid_vals = c[~p_nan & c_finite]
         if nan_vals.size >= 2:
