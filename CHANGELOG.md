@@ -213,8 +213,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **2026-09-25 — Task 07: decided the final production `r_dmd = 100`** —
   `docs/open_questions.md` §5.3, `tasks/07-tucker-dmd-rank-selection.md`
-  §10, plots in `notebooks/07_dmd_rank_fidelity_tradeoff.png` and
-  `notebooks/07_dmd_rank_cv_predictive_error.png`
+  §10, plots in `notebooks/dmd_rank_fidelity_tradeoff.png` and
+  `notebooks/dmd_rank_cv_predictive_error.png`
   (`notebooks/07_dmd_rank_summary_plots.py`). The generative check's two
   fidelity metrics disagree on where "best" is (spectral at `r_dmd=150`,
   marginal/KS at `r_dmd=80`); `r_dmd=100` is the knee point between them

@@ -912,7 +912,7 @@ imaginary as real — not safely-discardable noise); the fix brought it to
 ≈3×10⁻¹⁷-6×10⁻¹⁷ (machine precision) at every rank 5-200 on the real
 35,712-dimensional core.
 
-### 5.3 How should Tucker ranks $(r_{\text{lat}}, r_{\text{lon}}, r_{\text{time}})$ and DMD rank $r_{\text{dmd}}$ be chosen? — **PARTIALLY DECIDED**: `r_dmd=100` (2026-09-25); Tucker rank still OPEN (cost/memory-bound, no elbow found)
+### 5.3 How should Tucker ranks $(r_{\text{lat}}, r_{\text{lon}}, r_{\text{time}})$ and DMD rank $r_{\text{dmd}}$ be chosen? — **DECIDED**: `r_dmd=100` (2026-09-25); Tucker rank 40% `(248, 576)` (2026-09-29, pragmatic/budget-bound, no elbow found)
 
 Raised in: `tucker_decomposition.md` §6, `dynamic_mode_decomposition.md` §6
 (the same underlying issue, applied to two different decompositions).
@@ -1184,8 +1184,8 @@ Recommendation unchanged, now on firmer footing: **`r_dmd` in 50-100**.
 
 **Decided (2026-09-25): `r_dmd = 100`.** Full justification:
 `tasks/07-tucker-dmd-rank-selection.md` §10 (plots:
-`notebooks/07_dmd_rank_fidelity_tradeoff.png`,
-`notebooks/07_dmd_rank_cv_predictive_error.png`). The generative check's
+`notebooks/dmd_rank_fidelity_tradeoff.png`,
+`notebooks/dmd_rank_cv_predictive_error.png`). The generative check's
 two fidelity metrics disagree on where "best" is — spectral
 (`log_psd_distance`) at `r_dmd=150`, marginal (`ks_d_statistic`) at
 `r_dmd=80` — and `r_dmd=100` is the point between them where that
@@ -1197,6 +1197,15 @@ result is flat across all three candidates regardless (99.60-99.64%,
 inside the fold-to-fold noise band), so it imposes no penalty on this
 choice. This closes the DMD half of §5.3 — Tucker's own rank remains
 open.
+
+**Decided (2026-09-29): Tucker rank = 40% `(248, 576)`.** Full record:
+`tasks/07-tucker-dmd-rank-selection.md` §12. The final VM run hit its 11h
+cap at iteration 170/300 with 23.30% reconstruction error, one checkpoint
+short of its own early-stop threshold — better than 30% (27.47%, 8h cap)
+and 20%'s fully converged 32.90%. Unlike `r_dmd`, this is a pragmatic
+choice made when the Azure credit ran out, not a swept optimum: no elbow
+was found, and a higher rank was never tested to convergence. Production
+copula and DMD (`r_dmd=100`) were fit on the full 40% core.
 
 ### 5.4 Is masked-HOOI's imputation of land cells guaranteed to converge well? — **OPEN** (mitigation available)
 
@@ -1478,7 +1487,7 @@ mistaken for open items that need chasing:
 | 4.2 | Copula family (Gaussian vs. t/GPD) | OPEN |
 | 5.1 | DMD state-vectorization | ANSWERED (recommendation) |
 | 5.2 | Conjugate-pair sampling | ANSWERED, procedure validated 2026-09-24 (production port deferred to task 9) |
-| 5.3 | Tucker/DMD rank selection | PARTIALLY DECIDED — DMD: **r_dmd=100** (2026-09-25, knee point between spectral- and marginal-fidelity optima); Tucker: still OPEN (cost/memory-bounded default for `wsh`/`wsp`) |
+| 5.3 | Tucker/DMD rank selection | DECIDED — DMD: **r_dmd=100** (2026-09-25, knee point between spectral- and marginal-fidelity optima); Tucker: **40% (248, 576)** (2026-09-29, pragmatic/budget-bound, not a swept optimum) |
 | 5.4 | Masked-HOOI convergence | OPEN (mitigation proposed) |
 | 5.5 | Growing DMD modes | OPEN (mitigation proposed) |
 | 5.6 | Partition-absence NaN vs. land/ice NaN | DECIDED (policy validated empirically, task 17) |
