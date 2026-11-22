@@ -89,6 +89,11 @@ def _bilinear_to_grid(
     return np.moveaxis(interpolated, -1, 0)  # (n_times, n_target_lat, n_target_lon)
 
 
+def _same_coordinates(source: np.ndarray, target: np.ndarray) -> bool:
+    """True when two 1D coordinate arrays describe the same grid lines (to 1e-9 degrees)."""
+    return source.shape == target.shape and bool(np.allclose(source, target, rtol=0.0, atol=1e-9))
+
+
 class Reprojector(BaseEstimator, TransformerMixin):  # type: ignore[misc]
     """Reproject non-target-grid variables onto the target grid via bilinear interpolation.
 
@@ -173,6 +178,15 @@ class Reprojector(BaseEstimator, TransformerMixin):  # type: ignore[misc]
 
             src_lats = da.coords[lat_dim].values.astype(np.float64)
             src_lons = da.coords[lon_dim].values.astype(np.float64)
+            if _same_coordinates(src_lats, self.target_lats_) and _same_coordinates(
+                src_lons, self.target_lons_
+            ):
+                # Wind shares the wave grid under its own dim names (§2.2, §5.2).
+                # Interpolating it anyway is not a no-op: scipy's linear stencil
+                # carries a zero-weight neighbour, so one land NaN would spread
+                # to the ocean cells south and west of it.
+                reprojected_vars[str(name)] = (("time", target_lat_dim, target_lon_dim), da.values)
+                continue
             values = _bilinear_to_grid(
                 da.values, src_lats, src_lons, self.target_lats_, self.target_lons_
             )

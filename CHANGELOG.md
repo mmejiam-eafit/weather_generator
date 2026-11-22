@@ -939,6 +939,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     concepts, (2) refactor code/tasks to match that understanding, (3) train
     and get real metrics.
 
+### Fixed
+
+- **2026-11-22 — `Reprojector` passes wind through instead of interpolating it
+  onto an identical grid** — `src/train/reproject.py`,
+  `tests/train/test_reproject.py`. Wind shares the wave grid (§2.2) but is
+  loaded under `wind_lat`/`wind_lon` dims, so `Reprojector` bilinearly
+  interpolated it onto the same grid lines. That is not a no-op: scipy's
+  linear stencil carries a zero-weight neighbour, and `NaN · 0` is NaN, so
+  each land NaN in `was` spread to the ocean cells south and west of it. v2's
+  intersection ocean mask silently dropped that coastal ring; v3's
+  `sigwh`-only mask would instead stop the fit at the Tucker boundary. A
+  variable whose coordinates match the target grid to 1e-9° is now relabelled
+  and passed through, as §5.2 already specified. Found while building the v3
+  test fixtures.
+
 ### Added
 
 - **2026-11-22 — v3 preprocessing stages: partition sentinel fill, log
