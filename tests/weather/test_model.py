@@ -1,152 +1,193 @@
-"""Tests for weather.model (see docs/model_design.md §7, §8.4, §8.5)."""
+"""Tests for weather.model (see docs/model_design.md §5.1, §7, §8.4, §8.5)."""
 
 import json
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
-from conftest import TIER1_T0, TIER1_VARIABLES, TIER1_WAVE_SHAPE, fit_small_tier1_model
+from conftest import (
+    TIER1_ABSENT_CELL,
+    TIER1_LAND_CELL,
+    TIER1_N_TIMES,
+    TIER1_T0,
+    TIER1_TENSORS,
+    TIER1_VARIABLES,
+    TIER1_WAVE_SHAPE,
+    fit_small_tier1_model,
+    small_tier1_model,
+)
 from numpy.testing import assert_allclose
+from pytest_mock import MockerFixture
 from sklearn.base import clone
 
-import weather.model as model_module
 from core.archive_eras import ArchiveEra
-from train.dmd import dmd_fit as _real_dmd_fit
-from train.local_residual import fit_local_residual as _real_fit_local_residual
-from weather.model import ModelMetadata, WeatherModel
+from train.ingest import load_training_window
+from train.linear_inverse import GroupDiagnostics
+from weather.model import ModelMetadata, WeatherModel, build_preprocess, resolve_groups
 
 
 def test_fit_produces_expected_fitted_attributes(fitted_tier1_model: WeatherModel) -> None:
-    """fit() populates every documented fitted attribute with sane shapes."""
+    """fit() populates every §8.5 fitted attribute with per-tensor and per-group shapes."""
     model = fitted_tier1_model
 
-    assert model.ocean_mask_.dtype == np.bool_
-    assert model.ocean_mask_.shape == TIER1_WAVE_SHAPE
-    n_ocean = int(model.ocean_mask_.sum())
-    assert n_ocean > 0
-
-    assert set(model.variable_names_) == {"sigwh", "wsp", "u_wsea", "v_wsea", "u_wind", "v_wind"}
-    assert model.tucker_.U_ocean.shape == (n_ocean, 10)
-    assert model.tucker_.U_var.shape == (len(model.variable_names_), 4)
-    assert model.dmd_.Phi.shape == (10 * 4, 8)
-    assert model.dmd_.variant == "exact"
-    assert model.mode_ou_.theta.shape == (8,)
-    assert not np.isnan(model.mode_ou_.theta).any()
-    assert not np.isnan(model.mode_ou_.sigma).any()
-    assert model.local_residual_ is not None
-    assert model.local_residual_.theta.shape == (n_ocean, len(model.variable_names_))
-    assert not np.isnan(model.local_residual_.theta).any()
+    assert set(model.tensor_names_) == TIER1_TENSORS
+    assert model.groups_ == {t: (t,) for t in model.tensor_names_}
+    for tensor in model.tensor_names_:
+        assert model.tucker_[tensor].factor_lat.shape == (TIER1_WAVE_SHAPE[0], 2)
+        assert model.tucker_[tensor].factor_lon.shape == (TIER1_WAVE_SHAPE[1], 2)
+        assert tensor in model.core_copula_
+    for group in model.groups_:
+        n_modes = model.dmd_[group].Lambda.size
+        assert model.dmd_[group].Phi.shape == (4, n_modes)  # n_G = 2 x 2
+        assert model.dmd_[group].variant == "exact"
+        assert np.all(np.isfinite(model.mode_ou_[group].innovation_cov))
+        assert isinstance(model.group_diagnostics_[group], GroupDiagnostics)
+    assert model.local_residual_ is None
     assert isinstance(model.metadata_, ModelMetadata)
-    assert model.metadata_.variables == model.variable_names_
-    assert model.metadata_.dmd_variant == "exact"
-    assert model.metadata_.include_trend is True
-    assert model.metadata_.include_local_residual is True
+    assert set(model.metadata_.tensors) == TIER1_TENSORS
+    assert model.metadata_.tucker_ranks == {t: (2, 2) for t in model.tensor_names_}
+    assert model.metadata_.include_local_residual is False
     assert model.metadata_.t_train_start <= model.metadata_.t_ref <= model.metadata_.t_train_end
 
 
-def test_fit_include_local_residual_false_skips_local_residual(tier1_archive: Path) -> None:
-    """include_local_residual=False leaves local_residual_ set to None after fit()."""
-    model = WeatherModel(
-        t_start=TIER1_T0,
-        t_end=TIER1_T0 + timedelta(hours=3 * 60),
-        variables=TIER1_VARIABLES,
-        r_ocean=10,
-        r_var=4,
-        r_dmd=8,
-        copula_lut_bins=50,
-        include_local_residual=False,
-        random_state=0,
+def test_fit_ocean_mask_comes_from_sigwh_only(fitted_tier1_model: WeatherModel) -> None:
+    """sigwh's land cell is masked; a cell with an absent partition stays ocean (task 17)."""
+    mask = fitted_tier1_model.ocean_mask_
+
+    assert mask.shape == TIER1_WAVE_SHAPE
+    assert not mask[TIER1_LAND_CELL]
+    assert mask[TIER1_ABSENT_CELL]
+    assert int(mask.sum()) == mask.size - 1
+
+
+def test_fit_include_local_residual_true_raises(tier1_archive: Path) -> None:
+    """The local residual is deferred in v3 (§5.7); asking for it fails loudly."""
+    with pytest.raises(ValueError, match="deferred"):
+        small_tier1_model(include_local_residual=True).fit(tier1_archive)
+
+
+def test_fit_joint_group_shares_one_dmd_state(tier1_archive: Path) -> None:
+    """A two-member group fits one DMD over both members' cores (§5.6)."""
+    groups = {"wind": ["u_wind", "v_wind"]}
+    groups.update({t: [t] for t in TIER1_TENSORS - {"u_wind", "v_wind"}})
+
+    model = small_tier1_model(groups=groups).fit(tier1_archive)
+
+    assert model.dmd_["wind"].Phi.shape[0] == 8  # two 2 x 2 cores
+    assert model.group_diagnostics_["wind"].members == ("u_wind", "v_wind")
+
+
+def test_resolve_groups_rejects_a_tensor_left_out() -> None:
+    """Every tensor needs dynamics, so groups must cover each exactly once (§5.6.2)."""
+    with pytest.raises(ValueError, match="missing: \\['b'\\]"):
+        resolve_groups({"g": ["a"]}, ("a", "b"))
+
+
+def test_build_preprocess_tier1_yields_the_seven_tier1_tensors(tier1_archive: Path) -> None:
+    """Tier-1 raw variables become the seven tier-1 tensors (§3.8, §10)."""
+    x_raw = load_training_window(
+        tier1_archive,
+        TIER1_T0,
+        TIER1_T0 + timedelta(hours=3 * TIER1_N_TIMES),
+        TIER1_VARIABLES,
     )
-    model.fit(tier1_archive)
-    assert model.local_residual_ is None
-    assert model.metadata_.include_local_residual is False
+
+    a_std = build_preprocess(TIER1_VARIABLES).fit_transform(x_raw)
+
+    assert {str(name) for name in a_std.data_vars} == TIER1_TENSORS
 
 
-def test_fit_save_load_sample(tier1_archive: Path, tmp_path: Path) -> None:
-    """save() then load() reconstructs an equivalent model, end to end on a synthetic archive."""
+def test_transform_returns_standardized_anomalies_per_tensor(
+    tier1_archive: Path, fitted_tier1_model: WeatherModel
+) -> None:
+    """transform() gives one tensor per variable: unit scale at ocean cells, land NaN."""
+    a_std = fitted_tier1_model.transform(tier1_archive)
+    ocean = fitted_tier1_model.ocean_mask_
+
+    assert {str(name) for name in a_std.data_vars} == TIER1_TENSORS
+    for tensor in TIER1_TENSORS:
+        values = a_std[tensor].values
+        assert values.shape[0] == TIER1_N_TIMES
+        assert np.all(np.isfinite(values[:, ocean]))
+        assert np.all(np.isnan(values[:, ~ocean]))
+        assert_allclose(np.std(values[:, ocean], axis=0), 1.0, rtol=1e-8)
+
+
+def test_transform_inverse_roundtrip(tier1_archive: Path, fitted_tier1_model: WeatherModel) -> None:
+    """preprocess_.inverse_transform(transform(X)) recovers wave-native variables.
+
+    Exact up to rounding where the height is above the 1 cm log floor;
+    absent partitions come back as height 0 (§5.3.1). Wind is excluded:
+    Reprojector's inverse is the identity (see its docstring).
+    """
+    model = fitted_tier1_model
+    x_raw = load_training_window(tier1_archive, model.t_start, model.t_end, model.variables)
+
+    recovered = model.preprocess_.inverse_transform(model.preprocess_.transform(x_raw))
+
+    for variable, floored in [("sigwh", True), ("wsh", True), ("wsp", False)]:
+        raw = x_raw[variable].values
+        present = np.isfinite(raw) & (raw > 0.01 if floored else True)
+        assert_allclose(recovered[variable].values[present], raw[present], rtol=1e-9)
+    absent = np.isnan(x_raw["wsh"].values) & model.ocean_mask_[None, :, :]
+    assert absent.any()
+    assert np.all(recovered["wsh"].values[absent] == 0.0)
+
+
+def test_fit_save_load_roundtrip(tier1_archive: Path, tmp_path: Path) -> None:
+    """save() then load() reconstructs every component (§7)."""
     model = fit_small_tier1_model(tier1_archive)
     model_dir = tmp_path / "model"
     model.save(model_dir)
+
     loaded = WeatherModel.load(model_dir)
 
-    assert_allclose(loaded.ocean_mask_, model.ocean_mask_)
-    assert loaded.variable_names_ == model.variable_names_
-    # tucker.npz stores U_ocean/U_var as float32 (§7 dtype policy), so a
-    # round trip loses float32-level precision even though both arrays are
-    # float64 in memory before/after save+load.
-    assert_allclose(loaded.tucker_.U_ocean, model.tucker_.U_ocean, rtol=1e-6, atol=1e-8)
-    assert_allclose(loaded.tucker_.U_var, model.tucker_.U_var, rtol=1e-6, atol=1e-8)
-    assert loaded.tucker_.reconstruction_error == model.tucker_.reconstruction_error
-    assert_allclose(loaded.dmd_.Phi, model.dmd_.Phi)
-    assert_allclose(loaded.dmd_.Lambda, model.dmd_.Lambda)
-    assert loaded.dmd_.variant == model.dmd_.variant
-    assert_allclose(loaded.mode_ou_.theta, model.mode_ou_.theta)
-    assert_allclose(loaded.mode_ou_.sigma, model.mode_ou_.sigma)
-    assert model.local_residual_ is not None
-    assert loaded.local_residual_ is not None
-    assert_allclose(loaded.local_residual_.theta, model.local_residual_.theta)
-    assert_allclose(loaded.local_residual_.sigma, model.local_residual_.sigma)
-    assert_allclose(loaded.local_residual_.variance_ratio, model.local_residual_.variance_ratio)
-    assert_allclose(loaded.local_residual_.active_mask, model.local_residual_.active_mask)
     assert loaded.metadata_ == model.metadata_
-
-
-def test_save_load_roundtrip_include_local_residual_false(
-    tier1_archive: Path, tmp_path: Path
-) -> None:
-    """include_local_residual=False round-trips: local_residual.npz absent, local_residual_ None."""
-    model = WeatherModel(
-        t_start=TIER1_T0,
-        t_end=TIER1_T0 + timedelta(hours=3 * 60),
-        variables=TIER1_VARIABLES,
-        r_ocean=10,
-        r_var=4,
-        r_dmd=8,
-        copula_lut_bins=50,
-        include_local_residual=False,
-        random_state=0,
-    )
-    model.fit(tier1_archive)
-    assert model.local_residual_ is None
-
-    model_dir = tmp_path / "model"
-    model.save(model_dir)
-    assert not (model_dir / "local_residual.npz").exists()
-
-    loaded = WeatherModel.load(model_dir)
+    assert loaded.groups_ == model.groups_
+    assert_allclose(loaded.ocean_mask_, model.ocean_mask_)
+    for tensor in model.tensor_names_:
+        # Factors are float32 on disk (§7 dtype policy).
+        assert_allclose(
+            loaded.tucker_[tensor].factor_lat, model.tucker_[tensor].factor_lat, rtol=1e-6
+        )
+        assert loaded.tucker_[tensor].n_iter == model.tucker_[tensor].n_iter
+        assert_allclose(
+            loaded.core_copula_[tensor].sorted_anomalies_binned_[tensor],
+            model.core_copula_[tensor].sorted_anomalies_binned_[tensor],
+        )
+    for group in model.groups_:
+        assert_allclose(loaded.dmd_[group].Phi, model.dmd_[group].Phi)
+        assert loaded.dmd_[group].variant == model.dmd_[group].variant
+        assert_allclose(loaded.mode_ou_[group].innovation_cov, model.mode_ou_[group].innovation_cov)
+        assert_allclose(loaded.mode_ou_[group].partner, model.mode_ou_[group].partner)
+        loaded_diag = loaded.group_diagnostics_[group]
+        diag = model.group_diagnostics_[group]
+        assert_allclose(loaded_diag.lim.G, diag.lim.G)
+        assert_allclose(loaded_diag.tau.error_variance_ratio, diag.tau.error_variance_ratio)
+        assert_allclose(loaded_diag.tau_consistent, diag.tau_consistent)
     assert loaded.local_residual_ is None
 
 
-def test_metadata_json_roundtrips_new_fields(tier1_archive: Path, tmp_path: Path) -> None:
-    """metadata.json round-trips dmd_variant, include_trend, and t_ref correctly."""
-    model = WeatherModel(
-        t_start=TIER1_T0,
-        t_end=TIER1_T0 + timedelta(hours=3 * 60),
-        variables=TIER1_VARIABLES,
-        r_ocean=10,
-        r_var=4,
-        r_dmd=8,
-        copula_lut_bins=50,
-        dmd_variant="exact",
-        include_trend=True,
-        random_state=0,
-    )
-    model.fit(tier1_archive)
-
+def test_save_writes_the_documented_artifact_layout(
+    fitted_tier1_model: WeatherModel, tmp_path: Path
+) -> None:
+    """One file per tensor and per group under the §7 directory names."""
     model_dir = tmp_path / "model"
-    model.save(model_dir)
+    fitted_tier1_model.save(model_dir)
 
-    metadata_dict = json.loads((model_dir / "metadata.json").read_text())
-    assert metadata_dict["dmd_variant"] == "exact"
-    assert metadata_dict["include_trend"] is True
-    assert metadata_dict["t_ref"] == model.metadata_.t_ref.isoformat()
-
-    loaded = WeatherModel.load(model_dir)
-    assert loaded.metadata_.dmd_variant == "exact"
-    assert loaded.metadata_.include_trend is True
-    assert loaded.metadata_.t_ref == model.metadata_.t_ref
+    for name in ("metadata.json", "ocean_mask.npy", "preprocess.pkl", "group_diagnostics.json"):
+        assert (model_dir / name).exists()
+    for tensor in fitted_tier1_model.tensor_names_:
+        assert (model_dir / "tucker" / f"{tensor}.npz").exists()
+        assert (model_dir / "core_copula" / f"{tensor}.npz").exists()
+    for group in fitted_tier1_model.groups_:
+        for sub in ("dmd", "mode_ou", "lim"):
+            assert (model_dir / sub / f"{group}.npz").exists()
+    assert not (model_dir / "local_residual.npz").exists()
+    metadata = json.loads((model_dir / "metadata.json").read_text())
+    assert metadata["t_ref"] == fitted_tier1_model.metadata_.t_ref.isoformat()
+    assert set(metadata["tensors"]) == TIER1_TENSORS
 
 
 def test_from_components_matches_fit(fitted_tier1_model: WeatherModel) -> None:
@@ -156,54 +197,20 @@ def test_from_components_matches_fit(fitted_tier1_model: WeatherModel) -> None:
     rebuilt = WeatherModel.from_components(
         preprocess=fitted.preprocess_,
         tucker=fitted.tucker_,
+        core_copula=fitted.core_copula_,
         dmd=fitted.dmd_,
         mode_ou=fitted.mode_ou_,
-        local_residual=fitted.local_residual_,
+        group_diagnostics=fitted.group_diagnostics_,
         ocean_mask=fitted.ocean_mask_,
         metadata=fitted.metadata_,
     )
 
     assert rebuilt.t_start == fitted.t_start
     assert rebuilt.t_end == fitted.t_end
-    assert tuple(rebuilt.variables) == fitted.variable_names_
+    assert rebuilt.variables == TIER1_VARIABLES
+    assert rebuilt.tensor_names_ == fitted.tensor_names_
+    assert rebuilt.groups_ == fitted.groups_
     assert_allclose(rebuilt.ocean_mask_, fitted.ocean_mask_)
-    assert_allclose(rebuilt.tucker_.U_ocean, fitted.tucker_.U_ocean)
-    assert_allclose(rebuilt.dmd_.Phi, fitted.dmd_.Phi)
-    assert_allclose(rebuilt.mode_ou_.theta, fitted.mode_ou_.theta)
-    assert rebuilt.local_residual_ is not None
-    assert fitted.local_residual_ is not None
-    assert_allclose(rebuilt.local_residual_.theta, fitted.local_residual_.theta)
-
-
-def test_transform_inverse_roundtrip(tier1_archive: Path, fitted_tier1_model: WeatherModel) -> None:
-    """preprocess_.inverse_transform(preprocess_.transform(X)) reproduces X on wave-native variables.
-
-    Some quantization error is expected (see train.copula's own round-trip
-    tests): the copula LUT holds only `copula_lut_bins` quantiles fit from
-    just `TIER1_N_TIMES` samples here, so recovery is exact only at those
-    quantiles. Reprojected variables (was/wad_come_from -> u_wind/v_wind) are
-    excluded: Reprojector's inverse is deliberately the identity (see its
-    docstring), so only wave-native variables round-trip.
-    """
-    model = fitted_tier1_model
-
-    from train.ingest import load_training_window
-
-    x_raw = load_training_window(tier1_archive, model.t_start, model.t_end, model.variables)
-    gaussianized = model.preprocess_.transform(x_raw)
-    recovered = model.preprocess_.inverse_transform(gaussianized)
-
-    for variable in ["sigwh", "wsh", "wsp"]:
-        error = np.abs(recovered[variable].values - x_raw[variable].values)
-        assert np.median(error) < 0.05
-
-
-def test_transform_defaults_to_training_window(
-    tier1_archive: Path, fitted_tier1_model: WeatherModel
-) -> None:
-    """transform(X) without explicit bounds uses the training window."""
-    result = fitted_tier1_model.transform(tier1_archive)
-    assert result["sigwh"].shape[0] == 60
 
 
 def test_ocean_mask_accessor(fitted_tier1_model: WeatherModel) -> None:
@@ -212,19 +219,14 @@ def test_ocean_mask_accessor(fitted_tier1_model: WeatherModel) -> None:
 
 
 def test_sklearn_clone() -> None:
-    """clone(model) produces a fresh unfitted copy with matching params.
-
-    Every __init__ param (§9 gotcha 16) must round-trip through
-    get_params()/set_params() unmodified — including the new
-    dmd_variant/include_trend/trend_significance_threshold/
-    include_local_residual/local_residual_variance_floor params.
-    """
+    """clone(model) produces a fresh unfitted copy with every __init__ param unmodified (§9.16)."""
     model = WeatherModel(
         t_start=TIER1_T0,
         t_end=TIER1_T0 + timedelta(days=1),
         variables=TIER1_VARIABLES,
-        r_ocean=10,
-        r_var=4,
+        tucker_rank_fraction=0.3,
+        tucker_max_iter=50,
+        tucker_tol=1e-4,
         r_dmd=8,
         dmd_variant="bop",
         copula_lut_bins=250,
@@ -233,37 +235,30 @@ def test_sklearn_clone() -> None:
         trend_significance_threshold=0.25,
         include_local_residual=False,
         local_residual_variance_floor=0.05,
+        groups={"wind": ["u_wind", "v_wind"]},
+        lim_rank=5,
+        tau_test_lags=(1, 2),
+        n_bootstrap=7,
         random_state=42,
     )
-    cloned = clone(model)
-    assert isinstance(cloned, WeatherModel)
-    assert cloned.t_start == TIER1_T0
-    assert cloned.t_end == TIER1_T0 + timedelta(days=1)
-    assert cloned.variables == TIER1_VARIABLES
-    assert cloned.r_ocean == 10
-    assert cloned.r_var == 4
-    assert cloned.r_dmd == 8
-    assert cloned.dmd_variant == "bop"
-    assert cloned.copula_lut_bins == 250
-    assert cloned.diurnal_variables == ["sst"]
-    assert cloned.include_trend is False
-    assert cloned.trend_significance_threshold == 0.25
-    assert cloned.include_local_residual is False
-    assert cloned.local_residual_variance_floor == 0.05
-    assert cloned.random_state == 42
-    assert not hasattr(cloned, "preprocess_")
 
-    original_params = model.get_params()
-    cloned_params = cloned.get_params()
-    assert original_params == cloned_params
+    cloned = clone(model)
+
+    assert isinstance(cloned, WeatherModel)
+    assert cloned.get_params() == model.get_params()
+    assert cloned.groups == {"wind": ["u_wind", "v_wind"]}
+    assert cloned.tau_test_lags == (1, 2)
+    assert not hasattr(cloned, "preprocess_")
 
 
 def test_fit_derives_dt_from_archive_era_not_flat_constant(
-    tier1_archive: Path, monkeypatch: pytest.MonkeyPatch
+    tier1_archive: Path, mocker: MockerFixture
 ) -> None:
-    """dt for dmd_fit/fit_local_residual comes from core.archive_eras.era_for_timestamp,
-    not a reimported flat SNAPSHOT_CADENCE_SECONDS constant (see
-    tasks/16-archive-grid-resolution-drift.md).
+    """DMD, mode OU and the LIM all use the window era's cadence (tasks/16).
+
+    Patches the era lookup `weather.model` uses (this test predates the v3
+    rewrite and kept its patch) with a sentinel cadence no flat constant
+    could produce.
     """
     sentinel_cadence = 999.0
     fake_era = ArchiveEra(
@@ -275,22 +270,11 @@ def test_fit_derives_dt_from_archive_era_not_flat_constant(
         ocean_grid_shapes={},
         cadence_seconds=sentinel_cadence,
     )
-    monkeypatch.setattr(model_module, "era_for_timestamp", lambda t: fake_era)
+    mocker.patch("weather.model.era_for_timestamp", return_value=fake_era)
 
-    captured_dts: list[float] = []
+    model = fit_small_tier1_model(tier1_archive)
 
-    def spy_dmd_fit(*args: Any, **kwargs: Any) -> Any:
-        captured_dts.append(kwargs["dt"])
-        return _real_dmd_fit(*args, **kwargs)
-
-    def spy_fit_local_residual(*args: Any, **kwargs: Any) -> Any:
-        captured_dts.append(kwargs["dt"])
-        return _real_fit_local_residual(*args, **kwargs)
-
-    monkeypatch.setattr(model_module, "dmd_fit", spy_dmd_fit)
-    monkeypatch.setattr(model_module, "fit_local_residual", spy_fit_local_residual)
-
-    fit_small_tier1_model(tier1_archive)
-
-    assert len(captured_dts) == 2
-    assert captured_dts == [sentinel_cadence, sentinel_cadence]
+    for group in model.groups_:
+        assert model.dmd_[group].dt == sentinel_cadence
+        assert model.mode_ou_[group].dt == sentinel_cadence
+        assert model.group_diagnostics_[group].lim.dt == sentinel_cadence

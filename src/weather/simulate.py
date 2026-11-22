@@ -5,172 +5,230 @@
 Free functions, not methods on `WeatherModel` — the model is a passive
 container of fitted state; these algorithms don't mutate it (see AGENTS.md
 "Sampling is free functions, not methods").
+
+Order of operations (§5.8): evolve each group's stochastic channels (one
+correlated draw per group, §5.6.1) → complex mode amplitudes, conjugate
+pairs exact → per-tensor Gaussianized cores → copula inverse → Tucker
+inverse on the cells needed, land NaN → the Pipeline's per-cell inverses on
+the grid → bilinear interpolation of the linear-safe tensors → the
+Pipeline's pointwise inverses. Interpolating after the nonlinear inverses
+would average direction angles across 0°/360° and heights in physical space.
 """
 
-import warnings
 from datetime import datetime
 from typing import Final
 
 import numpy as np
 import xarray as xr
+from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_is_fitted
 
 from core.io import require_utc
-from train.dmd import ModeOUFit
+from train.dmd import (
+    ModeOUFit,
+    mode_amplitudes,
+    ou_stationary_cov,
+    ou_transition,
+    split_group_state,
+)
+from train.linear_inverse import covariance_factor
 from train.reproject import lonlat_interpolator
 from train.tucker import tucker_inverse
-from weather.model import WeatherModel
+from weather.model import PER_CELL_FIRST_STEP, WeatherModel, core_dataset
 
-_REPROJECT_STEP: Final[str] = "reproject"
-
-
-# --- Mechanical restoration of train/ou.py's deleted simulation helpers ----
-# `train/ou.py` was deleted (task 06): its mode-OU *fitting* logic moved into
-# `train/dmd.py` (`fit_mode_ou`), but its *simulation/evolution* helpers were
-# deliberately not ported anywhere — task 09 ("Sampling rewrite: coherent +
-# local") owns that, and needs to add complex-conjugate-pair forcing (§9
-# gotcha 8) and a parallel local-residual evolution step (§5.7, §5.8) neither
-# of which exist yet. The two functions below are a verbatim, unmodified port
-# of `train/ou.py`'s prior implementation (same math, only the type hint
-# changed from the deleted `OUFit` to `ModeOUFit` — identical fields), added
-# here only so this module and its test suite are importable again in the
-# interim. Task 09 must revisit both call sites in `sample_batch`/
-# `simulate_field` below to add conjugate-pair forcing and the local-residual
-# term — do not treat this restoration as task 09 being done.
-def _complex_normal(variance: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Draw a circularly-symmetric complex Gaussian sample per element.
-
-    `variance` is the total variance ``E[|Z|**2]``; real and imaginary
-    parts are independent with half that variance each.
-    """
-    std = np.sqrt(variance / 2.0)
-    return rng.normal(0.0, std) + 1j * rng.normal(0.0, std)
+# Unique query times per full-grid pass in `sample_batch`. The per-cell
+# inverses run on full-grid arrays (§5.8 step 4), about 8 MB per tensor and
+# time at era-3 resolution, so the chunk bounds that memory.
+_TIME_CHUNK: Final[int] = 8
 
 
-def sample_ou_equilibrium(ou: ModeOUFit, rng: np.random.Generator) -> np.ndarray:
-    """Draw each mode's initial amplitude from its stationary distribution.
-
-    (see docs/model_design.md §5.8: ``η_k(0) ~ N(0, σ_k² / (2θ_k))``)
-
-    Parameters
-    ----------
-    ou : ModeOUFit
-    rng : np.random.Generator
-
-    Returns
-    -------
-    (r_dmd,) complex128
-    """
-    variance = ou.sigma**2 / (2.0 * ou.theta)
-    return _complex_normal(variance, rng)
-
-
-def simulate_ou_forward(
-    ou: ModeOUFit,
-    eta: np.ndarray,
-    n_steps: np.ndarray | float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Evolve each OU mode's amplitude forward by ``n_steps * ou.dt`` in closed form.
-
-    (see docs/model_design.md §5.8)
-
-    The same closed-form transition serves both the discrete grid
-    simulation (called repeatedly with ``n_steps=1``, chaining forward)
-    and the continuous-time point-query fast path (called once with a
-    possibly fractional ``n_steps`` directly from a reference state).
-
-    Parameters
-    ----------
-    ou : ModeOUFit
-    eta : np.ndarray
-        Current per-mode amplitude. Mode is always axis 0; any further
-        axes (e.g. a batch of query times) must match `n_steps`'s further
-        axes — e.g. ``eta`` shaped ``(r_dmd, 1)`` against ``n_steps``
-        shaped ``(1, n_times)`` broadcasts to ``(r_dmd, n_times)``.
-    n_steps : np.ndarray | float
-        Elapsed time in units of `ou.dt`; may be fractional and need not
-        be 1.
-    rng : np.random.Generator
-
-    Returns
-    -------
-    np.ndarray, complex128, the broadcast shape of `eta` and `n_steps`.
-    """
-    n_steps_arr = np.asarray(n_steps, dtype=np.float64)
-    eta_arr = np.asarray(eta)
-
-    # ou.phi/sigma/theta are always 1D (r_dmd,); numpy broadcasting aligns
-    # shapes from the *trailing* axis, so a bare (r_dmd,) would collide
-    # with n_steps's own trailing (e.g. query-time) axis instead of lining
-    # up with eta/n_steps's leading mode axis. Reshape to (r_dmd, 1, 1, ...)
-    # to match however many extra axes eta/n_steps carry beyond the mode axis.
-    extra_dims = max(eta_arr.ndim, n_steps_arr.ndim, 1) - 1
-    mode_shape = (-1,) + (1,) * extra_dims
-    phi = ou.phi.reshape(mode_shape)
-    sigma = ou.sigma.reshape(mode_shape)
-    theta = ou.theta.reshape(mode_shape)
-
-    phi_n = phi**n_steps_arr
-    variance = sigma**2 * (1.0 - np.abs(phi) ** (2.0 * n_steps_arr)) / (2.0 * theta)
-    noise = _complex_normal(variance, rng)
-    result: np.ndarray = phi_n * eta_arr + noise
-    return result
+def _split_pipeline(model: WeatherModel) -> tuple[Pipeline, Pipeline]:
+    """The fitted Pipeline cut into its pointwise and per-cell halves (§5.8 steps 4, 6)."""
+    names = [name for name, _ in model.preprocess_.steps]
+    index = names.index(PER_CELL_FIRST_STEP)
+    return model.preprocess_[:index], model.preprocess_[index:]
 
 
 def _wave_grid_coordinates(model: WeatherModel) -> tuple[np.ndarray, np.ndarray]:
-    """Fetch the fitted Reprojector's target grid coordinates from `model.preprocess_`."""
-    reprojector = model.preprocess_.named_steps[_REPROJECT_STEP]
+    """The fitted Reprojector's target grid coordinates."""
+    reprojector = model.preprocess_.named_steps[PER_CELL_FIRST_STEP]
     return reprojector.target_lats_, reprojector.target_lons_
 
 
-def _invert_to_physical_grid(model: WeatherModel, z: np.ndarray, times64: np.ndarray) -> xr.Dataset:
-    """Scatter Gaussianized ocean-cell values to the grid and invert the preprocessing chain.
-
-    (see docs/model_design.md §4 — inversion must happen on the full grid,
-    before any spatial interpolation, since climatology/standardization/
-    copula are all fit per grid cell.)
-
-    Parameters
-    ----------
-    model : WeatherModel
-    z : (n_times, N_ocean, V) float64
-        Gaussianized ocean-cell values, e.g. from `train.tucker.tucker_inverse`.
-    times64 : (n_times,) datetime64[s]
-
-    Returns
-    -------
-    xr.Dataset
-        Physical-unit values in archive-native variable names (directional
-        pairs recombined to speed/direction by `ComingFromToUV.
-        inverse_transform` / `GoingToToUV.inverse_transform`), dims
-        ``(time, wave_lat, wave_lon)``.
-    """
-    n_times = z.shape[0]
-    n_lat, n_lon = model.ocean_mask_.shape
-    z2d = np.full((n_times, n_lat, n_lon, len(model.variable_names_)), np.nan, dtype=np.float64)
-    z2d[:, model.ocean_mask_, :] = z
-
-    wave_lats, wave_lons = _wave_grid_coordinates(model)
-    data_vars = {
-        name: (("time", "wave_lat", "wave_lon"), z2d[:, :, :, i])
-        for i, name in enumerate(model.variable_names_)
-    }
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="no explicit representation of timezones")
-        time_coord = times64.astype("datetime64[s]")
-    ds = xr.Dataset(
-        data_vars, coords={"time": time_coord, "wave_lat": wave_lats, "wave_lon": wave_lons}
-    )
-    result: xr.Dataset = model.preprocess_.inverse_transform(ds)
-    return result
+def _cadence_seconds(model: WeatherModel) -> float:
+    """Seconds between snapshots; every group shares the training window's cadence."""
+    return next(iter(model.dmd_.values())).dt
 
 
 def _delta_n(times64: np.ndarray, t_train_start: datetime, dt: float) -> np.ndarray:
-    """Elapsed time since `t_train_start`, in units of `dt` (may be fractional)."""
+    """Steps since the training window's first snapshot (fractional, §5.8 step 1).
+
+    Raises
+    ------
+    ValueError
+        For a time before `t_train_start`: DMD's decaying deterministic
+        terms grow without bound backwards in time, so the model only
+        extrapolates forward from its training window.
+    """
     t_train_start64 = np.datetime64(t_train_start.replace(tzinfo=None), "s")
     seconds = (times64 - t_train_start64).astype("timedelta64[s]").astype(np.float64)
-    return seconds / dt
+    if np.any(seconds < 0):
+        raise ValueError(
+            f"query times before the training window's start {t_train_start.isoformat()} "
+            "are not supported (docs/model_design.md §5.8)"
+        )
+    result: np.ndarray = seconds / dt
+    return result
+
+
+def _stationary_draw(ou: ModeOUFit, rng: np.random.Generator) -> np.ndarray:
+    """One draw of a group's channels from their joint stationary law, ``(n_c,)``."""
+    result: np.ndarray = covariance_factor(ou_stationary_cov(ou)) @ rng.standard_normal(ou.phi.size)
+    return result
+
+
+def _jump_channels(
+    ou: ModeOUFit, start: np.ndarray, delta_n: np.ndarray, standard_normal: np.ndarray
+) -> np.ndarray:
+    """Channels at each `delta_n`, each jumping from `start` with its own noise (§5.8 step 1).
+
+    Parameters
+    ----------
+    ou : ModeOUFit
+    start : (n_c,) channel state at step 0
+    delta_n : (n_t,)
+    standard_normal : (n_t, n_c) pre-drawn N(0, 1), so chunking cannot change the draw
+
+    Returns
+    -------
+    (n_c, n_t) float64
+    """
+    decay, noise_cov = ou_transition(ou, delta_n)
+    noise = np.einsum("tij,tj->ti", covariance_factor(noise_cov), standard_normal)
+    result: np.ndarray = (decay * start[None, :] + noise).T
+    return result
+
+
+def _chain_channels(ou: ModeOUFit, n_steps: int, rng: np.random.Generator) -> np.ndarray:
+    """A mutually consistent channel trajectory at the snapshot cadence, ``(n_c, n_steps)``.
+
+    Starts from a stationary draw and chains the one-step transition, whose
+    noise covariance is the innovation covariance itself (§5.6.1).
+    """
+    path = np.empty((ou.phi.size, n_steps), dtype=np.float64)
+    path[:, 0] = _stationary_draw(ou, rng)
+    noise = rng.standard_normal((n_steps, ou.phi.size)) @ covariance_factor(ou.innovation_cov).T
+    for step in range(1, n_steps):
+        path[:, step] = ou.phi * path[:, step - 1] + noise[step]
+    return path
+
+
+def _gaussianized_cores(
+    model: WeatherModel, channels: dict[str, np.ndarray], delta_n: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Channels → mode amplitudes → joint states → per-tensor cores (§5.8 steps 1–2).
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        Tensor -> Gaussianized core ``(n_t, r_lat, r_lon)``.
+    """
+    cores: dict[str, np.ndarray] = {}
+    for group, members in model.groups_.items():
+        dmd = model.dmd_[group]
+        amplitudes = mode_amplitudes(dmd, model.mode_ou_[group], channels[group], delta_n)
+        state = (dmd.Phi.astype(np.complex128) @ amplitudes).real.T
+        shapes = {
+            m: (model.tucker_[m].factor_lat.shape[1], model.tucker_[m].factor_lon.shape[1])
+            for m in members
+        }
+        cores.update(split_group_state(state, members, shapes))
+    return cores
+
+
+def _standardized_anomaly(
+    model: WeatherModel,
+    gaussianized_cores: dict[str, np.ndarray],
+    rows: np.ndarray | None = None,
+    cols: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Copula inverse on each core, then its Tucker inverse on ``rows × cols`` (§5.8 step 3)."""
+    anomaly: dict[str, np.ndarray] = {}
+    for tensor, gaussianized in gaussianized_cores.items():
+        core_ds = model.core_copula_[tensor].inverse_transform(core_dataset(tensor, gaussianized))
+        anomaly[tensor] = tucker_inverse(core_ds[tensor].values, model.tucker_[tensor], rows, cols)
+    return anomaly
+
+
+def _grid_dataset(
+    model: WeatherModel, fields: dict[str, np.ndarray], times64: np.ndarray
+) -> xr.Dataset:
+    """Full-grid fields as a canonical Dataset, land set to NaN.
+
+    The Tucker inverse also reconstructs the ALS's imputed land values;
+    those are not data, so land is masked before any inverse runs.
+    """
+    wave_lats, wave_lons = _wave_grid_coordinates(model)
+    land = ~model.ocean_mask_
+    data_vars = {}
+    for tensor, values in fields.items():
+        masked = values.copy()
+        masked[:, land] = np.nan
+        data_vars[tensor] = (("time", "wave_lat", "wave_lon"), masked)
+    return xr.Dataset(
+        data_vars,
+        coords={
+            "time": times64.astype("datetime64[s]"),
+            "wave_lat": wave_lats,
+            "wave_lon": wave_lons,
+        },
+    )
+
+
+def _scatter_to_grid(
+    blocks: dict[str, np.ndarray], rows: np.ndarray, cols: np.ndarray, grid_shape: tuple[int, ...]
+) -> dict[str, np.ndarray]:
+    """Place each ``(n_t, n_rows, n_cols)`` sub-grid on a NaN full grid."""
+    fields: dict[str, np.ndarray] = {}
+    for tensor, block in blocks.items():
+        full = np.full((block.shape[0], *grid_shape), np.nan, dtype=np.float64)
+        full[:, rows[:, None], cols[None, :]] = block
+        fields[tensor] = full
+    return fields
+
+
+def _stencil_rows_cols(
+    lats: np.ndarray, lons: np.ndarray, grid_lats: np.ndarray, grid_lons: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Grid rows and columns covering every query's 2 × 2 bilinear stencil (§5.8 step 3).
+
+    Matches `lonlat_interpolator`'s stencil choice: the lower corner is the
+    last grid line at or below the query (clipped to the second-to-last row
+    so a query on the top row uses the top interval), and the column after
+    the last one wraps to column 0. A superset is harmless; it only costs
+    evaluation.
+    """
+    n_lat, n_lon = grid_lats.size, grid_lons.size
+    row0 = np.clip(np.searchsorted(grid_lats, lats, side="right") - 1, 0, n_lat - 2)
+    step = grid_lons[1] - grid_lons[0]
+    col0 = np.floor((lons - grid_lons[0]) / step).astype(np.int64) % n_lon
+    rows = np.unique(np.concatenate([row0, row0 + 1]))
+    cols = np.unique(np.concatenate([col0, (col0 + 1) % n_lon]))
+    return rows, cols
+
+
+def _check_variables(model: WeatherModel, requested: list[str]) -> None:
+    """Raise unless every requested name is a modeled archive field.
+
+    The Pipeline's inverses return exactly the raw fields it was fit on
+    (`model.variables`), so this is checked before any sampling work.
+    """
+    missing = sorted(set(requested) - set(model.variables))
+    if missing:
+        raise ValueError(
+            f"variables {missing} are not modeled; available: {sorted(model.variables)} "
+            "(docs/model_design.md §10)"
+        )
 
 
 def sample_batch(
@@ -183,20 +241,21 @@ def sample_batch(
 ) -> np.ndarray:
     """Batched point query — the fast path (see docs/model_design.md §5.8).
 
-    One closed-form OU/DMD jump per *unique* query time (from a single
-    seeded equilibrium draw, so `seed` fully determines the realization),
-    one preprocessing-chain inversion over all unique times together, then
-    a bilinear interpolation per time group at the group's own points. See
-    §5.8 for why this is a deliberate approximation for batches spanning
-    many distinct times (use `simulate_field` when a dense, mutually
-    consistent trajectory matters) and why inversion precedes
-    interpolation (§4).
+    Each group's channels are drawn once from their stationary law at the
+    training window's start, then every unique query time jumps from that
+    draw in closed form with its own correlated noise. Each time therefore
+    has the correct marginal, but points at distinct times are not one
+    trajectory; use `simulate_field` when that matters. Only the stencil
+    rows and columns are Tucker-inverted; the per-cell inverses run on the
+    grid before interpolation, the pointwise inverses after.
 
     Parameters
     ----------
     model : WeatherModel
     lats, lons : (N,) float
+        Degrees; longitudes are taken modulo 360.
     times : (N,) datetime64[s]
+        UTC, at or after the training window's start.
     variables : list[str] | str
         Archive-native variable name(s), e.g. ``"sigwh"`` or ``["sigwh", "was"]``.
     seed : int | None
@@ -205,57 +264,58 @@ def sample_batch(
     -------
     np.ndarray
         ``(N,)`` if `variables` is a single string, else ``(N, len(variables))``.
+        NaN where a query's stencil touches land or leaves the grid.
     """
     check_is_fitted(model, "preprocess_")
-    if isinstance(variables, str):
-        single_variable = True
-        variable_list = [variables]
-    else:
-        single_variable = False
-        variable_list = list(variables)
-
+    variable_list = [variables] if isinstance(variables, str) else list(variables)
+    _check_variables(model, variable_list)
     lats = np.asarray(lats, dtype=np.float64)
-    lons = np.asarray(lons, dtype=np.float64)
-    n_points = lats.shape[0]
+    lons = np.mod(np.asarray(lons, dtype=np.float64), 360.0)
+    points = np.stack([lats, lons], axis=-1)
 
-    rng = np.random.default_rng(seed)
     times64 = np.asarray(times, dtype="datetime64[s]")
     unique_times, inverse = np.unique(times64, return_inverse=True)
-    n_unique = unique_times.shape[0]
+    inverse = inverse.reshape(-1)
+    delta_n = _delta_n(unique_times, model.metadata_.t_train_start, _cadence_seconds(model))
 
-    delta_n = _delta_n(unique_times, model.metadata_.t_train_start, model.dmd_.dt)
+    rng = np.random.default_rng(seed)
+    starts = {g: _stationary_draw(ou, rng) for g, ou in model.mode_ou_.items()}
+    normals = {
+        g: rng.standard_normal((unique_times.size, ou.phi.size)) for g, ou in model.mode_ou_.items()
+    }
 
-    eta_start = sample_ou_equilibrium(model.mode_ou_, rng)  # (r_dmd,)
-    eta_q = simulate_ou_forward(model.mode_ou_, eta_start[:, None], delta_n[None, :], rng)
-    a_det = model.dmd_.b0[:, None] * (model.dmd_.Lambda[:, None] ** delta_n[None, :])
-    a_q = a_det + eta_q  # (r_dmd, n_unique)
-
-    x_q = (model.dmd_.Phi @ a_q).real  # (N_state, n_unique)
-    core_q = x_q.T.reshape(n_unique, model.tucker_.r_ocean, model.tucker_.r_var)
-    z_q = tucker_inverse(core_q, model.tucker_)  # (n_unique, N_ocean, V)
-
-    physical = _invert_to_physical_grid(model, z_q, unique_times)
+    pointwise, per_cell = _split_pipeline(model)
     wave_lats, wave_lons = _wave_grid_coordinates(model)
+    rows, cols = _stencil_rows_cols(lats, lons, wave_lats, wave_lons)
+    tensors = list(model.tensor_names_)
+    linear = np.full((lats.size, len(tensors)), np.nan, dtype=np.float64)
+    for start in range(0, unique_times.size, _TIME_CHUNK):
+        chunk = slice(start, start + _TIME_CHUNK)
+        channels = {
+            g: _jump_channels(ou, starts[g], delta_n[chunk], normals[g][chunk])
+            for g, ou in model.mode_ou_.items()
+        }
+        blocks = _standardized_anomaly(
+            model, _gaussianized_cores(model, channels, delta_n[chunk]), rows, cols
+        )
+        grid = _grid_dataset(
+            model,
+            _scatter_to_grid(blocks, rows, cols, model.ocean_mask_.shape),
+            unique_times[chunk],
+        )
+        on_grid = per_cell.inverse_transform(grid)
+        for offset, time_index in enumerate(range(start, start + grid.sizes["time"])):
+            at_time = inverse == time_index
+            fields = np.stack([on_grid[t].values[offset] for t in tensors])
+            linear[at_time] = lonlat_interpolator(fields, wave_lats, wave_lons)(points[at_time])
 
-    results = {name: np.full(n_points, np.nan, dtype=np.float64) for name in variable_list}
-    for time_idx in range(n_unique):
-        point_mask = inverse == time_idx
-        if not point_mask.any():
-            continue
-        field_slices: list[np.ndarray] = []
-        for name in variable_list:
-            variable_array = physical.data_vars[name]
-            field_slices.append(variable_array.values[time_idx])
-        fields = np.stack(field_slices, axis=0)  # (len(variable_list), n_lat, n_lon)
-        interpolator = lonlat_interpolator(fields, wave_lats, wave_lons)
-        points = np.stack([lats[point_mask], lons[point_mask]], axis=-1)
-        interpolated = interpolator(points)  # (n_points_in_group, len(variable_list))
-        for v_idx, name in enumerate(variable_list):
-            results[name][point_mask] = interpolated[:, v_idx]
-
-    if single_variable:
-        return results[variable_list[0]]
-    return np.stack([results[name] for name in variable_list], axis=-1)
+    physical = pointwise.inverse_transform(
+        xr.Dataset({t: (("point",), linear[:, i]) for i, t in enumerate(tensors)})
+    )
+    if isinstance(variables, str):
+        result: np.ndarray = physical[variables].values
+        return result
+    return np.stack([physical[name].values for name in variable_list], axis=-1)
 
 
 def sample(
@@ -301,20 +361,20 @@ def simulate_field(
     variables: list[str],
     seed: int | None = None,
 ) -> xr.Dataset:
-    """Full-field synthetic trajectory on the native wave grid at 3h cadence.
+    """Full-field synthetic trajectory on the native wave grid at the snapshot cadence.
 
     (see docs/model_design.md §5.8)
 
-    Unlike `sample_batch`, this chains the OU process step by step (each
-    step's innovation depends on the previous step's state), giving a
-    single mutually consistent trajectory rather than independent jumps
-    from a reference time.
+    Unlike `sample_batch`, this chains each group's channels step by step
+    from a stationary draw, giving one mutually consistent trajectory. The
+    whole fitted Pipeline inverts the grid; no interpolation.
 
     Parameters
     ----------
     model : WeatherModel
     t_start, t_end : datetime
-        UTC-aware; `t_start` inclusive, `t_end` exclusive, at 3h cadence.
+        UTC-aware; `t_start` inclusive, `t_end` exclusive; `t_start` at or
+        after the training window's start.
     variables : list[str]
         Archive-native variable names to keep in the result.
     seed : int | None
@@ -322,39 +382,28 @@ def simulate_field(
     Returns
     -------
     xr.Dataset
-        Dims ``(time, wave_lat, wave_lon)``, restricted to `variables`.
+        Dims ``(time, wave_lat, wave_lon)``, restricted to `variables`; land NaN.
     """
     check_is_fitted(model, "preprocess_")
     require_utc(t_start, "t_start")
     require_utc(t_end, "t_end")
-
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="no explicit representation of timezones")
-        times64 = np.arange(
-            np.datetime64(t_start.replace(tzinfo=None), "s"),
-            np.datetime64(t_end.replace(tzinfo=None), "s"),
-            np.timedelta64(int(model.dmd_.dt), "s"),
-        )
-    n_steps = times64.shape[0]
-    if n_steps == 0:
+    _check_variables(model, variables)
+    dt = _cadence_seconds(model)
+    times64 = np.arange(
+        np.datetime64(t_start.replace(tzinfo=None), "s"),
+        np.datetime64(t_end.replace(tzinfo=None), "s"),
+        np.timedelta64(int(dt), "s"),
+        dtype="datetime64[s]",
+    )
+    if times64.size == 0:
         raise ValueError(f"empty simulation window: [{t_start.isoformat()}, {t_end.isoformat()})")
-
-    delta_n_start = _delta_n(times64[:1], model.metadata_.t_train_start, model.dmd_.dt)[0]
+    delta_n = _delta_n(times64, model.metadata_.t_train_start, dt)
 
     rng = np.random.default_rng(seed)
-    r_dmd = model.dmd_.Lambda.shape[0]
-    eta = sample_ou_equilibrium(model.mode_ou_, rng)
-    a_all = np.empty((r_dmd, n_steps), dtype=np.complex128)
-    for i in range(n_steps):
-        if i > 0:
-            eta = simulate_ou_forward(model.mode_ou_, eta, 1.0, rng)
-        a_det = model.dmd_.b0 * (model.dmd_.Lambda ** (delta_n_start + i))
-        a_all[:, i] = a_det + eta
-
-    x_all = (model.dmd_.Phi @ a_all).real  # (N_state, n_steps)
-    core_all = x_all.T.reshape(n_steps, model.tucker_.r_ocean, model.tucker_.r_var)
-    z_all = tucker_inverse(core_all, model.tucker_)  # (n_steps, N_ocean, V)
-
-    physical = _invert_to_physical_grid(model, z_all, times64)
+    channels = {g: _chain_channels(ou, times64.size, rng) for g, ou in model.mode_ou_.items()}
+    anomaly = _standardized_anomaly(model, _gaussianized_cores(model, channels, delta_n))
+    physical: xr.Dataset = model.preprocess_.inverse_transform(
+        _grid_dataset(model, anomaly, times64)
+    )
     result: xr.Dataset = physical[variables]
     return result

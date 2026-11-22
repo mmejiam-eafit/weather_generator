@@ -7,6 +7,76 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — v3 pipeline implemented: per-tensor Tucker, copula on the
+  core, per-group DMD and pair-coherent OU, a v3 sampler** —
+  `src/train/tucker.py`, `src/train/dmd.py`, `src/train/linear_inverse.py`,
+  `src/train/local_residual.py`, `src/train/ingest.py`, `src/core/logger.py`
+  (new), `src/weather/model.py`, `src/weather/simulate.py`,
+  `src/weather/validate.py`, `tests/conftest.py`, `tests/train/test_tucker.py`,
+  `tests/train/test_dmd.py`, `tests/train/test_ingest.py`,
+  `tests/train/test_local_residual.py`, `tests/weather/*`,
+  `docs/model_design.md` (§5.5, §5.6, §5.6.1, §5.6.2, §5.8, §7, §9 gotcha 8),
+  `AGENTS.md`. Steps 3–6 of the v3 implementation, one change because the
+  new `TuckerFit` breaks every caller at once.
+  - **Handoff gap filled first.** v3's `ModeOUFit` could hold neither the
+    conjugate-pair procedure task 07 validated nor correlated within-group
+    noise. §5.6.1 now specifies one real AR(1) channel per real mode and per
+    conjugate pair (log magnitude, deterministic phase), one innovation
+    covariance per group, and closed-form fractional-step transitions; §5.8
+    and §7 follow. Real channels draw real noise at the full variance; task
+    07's script halved it by keeping the real part of complex noise.
+  - **`train/tucker.py`.** `TuckerFit(factor_lat, factor_lon,
+    reconstruction_error, n_iter)`; `tucker_fit` runs
+    `partial_tucker_lowmem` in checkpoint chunks with chunk-to-chunk early
+    stopping, returns the ALS core, and reports the error over ocean cells
+    only. `fill_land` is the Tucker boundary and raises on NaN at an ocean
+    cell. `tucker_inverse` takes optional `rows`/`cols` for the sampler's
+    sub-grid. Contractions are batched matmuls: a three-operand `einsum`
+    would loop naively at production size.
+  - **`train/dmd.py`.** `dmd_fit` takes a group's `(T, n_G)` state (any
+    trailing shape is flattened, so task 07 scripts that pass a 3-D core
+    still run). New `group_state`, `split_group_state`, `conjugate_pairs`,
+    `ou_transition`, `ou_stationary_cov`, `mode_amplitudes`; `fit_mode_ou`
+    returns the new `ModeOUFit`, with `theta`/`sigma` as derived properties.
+  - **`train/linear_inverse.py`.** `covariance_factor` extracted from
+    `_simulate_linear` so the sampler reuses it; behaviour unchanged.
+  - **`weather/model.py`.** `build_preprocess` derives the §5.3 Pipeline
+    from the raw variables (sentinel → `(u, v)` with `keep_speed` → log →
+    reproject → climatology → standardize). `fit` runs per-tensor Tucker and
+    copula, per-group DMD, mode OU and `diagnose_group`, and logs Tucker
+    errors, period sentinels, trend significance and diagnostics verdicts.
+    `groups` must cover every tensor exactly once; `include_local_residual=True`
+    raises (deferred, §5.7). Hyperparameters, fitted attributes,
+    `from_components` and the per-tensor/per-group artifact layout follow
+    §7 and §8.5.
+  - **`weather/simulate.py`.** Correlated channel draws per group, exact
+    conjugate pairs, copula inverse, Tucker inverse on the stencil rows and
+    columns only, land masked, the Pipeline's per-cell steps before bilinear
+    interpolation of `(u, v)`, `logE` and `T`, its pointwise steps after.
+    Longitudes are taken modulo 360. Times before the training window raise:
+    decaying DMD terms grow without bound backwards. Requested variables are
+    checked before any sampling work. `sample_ou_equilibrium` and
+    `simulate_ou_forward` are removed.
+  - **`weather/validate.py`.** Real data takes the Pipeline's round trip
+    through reprojection; check 7 KS-tests held-out Gaussianized core
+    coefficients (§6.A.7); the report adds a §5.6.2 diagnostics page.
+  - **Logging.** `core/logger.py` wraps one stdlib-backed structlog logger
+    without configuring handlers or structlog globally; the three
+    training-path `print` calls moved to it, and the ingest tests read it
+    with `caplog`.
+  - **Tests.** 230 pass. The tier-1 fixture gains a land cell (NaN `sigwh`
+    and `was`) and an intermittently absent wind-sea partition, and puts
+    wind on the wave grid's own lines as in era 3. New tests check, among
+    others: the ocean mask ignores partition absence; heights halfway
+    between nodes are the geometric mean (interpolation in log-energy
+    space); land never leaves the sampler; pair amplitudes reconstruct a
+    real field to 1e-10; transitions leave the stationary covariance
+    invariant; correlated innovations are recovered. The fixture runs 2
+    bootstrap replicates, which dominated fit time.
+  - **Broken outside the gates.** `notebooks/07_dmd_ou_generative_check.py`
+    imports the removed `simulate_ou_forward` and builds the old
+    `ModeOUFit`; it stays as the record of task 07's validation.
+
 - **2026-11-22 — `model_design.md` v3: the handoff now specifies the
   decided pipeline, ahead of the `model.py` rewrite** —
   `docs/model_design.md` (header and windows, new "What changed in v3",

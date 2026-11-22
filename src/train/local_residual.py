@@ -43,16 +43,21 @@ def coherent_reconstruction(core_deterministic: np.ndarray, tucker: TuckerFit) -
     accidentally includes `η_k(t)` here would leak coherent-layer stochastic
     variance into the local-residual fit and double-count it at sample time.
 
+    Deferred in v3 (docs/model_design.md §5.7): Tucker is now per tensor, so
+    this reconstructs one tensor's grid; `fit_local_residual` below still
+    has v2's raveled ``(T, N_ocean, V)`` layout and is not wired into
+    `WeatherModel`.
+
     Parameters
     ----------
-    core_deterministic : (T, r_ocean, r_var) float64
+    core_deterministic : (T, r_lat, r_lon) float64
         DMD forward's deterministic reconstruction, with no OU term added.
     tucker : TuckerFit
         The same Tucker fit `core_deterministic` was expressed in.
 
     Returns
     -------
-    Z_coherent : (T, N_ocean, V) float64
+    Z_coherent : (T, H, W) float64
     """
     return tucker_inverse(core_deterministic, tucker)
 

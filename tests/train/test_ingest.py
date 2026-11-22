@@ -1,5 +1,6 @@
 """Tests for train.ingest (see docs/model_design.md §2.5, §5.1)."""
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from numpy.testing import assert_allclose
 
 from core.io import snapshot_path
+from core.logger import LOGGER_NAME
 from train.ingest import load_training_window
 
 _T0 = datetime(2025, 1, 1, 0, tzinfo=timezone.utc)
@@ -62,7 +64,7 @@ def test_load_training_window_direction_variable_decoded(tmp_path: Path) -> None
 
 
 def test_load_training_window_missing_snapshot_fills_nan(tmp_path: Path) -> None:
-    """A single missing snapshot is logged to stderr and filled with NaN, not aborted."""
+    """A single missing snapshot is logged and filled with NaN, not aborted."""
     _write_uniform_window(
         tmp_path,
         "sigwh",
@@ -190,13 +192,13 @@ def test_load_training_window_last_snapshot_wad_consistency_failure_raises(
 
 
 def test_load_training_window_wad_consistency_check_passes_silently(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A correctly-related wad/wad_come_from pair across the window loads cleanly (§5.1).
 
-    Success is logged to stderr (via the informational print pattern this
-    file already uses for gap handling) but no warning or exception fires.
+    Success is logged through `core.logger` but no warning or exception fires.
     """
+    caplog.set_level(logging.INFO, logger=LOGGER_NAME)
     n_times = 3
     wad = np.array([[1, 5]], dtype=np.int8)  # 0 deg, 90 deg
     wad_come_from = np.array([[9, 13]], dtype=np.int8)  # 180 deg, 270 deg -> consistent
@@ -212,7 +214,7 @@ def test_load_training_window_wad_consistency_check_passes_silently(
     ds = load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3 * n_times), ["sigwh"])
 
     assert ds["sigwh"].shape == (n_times, 1, 2)
-    assert "consistency check passed" in capsys.readouterr().err
+    assert "wad consistency check passed" in caplog.text
 
 
 def test_load_training_window_wad_consistency_check_ignores_land_cells(tmp_path: Path) -> None:
@@ -259,7 +261,7 @@ def test_load_training_window_wad_consistency_check_still_detects_ocean_drift(
 
 
 def test_load_training_window_wad_consistency_check_tolerates_rare_sector_rounding(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A handful of cells landing on a compass-code sector boundary and
     rounding into an adjacent sector must not fail the whole window --
@@ -270,6 +272,7 @@ def test_load_training_window_wad_consistency_check_tolerates_rare_sector_roundi
     2000 ocean cells, all cleanly 180° apart except 1 cell that's exactly
     one 22.5° sector off (0.05% of cells) -- well under the 0.1% tolerance.
     """
+    caplog.set_level(logging.INFO, logger=LOGGER_NAME)
     shape = (2, 1000)  # within era2's (721, 1440) wind-grid bound; 2000 cells total
     was = np.full(shape, 5.0, dtype=np.float16)  # all ocean
     wad = np.ones(shape, dtype=np.int8)  # every cell: code 1 -> 0 deg
@@ -283,7 +286,7 @@ def test_load_training_window_wad_consistency_check_tolerates_rare_sector_roundi
     ds = load_training_window(tmp_path, _T0, _T0 + timedelta(hours=3), ["was"])
 
     assert ds["was"].shape == (1, *shape)
-    assert "consistency check passed" in capsys.readouterr().err
+    assert "wad consistency check passed" in caplog.text
 
 
 def test_load_training_window_wad_consistency_check_rejects_too_many_off_sector_cells(
@@ -355,7 +358,7 @@ def test_load_training_window_era1_window_loads_with_era1_cadence(tmp_path: Path
 
 
 def test_load_training_window_spans_era_boundary_raises_before_file_io(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A window spanning the era1/era2 seam is rejected immediately, before any file I/O.
 
@@ -363,14 +366,14 @@ def test_load_training_window_spans_era_boundary_raises_before_file_io(
     than up-front (e.g. deep in the per-variable load loop), this would
     instead fail with "no snapshots found" or log "missing snapshot" lines.
     """
+    caplog.set_level(logging.INFO, logger=LOGGER_NAME)
     t_start = datetime(2023, 10, 1, 18, tzinfo=timezone.utc)  # era1's last real snapshot
     t_end = datetime(2023, 10, 2, 3, tzinfo=timezone.utc)  # era2
 
     with pytest.raises(ValueError, match="spans more than one archive era"):
         load_training_window(tmp_path, t_start, t_end, ["sigwh"])
 
-    captured = capsys.readouterr()
-    assert "missing snapshot" not in captured.err
+    assert "missing snapshot" not in caplog.text
 
 
 def test_load_training_window_shape_changes_mid_window_raises(tmp_path: Path) -> None:

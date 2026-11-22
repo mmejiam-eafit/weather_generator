@@ -26,7 +26,7 @@ Read this section if you know v2. v3 brings the handoff in line with the decisio
 2. **Per-variable masked Tucker** on each `(T, lat, lon)` tensor, compressing only the spatial modes, through the vendored `train/masked_tucker.partial_tucker_lowmem` (task 07 §5 fixed two tensorly bugs). Replaces v2's joint ocean-cell × variable Tucker and its `r_ocean`/`r_var` ranks. Rank: 40% of each spatial dimension (task 07). §5.5.
 3. **Gaussianization after Tucker** (placement ii, DECIDED in `open_questions.md` §4.1). The copula is fit on each Tucker core's coefficients, not on grid cells, and leaves the preprocessing Pipeline. §3.5, §5.5.1.
 4. **Land mask from `sigwh`, sentinel fill for absent partitions** (task 17, `open_questions.md` §5.6). §5.1, §5.3.1.
-5. **DMD and mode-level OU per variable group**: one group per tensor by default; joint groups are a Linear Inverse Model (`correlated_variables.md` §4). `r_dmd = 100` (task 07). §5.6.
+5. **DMD and mode-level OU per variable group**: one group per tensor by default; joint groups are a Linear Inverse Model (`correlated_variables.md` §4). `r_dmd = 100` (task 07). The mode OU drives one real channel per real mode and per conjugate pair (task 07's validated pair procedure), with one joint innovation covariance per group. §5.6, §5.6.1.
 6. **Group dynamics diagnostics stage** (tau test, coupling information). §5.6.2.
 7. **Local residual deferred.** Not part of the first era-3 model (`include_local_residual=False`). §3.10, §5.7.
 8. **Sampling interpolates in linear-safe space.** Per-cell inverses on grid cells, then bilinear interpolation of `(u, v)`, `logE` and `T`, then pointwise `exp` / `hypot` / `atan2`. v2 interpolated physical values, direction angles included. §5.8.
@@ -912,13 +912,24 @@ def tucker_fit(
     """Masked Tucker on the spatial modes; returns the fit and its (T, r_lat, r_lon) core."""
 
 
+def fill_land(field: np.ndarray, ocean_mask: np.ndarray) -> np.ndarray:
+    """(T, H, W) with land NaN → float32, land 0.0; raises if an ocean cell is NaN."""
+
+
 def tucker_transform(x: np.ndarray, fit: TuckerFit) -> np.ndarray:
-    """x ×_lat factor_latᵀ ×_lon factor_lonᵀ → (T, r_lat, r_lon); land filled 0.0."""
+    """x ×_lat factor_latᵀ ×_lon factor_lonᵀ → (T, r_lat, r_lon); x from fill_land."""
 
 
-def tucker_inverse(core: np.ndarray, fit: TuckerFit) -> np.ndarray:
-    """core ×_lat factor_lat ×_lon factor_lon → (T, H, W)."""
+def tucker_inverse(
+    core: np.ndarray,
+    fit: TuckerFit,
+    rows: np.ndarray | None = None,       # factor_lat rows to evaluate; None = all
+    cols: np.ndarray | None = None,       # factor_lon rows to evaluate; None = all
+) -> np.ndarray:
+    """core ×_lat factor_lat[rows] ×_lon factor_lon[cols] → (T, len(rows), len(cols))."""
 ```
+
+`fill_land` is the Tucker boundary of §9 gotcha 24, for training and held-out data alike. A NaN at an ocean cell means an upstream stage failed to fill something (the partition sentinel, or a reprojection stencil touching land), so it raises rather than letting the masked ALS impute an ocean value silently. `tucker_inverse` with `rows`/`cols` evaluates a sub-grid for the sampler (§5.8) at a cost proportional to its size.
 
 **Algorithm.** Masked HOOI with time left at full rank (`modes=[1, 2]`): randomized-SVD initialization, then ALS in chunks of `checkpoint_every` iterations, each chunk resuming from the previous `(core, factors)`. Stop at `n_iter_max`, or when the reconstruction error improves by less than `early_stop_tol` from one chunk to the next. These are the settings of task 07's production run (`svd="randomized_svd"`, `svd_mask_repeats=0`). `tucker_fit` returns the ALS's own core, which is consistent with the imputed land values, and that core is what the copula and DMD consume. `tucker_transform` is for held-out data.
 
@@ -942,7 +953,7 @@ The copula is not a Pipeline stage. `WeatherModel` keeps one per tensor (`core_c
 
 Lives in `train/dmd.py`. Not a transformer.
 
-**Input: a variable group's joint state.** For group `G`, flatten each member's Gaussianized core to `(T, r_lat · r_lon)` and concatenate the members along the feature axis (`correlated_variables.md` §4.2): `(T, n_G)`. A single-member group is one tensor's core, `n_G = 288 · 576 = 165,888` at default rank. Snapshot pairs never cross an era boundary, which a single-era training window guarantees.
+**Input: a variable group's joint state.** For group `G`, flatten each member's Gaussianized core to `(T, r_lat · r_lon)` and concatenate the members along the feature axis (`correlated_variables.md` §4.2): `(T, n_G)`. A single-member group is one tensor's core, `n_G = 288 · 576 = 165,888` at default rank. Snapshot pairs never cross an era boundary, which a single-era training window guarantees. `train.dmd.group_state(cores, members)` builds this state and `split_group_state` inverts it at sampling. `dmd_fit` flattens any trailing shape, so a single `(T, r_lat, r_lon)` core is also accepted.
 
 ```python
 from pydmd import DMD, BOPDMD, HankelDMD
@@ -1025,38 +1036,57 @@ Fit per group on the same joint state DMD used (`fit_mode_ou(state, dmd)`). For 
 
 ```
 a_k(t) = k-th component of (Φ⁺ · x_t)           # measured complex amplitude
-â_k(t) = b0_k · exp(lam_cont_k · t)              # deterministic prediction
+â_k(t) = b0_k · Λ_k^t                            # deterministic prediction
 η_k(t) = a_k(t) − â_k(t)                         # residual
 ```
 
-Fit AR(1) → OU:
+**One real stochastic channel per real mode and per conjugate pair (v3).** Exact DMD on real data returns modes that are real or come in exact complex-conjugate pairs, and a real field needs `η_k'(t) = conj(η_k(t))` exactly, not merely in distribution (`open_questions.md` §5.2). A pair is therefore one stochastic driver. v3 ports the procedure task 07 validated (`notebooks/07_dmd_ou_generative_check.py`), which took the reconstruction's imaginary-to-real ratio from about 1 to machine precision:
+
+- **Real mode `k`:** channel `c(t) = Re η_k(t)`.
+- **Conjugate pair `(k, k')`:** channel `c(t) = log|η_k(t)| − mean_t log|η_k(t)|`. Only the magnitude is stochastic, in log space because it is positive with a nonzero mean. The phase is deterministic, `arg η_k(t) = phase_offset_k + t · arg Λ_k`, anchored at the measured phase of the last training step. The partner is the conjugate, so the pair is exactly conjugate by construction.
+- **Pairing:** `k'` is a pair partner when `|Λ_k' − conj(Λ_k)| < 1e-6`. An oscillatory mode whose partner the truncation dropped is treated as a real mode, and the imaginary part it contributes to the reconstruction is discarded.
+
+**AR(1) per channel, one joint innovation covariance per group.** Channels are real, so:
 
 ```
-φ_mode(k) = Σ_t conj(η_k(t)) · η_k(t+Δt)  /  Σ_t |η_k(t)|²
-θ_mode(k) = −log(clip(Re(φ_mode(k)), 1e-4, 0.9999)) / Δt
-σ_mode(k)² = Var(η_k) · 2·θ_mode(k) / (1 − |φ_mode(k)|²)     # continuous-time diffusion
+φ_c = clip( Σ_t c(t) c(t+1) / Σ_t c(t)²,  1e-4, 0.9999 )
+θ_c = −log(φ_c) / Δt
+ε_c(t) = c(t+1) − φ_c · c(t)                     # one-step innovation
+Q = Cov(ε)                                       # (n_c, n_c), all channels of the group
+σ_c² = Q_cc · 2θ_c / (1 − φ_c²)                  # continuous-time diffusion, as in v2
 ```
 
-**`θ_mode(k)` clips `Re(φ_mode(k))`, not `|φ_mode(k)|`.** These are not
-interchangeable: a negative real part means the mode's residual alternates
-sign step-to-step (anti-correlation), which is physically distinct from slow
-mean-reversion even if `|φ|` happens to be large in that case. Clipping the
-*real part* pushes negative-real-part modes to the fast-decorrelation end of
-the range (`θ` large) rather than assigning them whatever slow decay `|φ|`
-alone would imply — deliberately treating alternation as noise-like, not
-as a real slow oscillation. Using `|φ|` here would recover the wrong `θ` for
-any mode with `Re(φ) < 0`.
+`Q`'s off-diagonal is the correlated within-group noise of §5.6.2 and `correlated_variables.md` §4.4. In a joint group it carries the cross-member coupling of the innovations. In a single-member group it carries the correlation between that tensor's own modes, which independent per-mode draws discarded.
 
-Lives in `train/dmd.py` alongside `dmd_fit`. Returns a `ModeOUFit` frozen dataclass:
+**Clip `φ` itself, not `|φ|`.** A negative AR(1) coefficient means the channel alternates sign step to step, which is physically distinct from slow mean reversion. Clipping pushes it to the fast-decorrelation floor (`θ` large), deliberately treating alternation as noise-like. The clipped `φ` is also the one the sampler uses, so fractional powers `φ^Δn` stay defined.
+
+**Transitions** (used by the sampler, §5.8). Elementwise over channel pairs `(a, b)`, for any real `n ≥ 0`:
+
+```
+c(t + nΔt) = φ^n ⊙ c(t) + w,   w ~ N(0, C(n)),   C(n)_ab = Q_ab · (1 − (φ_a φ_b)^n) / (1 − φ_a φ_b)
+P_ab = Q_ab / (1 − φ_a φ_b)                      # stationary covariance
+```
+
+`C(n)` and `P` are positive semidefinite (Schur product of `Q` with a positive semidefinite kernel), and `P` is invariant under the transition.
+
+**Real channels draw real noise at the full innovation variance.** Task 07's script drew complex noise for real modes and kept the real part, which halves their innovation variance. v3 does not copy that.
+
+Lives in `train/dmd.py` alongside `dmd_fit`, with `ou_transition`, `ou_stationary_cov` and `mode_amplitudes` (channels → complex mode amplitudes, §5.8 step 1). Returns a `ModeOUFit` frozen dataclass:
 
 ```python
 @dataclass(frozen=True, slots=True)
 class ModeOUFit:
-    theta: np.ndarray       # (r_dmd,) float64
-    sigma: np.ndarray       # (r_dmd,) float64
-    phi:   np.ndarray       # (r_dmd,) complex128
-    dt:    float
+    mode: np.ndarray                # (n_c,) int64 — the DMD mode each channel drives
+    partner: np.ndarray             # (n_c,) int64 — that mode's conjugate partner; -1 = real channel
+    phi: np.ndarray                 # (n_c,) float64 — clipped AR(1) coefficient at dt
+    innovation_cov: np.ndarray      # (n_c, n_c) float64 — Q
+    log_magnitude_mean: np.ndarray  # (n_c,) float64 — 0 for real channels
+    phase_offset: np.ndarray        # (n_c,) float64 — 0 for real channels
+    dt: float
+    # theta and sigma are derived properties (formulas above)
 ```
+
+v2's `ModeOUFit(theta, sigma, phi, dt)` held one complex OU per mode with independent noise; `phi` was complex.
 
 #### 5.6.2 Group dynamics diagnostics: linear inverse model, tau test, coupling information
 
@@ -1143,12 +1173,13 @@ evidence for the decisions they inform: the training lag, `variant="hankel"`
 complement the held-out checks of §6. They are in-sample, and they measure
 the regression's assumptions rather than the samples.
 
-**Correlated noise.** Within a multi-member group, stochastic forcing is
-specified as one joint Gaussian draw with the group's innovation covariance
-(`correlated_variables.md` §4.4). That change is ported to the sampler with
-the `weather/simulate.py` rewrite; `simulate_lim` is the reference
-implementation. This stage only estimates the covariance and measures what
-independent draws would lose.
+**Correlated noise.** Within a group, stochastic forcing is one joint
+Gaussian draw with the group's innovation covariance
+(`correlated_variables.md` §4.4). The sampler draws it in DMD channel
+coordinates, from the covariance `fit_mode_ou` estimates (§5.6.1);
+`simulate_lim` is the reference implementation of the same idea in PC
+coordinates. This stage estimates the LIM's own covariance and measures
+what independent draws would lose; it does not feed the sampler.
 
 **Cost.** Dominated by one principal-component decomposition per member:
 the T × T Gram matrix, under a minute at production scale. The bootstrap
@@ -1247,17 +1278,16 @@ Free functions in `weather/simulate.py`. They read from the fitted `WeatherModel
 
 **Continuous-time point query — the `sample_batch` fast path.** For each unique query time `t_q`, use the closed-form OU transition rather than a grid simulation.
 
-**Step 1: Evolve each group's mode amplitudes to `t_q`.**
+**Step 1: Evolve each group's channels to `t_q`, then build its mode amplitudes** (§5.6.1).
 ```
 Δn = (t_q − t_train_start).total_seconds() / dt      # can be fractional
-For each DMD mode k of group G:
-    â_k(t_q) = b0_k · Λ_k^Δn
-    η_k(t_q) = φ_mode(k)^Δn · η_k(t_ref)
-             + N_ℂ(0, σ_mode(k)² · (1 − |φ_mode(k)|^(2·Δn)) / (2·θ_mode(k)))
-    a_k(t_q) = â_k(t_q) + η_k(t_q)
+c_0 ~ N(0, P)                                         # one stationary draw per group and call, at t_train_start
+c(t_q) = φ^Δn ⊙ c_0 + w,   w ~ N(0, C(Δn))           # one correlated draw per group and unique time
+real channel (mode k):    η_k = c
+pair channel (k, k'):     η_k = exp(c + log_magnitude_mean) · exp(i · (phase_offset + Δn · arg Λ_k)),  η_k' = conj(η_k)
+a_k(t_q) = b0_k · Λ_k^Δn + η_k
 ```
-- **Conjugate pairs** (`variant="exact"` or `"hankel"`). Use the procedure validated in task 07 (`open_questions.md` §5.2): per conjugate pair, only the shared magnitude evolves stochastically, in log space, and the phase stays deterministic at the pair's own frequency. The pair is then exactly conjugate by construction. Independent per-mode draws make the reconstruction about as imaginary as real. `variant="bop"` enforces pairing at fit time.
-- **Joint groups.** Draw the innovations as one correlated Gaussian vector with the group's innovation covariance, not independently per mode or per member (§5.6.2, `correlated_variables.md` §4.4). `train.linear_inverse.simulate_lim` is the reference implementation.
+Every unique time jumps from the same reference draw with its own transition noise, so each time has the correct marginal, but points at distinct times are not one trajectory. Use `simulate_field` when a mutually consistent trajectory matters. The noise is one correlated draw per group (`Q` of §5.6.1), never independent per mode or per member (§5.6.2). `variant="bop"` already returns exact pairs; the same channel construction applies.
 
 **Step 2: Joint state → per-tensor Gaussianized cores.**
 ```
@@ -1265,21 +1295,21 @@ x_G(t_q) = Re(Φ_G · a(t_q))                            # (n_G,)
 split x_G by member blocks; reshape each to (r_lat, r_lon)
 ```
 
-**Step 3: Copula inverse, then Tucker inverse on the cells needed.** `core_copula_[v].inverse_transform` maps the Gaussianized core back to the anomaly-space core. The Tucker inverse then gives the standardized anomaly. For point queries, evaluate only the cells in each query's 2 × 2 bilinear stencil: `A_std[i, j] = factor_lat[i] · core · factor_lon[j]ᵀ`. A full-grid inverse costs about 0.7 GFLOP per tensor per time.
+**Step 3: Copula inverse, then Tucker inverse on the cells needed.** `core_copula_[v].inverse_transform` maps the Gaussianized core back to the anomaly-space core. The Tucker inverse then gives the standardized anomaly. For point queries, evaluate only the rows and columns of the queries' 2 × 2 bilinear stencils: `A_std[rows, cols] = factor_lat[rows] · core · factor_lon[cols]ᵀ` (`tucker_inverse(core, fit, rows, cols)`). A full-grid inverse costs about 0.7 GFLOP per tensor per time; a single point's stencil costs about 0.3 MFLOP. Land cells are set to NaN here: the Tucker inverse also reconstructs the imputed land values, which are not data.
 
-**Step 4: Per-cell inverses on those cells.** Standardization, then climatology (evaluated at `t_q` against `t_ref`), then reprojection, which is the identity for wave-grid fields. These use per-cell statistics, so they must be inverted on grid cells, before any interpolation (§4).
+**Step 4: Per-cell inverses on those cells.** Standardization, then climatology (evaluated at `t_q` against `t_ref`), then reprojection, which is the identity for wave-grid fields. These use per-cell statistics, so they must be inverted on grid cells, before any interpolation (§4). They are the fitted Pipeline's own steps from `reproject` onward (`preprocess_[reproject:]`), so the sampler duplicates no inverse logic. Those transformers hold full-grid fields and index positionally, so the sampler runs them on a full-grid array that is NaN outside the evaluated cells. That costs one elementwise pass over the grid per unique time, far less than a Tucker inverse; unique times are processed in small chunks to bound memory.
 
-**Step 5: Bilinear interpolation in linear-safe space.** Interpolate the tensors (`u`, `v`, `logE`, `T`) at `(lat, lon)`, with longitude wraparound padding (§2.6).
+**Step 5: Bilinear interpolation in linear-safe space.** Interpolate the tensors (`u`, `v`, `logE`, `T`) at `(lat, lon)`, with longitude wraparound padding (§2.6). Query longitudes are taken modulo 360°. A stencil touching land gives NaN.
 
-**Step 6: Pointwise nonlinear inverses at the query point.** `H = exp(logE / 2)` (below the 1 cm floor → `0.0`, partition absent; §5.3.1), `period = exp(T)`, and `(u, v) → (speed, direction)` in the native convention, with the class-C magnitude from `logE`.
+**Step 6: Pointwise nonlinear inverses at the query point.** `H = exp(logE / 2)` (below the 1 cm floor → `0.0`, partition absent; §5.3.1), `period = exp(T)`, and `(u, v) → (speed, direction)` in the native convention, with the class-C magnitude from `logE`. These are the Pipeline's steps before `reproject` (`preprocess_[:reproject]`), applied to the interpolated values.
 
 **Why this order.** Interpolating after the nonlinear inverses would interpolate direction angles across the 0°/360° seam and average heights in physical rather than log space. v2's sampler did both.
 
 **Open in v3.** Where the sampled height falls below the floor (partition absent), that partition's direction and period are physically undefined. They are returned as reconstructed, and `variable_taxonomy.md` §3.3.1 has no inverse rule yet.
 
-**Compute cost:** step 1 is `O(r_dmd)` per group and unique time. Steps 2–3 are `O(n_G · r_dmd)` plus the stencil evaluation. Steps 4–6 are `O(N_queries)`. Point queries never pay the full-grid inverse.
+**Compute cost:** step 1 is `O(n_c³)` per group and unique time (one factorization of `C(Δn)`, `n_c ≤ r_dmd`). Steps 2–3 are `O(n_G · r_dmd)` plus the stencil evaluation. Step 4 is one elementwise grid pass per unique time. Steps 5–6 are `O(N_queries)`. Point queries never pay the full-grid Tucker inverse.
 
-**Full-field simulation on the 3h grid** (`simulate_field`) uses the same steps over the full grid at `t_q ∈ {t_start, t_start + Δt, ...}`. It chains the OU step by step instead of jumping from a reference time, so the trajectory is mutually consistent. Its steps 5–6 are grid-wise, with no interpolation.
+**Full-field simulation on the 3h grid** (`simulate_field`) uses the same steps over the full grid at `t_q ∈ {t_start, t_start + Δt, ...}`. It draws `c` from the stationary `P` at `t_start` and chains the one-step transition (`C(1) = Q`) instead of jumping from a reference time, so the trajectory is mutually consistent. Its steps 5–6 are grid-wise, with no interpolation: the whole fitted Pipeline's `inverse_transform`.
 
 ---
 
@@ -1363,7 +1393,8 @@ Directory layout — one dir per model version:
 ├── tucker/<tensor>.npz      # factor_lat, factor_lon, reconstruction_error, n_iter
 ├── core_copula/<tensor>.npz # bin_probs, sorted_core_binned (n_bins, r_lat, r_lon)
 ├── dmd/<group>.npz          # Phi, Lambda, b0, lam_cont, dt, variant, members, member sizes
-├── mode_ou/<group>.npz      # theta, sigma, phi, dt
+├── mode_ou/<group>.npz      # mode, partner, phi, innovation_cov, log_magnitude_mean,
+│                            # phase_offset, dt (§5.6.1)
 ├── group_diagnostics.json   # per group (§5.6.2): members, variance retained, tau-test
 │                            # lags / drift / ratio / bands / verdicts, coupling nats,
 │                            # null bands and significance flags
@@ -1775,7 +1806,7 @@ Ordered by expected pain if missed.
 
 7. **Land mask comes from `sigwh` only** (task 17, §5.1). A partition variable's NaN (`wsh`, `pswh`, their periods and directions) also fires where that partition is absent at a genuine ocean cell. Intersecting every modeled variable's NaN, as v2 did, deletes large areas of real ocean.
 
-8. **Complex-conjugate DMD pair handling — depends on DMD variant.** With `dmd_variant="bop"`, `eig_constraints={"conjugate_pairs"}` handles this automatically. With `"exact"` or `"hankel"`, the sampler must force `η_{k'}(t) = conj(η_k(t))` at every step. Add an assertion: `assert np.abs(Y_sim.imag).max() < 1e-10` after every simulation step in debug builds. **v2 defaults to `"exact"`** (fast enough for repeated rank sweeps during notebook iteration, §8.6) **so this manual handling is live during iteration** — don't skip it just because `"bop"` makes it unnecessary in the final fit. Switch to `"bop"` for the production model, which sidesteps this class of bug entirely at ~100× the fit cost — a cost worth paying once ranks are settled, not on every sweep.
+8. **Complex-conjugate DMD pairs are one stochastic driver.** A real field needs `η_k'(t) = conj(η_k(t))` exactly. Independent per-mode draws make the reconstruction about as imaginary as real (task 07). v3 builds this into the fit: `fit_mode_ou` gives each pair one log-magnitude channel with a deterministic phase, and `mode_amplitudes` sets the partner to the conjugate (§5.6.1, §5.8). The sampler's real part is then exact, not a discard of a large imaginary part. With `dmd_variant="bop"`, `eig_constraints={"conjugate_pairs"}` also enforces exact pairs at fit time; with `"exact"` or `"hankel"`, pairs are matched by eigenvalue within `1e-6`, and a mode whose partner the truncation dropped is treated as real.
 
 9. **Wraparound at year boundaries in the climatology.** Compute `t_since_epoch_days` continuously from `t_ref` (the training-window midpoint); don't reset at Jan 1. The cosines handle periodicity.
 

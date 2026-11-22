@@ -371,6 +371,30 @@ def simulate_lim(fit: LIMFit, z0: np.ndarray, n_steps: int, rng: np.random.Gener
     return _simulate_linear(fit.G, fit.innovation_cov, z0, n_steps, rng)
 
 
+def covariance_factor(cov: np.ndarray) -> np.ndarray:
+    """A square root ``F`` with ``F @ F.T = cov``, for drawing correlated Gaussian noise.
+
+    (see docs/correlated_variables.md §4.4)
+
+    Symmetric eigendecomposition rather than Cholesky: estimated innovation
+    covariances are often singular or slightly indefinite from rounding,
+    which Cholesky rejects. Negative eigenvalues are clipped to zero, the
+    nearest positive semidefinite matrix in that eigenbasis. Accepts a stack
+    ``(..., n, n)`` and factors each matrix.
+
+    Parameters
+    ----------
+    cov : (..., n, n) float64, symmetric
+
+    Returns
+    -------
+    (..., n, n) float64
+    """
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    factor: np.ndarray = eigvecs * np.sqrt(np.clip(eigvals, 0.0, None))[..., None, :]
+    return factor
+
+
 def _simulate_linear(
     G: np.ndarray,
     innovation_cov: np.ndarray,
@@ -379,8 +403,7 @@ def _simulate_linear(
     rng: np.random.Generator,
 ) -> np.ndarray:
     """``z[t+1] = G z[t] + eps[t]``, ``eps ~ N(0, innovation_cov)``; rows include `z0`."""
-    eigvals, eigvecs = np.linalg.eigh(innovation_cov)
-    noise_factor = eigvecs * np.sqrt(np.clip(eigvals, 0.0, None))  # factor @ factor.T = cov
+    noise_factor = covariance_factor(innovation_cov)
     n = z0.shape[0]
     # All innovations in one draw: the bootstrap bands run hundreds of these
     # simulations, and a per-step rng call dominated the loop's cost.

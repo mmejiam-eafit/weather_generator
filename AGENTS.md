@@ -59,16 +59,21 @@ review.
 
 ### Two-layer training architecture
 
-- **Preprocessing** (`train/directional.py` — `ComingFromToUV` and
-  `GoingToToUV` both live here, §3.7 — plus `train/reproject.py`,
-  `train/climatology.py`, `train/standardize.py`, `train/copula.py`) — six
-  scikit-learn transformer classes chained via
-  `sklearn.pipeline.Pipeline`. Each has a real `fit`, `transform`, and
-  `inverse_transform`.
-- **Decomposition + stochastic model** (`train/tucker.py`, `train/dmd.py`,
-  `train/local_residual.py`) — pure functions taking arrays + hyperparameters,
-  returning frozen dataclasses (`TuckerFit`, `DMDFit`, `ModeOUFit`,
-  `LocalResidualFit`). Not transformers. Alongside it, the **group dynamics
+- **Preprocessing** (`train/masking.py` — `PartitionSentinelFiller`,
+  `LogTransform` — plus `train/directional.py` — `ComingFromToUV` and
+  `GoingToToUV`, §3.7 — `train/reproject.py`, `train/climatology.py`,
+  `train/standardize.py`) — seven scikit-learn transformer classes chained
+  via `sklearn.pipeline.Pipeline` (`weather.model.build_preprocess`, §5.3),
+  ending at the standardized anomaly, one `(T, lat, lon)` tensor per field.
+  Each has a real `fit`, `transform`, and `inverse_transform`.
+- **Decomposition + stochastic model** (`train/tucker.py`, `train/dmd.py`) —
+  pure functions taking arrays + hyperparameters, returning frozen
+  dataclasses (`TuckerFit`, `DMDFit`, `ModeOUFit`). Not transformers.
+  Per tensor: masked Tucker, then a `train/copula.py` `GaussianCopula` fit on
+  the Tucker core (placement ii, §5.5.1) — a transformer, but applied per
+  core, not as a Pipeline stage. Per variable group: DMD and the mode OU on
+  the joint state. `train/local_residual.py` (`LocalResidualFit`) is
+  deferred in v3 (§5.7) and not wired in. Alongside it, the **group dynamics
   diagnostics** stage (`train/linear_inverse.py`, §5.6.2): `diagnose_group`
   runs once per variable group on the Gaussianized cores DMD consumes, and
   returns a `GroupDiagnostics`. It holds a tau test of the linear-Markov
@@ -82,14 +87,11 @@ glues the two layers together. Sampling operations are **free functions** in
 
 See handoff §3.12, §3.14, and §4 for the full rationale.
 
-**Gaussianization placement — the code lags the decision.** `WeatherModel`
-still runs placement (i): `GaussianCopula` is the last stage of the
-preprocessing Pipeline, before Tucker. Placement (ii) — Tucker on the
-(log-energy) anomalies, then Gaussianize the Tucker core, before DMD — is
-**DECIDED** (`docs/open_questions.md` §4.1; task 07 fixed Tucker rank 40%
-and `r_dmd = 100` under it) and currently lives in
-`notebooks/07_placement2_*.py`. Don't treat the Pipeline order above as
-settled design; promoting placement (ii) into `src/` is pending work.
+**Gaussianization placement (ii) is implemented.** Tucker runs on the
+(log-energy) standardized anomalies and the copula Gaussianizes each Tucker
+core before DMD (**DECIDED**, `docs/open_questions.md` §4.1; task 07 fixed
+Tucker rank 40% and `r_dmd = 100` under it). Placement (i), the copula as
+the last Pipeline stage, is gone from `src/`.
 
 ---
 
@@ -102,6 +104,7 @@ before changing the module. Section numbers without a file name refer to
 | Module | Spec | Status |
 |---|---|---|
 | `src/core/config.py` | §2.2, §2.7, §2.8 | ✓ Exists |
+| `src/core/logger.py` | AGENTS.md *Logging* | ✓ Exists |
 | `src/core/io.py` | §2.1, §2.3, §5.1 | ✓ Exists |
 | `src/core/archive_eras.py` | §2.2.1, §5.1 | ✓ Exists |
 | `src/train/ingest.py` | §2.5, §5.1 | ✓ Exists |
@@ -111,11 +114,11 @@ before changing the module. Section numbers without a file name refer to
 | `src/train/standardize.py` | §5.4 | ✓ Exists |
 | `src/train/copula.py` | §5.4 | ✓ Exists |
 | `src/train/tucker.py` | §5.5 | ✓ Exists |
-| `src/train/masked_tucker.py` | §5.5; `tasks/07-tucker-dmd-rank-selection.md` §5 | ✓ Exists — used by task 07 scripts only so far |
-| `src/train/masking.py` | `docs/variable_taxonomy.md` §3.3.1; task 17 | ✓ Exists — helper only, **not wired into production** |
+| `src/train/masked_tucker.py` | §5.5; `tasks/07-tucker-dmd-rank-selection.md` §5 | ✓ Exists — the ALS behind `train/tucker.py` |
+| `src/train/masking.py` | §5.1, §5.3.1; `docs/variable_taxonomy.md` §3.3.1; task 17 | ✓ Exists |
 | `src/train/dmd.py` | §5.6, §5.6.1 | ✓ Exists |
-| `src/train/linear_inverse.py` | §5.6.2; `docs/correlated_variables.md` §4.4 | ✓ Exists — not yet wired into `WeatherModel.fit` (pending `model.py` rewrite) |
-| `src/train/local_residual.py` | §3.10, §5.7 | ✓ Exists |
+| `src/train/linear_inverse.py` | §5.6.2; `docs/correlated_variables.md` §4.4 | ✓ Exists |
+| `src/train/local_residual.py` | §3.10, §5.7 | ✓ Exists — deferred in v3, not wired into `WeatherModel` |
 | `src/weather/model.py` | §7, §8.4, §8.5 | ✓ Exists |
 | `src/weather/simulate.py` | §5.8, §8.4 | ✓ Exists |
 | `src/weather/validate.py` | §6 | ✓ Exists |
@@ -332,22 +335,19 @@ that restate the code*: explain reasoning, never mechanics.
   `structlog` logger, `from core.logger import logger`, with structured
   key-value pairs instead of an interpolated string:
   `logger.info("wad consistency check passed", time=t.isoformat(), max_dev_deg=max_dev)`.
-- `src/core/logger.py` does not exist yet. Create it together with the
-  migration below — not before (no scaffolding).
-- Design constraint for that module: `weather` is a library consumed
-  programmatically, so `core/logger.py` routes through
-  `structlog.stdlib.LoggerFactory` and must **not** attach handlers to the
-  root logger at import time. An application may do that; a library that
-  does hijacks its consumer's logging. The training notebook or script
-  configures output.
+- Design constraint for `core/logger.py`: `weather` is a library consumed
+  programmatically, so it routes through `structlog.stdlib.LoggerFactory`
+  and must **not** attach handlers to the root logger at import time, nor
+  call `structlog.configure` (both change process-wide state). An
+  application may do that; a library that does hijacks its consumer's
+  logging. The training notebook or script configures output, e.g.
+  `logging.basicConfig(level=logging.INFO)`. Tests read records with
+  pytest's `caplog` at `core.logger.LOGGER_NAME`.
 - `warnings.warn` stays the tool for caller-actionable conditions (see
   *Error Handling*).
-- **Known debt** — three `print(..., file=sys.stderr)` calls, all on the
-  training path, to migrate when `core/logger.py` is created:
-  `train/ingest.py` (the `wad` consistency-check result and the
-  missing-snapshot notice, both inside `load_training_window`) and
-  `weather/model.py::_log_trend_significance` (runs only while fitting).
-  The query path (`weather/simulate.py`) has none and must stay that way.
+- Logging is on the training path only (ingest checks, period sentinels,
+  trend significance, Tucker errors, group diagnostics). The query path
+  (`weather/simulate.py`) logs nothing and must stay that way.
 
 ---
 
@@ -542,7 +542,7 @@ weather_generator/
 ├── context.md                           # Orientation snapshot — not a source of truth
 ├── *handoff*.md                         # Historical handoffs — not sources of truth
 ├── docs/
-│   ├── model_design.md                  # Design handoff (v2): design, algorithm, API
+│   ├── model_design.md                  # Design handoff (v3): design, algorithm, API
 │   ├── open_questions.md                # Open / DECIDED design questions (DECIDED wins)
 │   ├── <topic>.md                       # Per-stage deep dives: variable_taxonomy,
 │   │                                    # harmonic_climatology, tucker_decomposition,
@@ -567,7 +567,8 @@ weather_generator/
 │   │   │                                # VARIABLE_GRID, Settings
 │   │   ├── io.py                        # snapshot_path, load_snapshot, load_raw,
 │   │   │                                # decode_compass_code, require_utc
-│   │   └── archive_eras.py              # ARCHIVE_ERAS, era_for_timestamp
+│   │   ├── archive_eras.py              # ARCHIVE_ERAS, era_for_timestamp
+│   │   └── logger.py                    # logger: the one structlog logger
 │   ├── train/                           # Training pipeline
 │   │   ├── __init__.py
 │   │   ├── ingest.py                    # load_training_window (xarray)
@@ -575,17 +576,20 @@ weather_generator/
 │   │   ├── reproject.py                 # pad_lon, lonlat_interpolator, Reprojector
 │   │   ├── climatology.py               # ClimatologyRemover transformer
 │   │   ├── standardize.py               # PerCellStandardizer transformer
-│   │   ├── copula.py                    # GaussianCopula transformer
-│   │   ├── tucker.py                    # tucker_fit, tucker_transform,
-│   │   │                                # tucker_inverse (pure functions)
+│   │   ├── copula.py                    # GaussianCopula (fit per Tucker core)
+│   │   ├── tucker.py                    # fill_land, tucker_fit, tucker_transform,
+│   │   │                                # tucker_inverse (per tensor, pure functions)
 │   │   ├── masked_tucker.py             # partial_tucker_lowmem (vendored tensorly fix)
-│   │   ├── masking.py                   # Land mask + partition NaN-sentinel policy
-│   │   ├── dmd.py                       # dmd_fit, fit_mode_ou (pure functions)
+│   │   ├── masking.py                   # Land mask, partition sentinel policy,
+│   │   │                                # PartitionSentinelFiller, LogTransform
+│   │   ├── dmd.py                       # group_state, dmd_fit, fit_mode_ou,
+│   │   │                                # ou_transition, mode_amplitudes
 │   │   ├── linear_inverse.py            # group_pcs, fit_lim, tau_test, diagnose_group
 │   │   └── local_residual.py            # coherent_reconstruction, fit_local_residual
 │   └── weather/                         # Public API
 │       ├── __init__.py                  # Re-exports (see handoff §8.4)
-│       ├── model.py                     # WeatherModel(BaseEstimator, TransformerMixin)
+│       ├── model.py                     # WeatherModel(BaseEstimator, TransformerMixin),
+│       │                                # build_preprocess, persistence (§7)
 │       ├── simulate.py                  # sample, sample_batch, simulate_field
 │       └── validate.py                  # full_report + per-check helpers
 ├── tests/
@@ -722,8 +726,9 @@ violation may pass every unit test and still produce wrong samples.
   The preprocessing transformers infer the time axis positionally, so a
   wrong order computes per-cell statistics over the wrong axis *without
   raising*. Validate with `core.config.check_canonical` at boundaries.
-  Raveled arrays keep their documented layouts (the stacked Tucker/DMD
-  input is `(T, N_ocean, V)`).
+  Raveled arrays keep their documented layouts: Tucker takes one
+  `(T, H, W)` tensor at a time, and a group's DMD state is `(T, n_G)`
+  (§5.5, §5.6).
 - **Row 0 = south** for the wave, wind and ocean grids. See handoff §2.7 for
   the empirical derivation. Any code that geo-references a grid must apply
   the formulas from §2.2; never assume "row 0 = north" defaults from other

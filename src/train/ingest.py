@@ -1,6 +1,5 @@
 """Load a training window from the raw archive (see docs/model_design.md §2.5, §5.1)."""
 
-import sys
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +10,7 @@ import xarray as xr
 from core.archive_eras import ArchiveEra, era_for_timestamp
 from core.config import VARIABLE_GRID, grid_coordinates
 from core.io import decode_compass_code, enumerate_snapshots, load_raw, load_snapshot, snapshot_path
+from core.logger import logger
 
 _ABORT_GAP_SNAPSHOTS = 8  # 24 h at 3 h cadence (see §5.1)
 _WARN_GAP_SNAPSHOTS = 2  # 6 h at 3 h cadence
@@ -79,11 +79,12 @@ def _check_wad_wad_come_from_consistency(data_dir: Path, t: datetime) -> None:
             f"({frac_off:.4%}) beyond {_WAD_ROUNDING_TOLERANCE_DEG}° tolerance "
             "(land excluded via `was`'s NaN mask). Archive convention may have changed."
         )
-    print(
-        f"wad/wad_come_from consistency check passed at {t.isoformat()}: "
-        f"max deviation {max_dev:.2f}°, {n_off}/{ocean_diff.size} cells beyond tolerance "
-        "(ocean cells only)",
-        file=sys.stderr,
+    logger.info(
+        "wad consistency check passed",
+        time=t.isoformat(),
+        max_dev_deg=max_dev,
+        n_cells_beyond_tolerance=n_off,
+        n_ocean_cells=int(ocean_diff.size),
     )
 
 
@@ -346,7 +347,7 @@ def load_training_window(
             try:
                 snapshot = load_snapshot(data_dir, t, variable)
             except FileNotFoundError:
-                print(f"missing snapshot: {variable} at {t.isoformat()}", file=sys.stderr)
+                logger.warning("missing snapshot", variable=variable, time=t.isoformat())
                 contiguous_gap += 1
                 if contiguous_gap == _WARN_GAP_SNAPSHOTS:
                     warnings.warn(
