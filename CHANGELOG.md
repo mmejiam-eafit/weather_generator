@@ -7,6 +7,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-21 — AGENTS.md: conventions ported from the radiologists
+  preprocessing pipeline, plus a drift refresh** — `AGENTS.md`.
+  - **Ported, adapted to 3.14 and this domain.** Python 3.14 feature table
+    (PEP 758 unparenthesized `except` is Black-enforced here; PEP 765
+    `finally` suppression banned; no sub-interpreters, free-threaded
+    assumptions, t-strings or `compression.zstd`); `collections.abc` and
+    PEP 695 alias rules; single-responsibility and explain-non-trivial
+    design rules; an Error Handling section; testing philosophy (test
+    intent, not implementation; fix the code, not the test); a Commits
+    section (`:shortcode: type(scope): subject`, repo-local `exp` type for
+    experiments, whole-file staging, no agent attribution, CHANGELOG entry
+    in the same commit); a Summary Checklist.
+  - **Logging rule, no migration yet.** No new `print` in `src/`; output
+    goes through a future `structlog` logger in `core/logger.py`, created
+    together with migrating the three existing training-path `print`
+    calls (listed as known debt).
+  - **Drift fixed.** Task Mapping marks every `src/` module as existing and
+    adds `archive_eras.py`, `masked_tucker.py`, `masking.py`;
+    `test_pipeline.ipynb` is recorded as parked in `notebooks/tbd/`;
+    dependency lists match `pyproject.toml`; module layout covers `docs/`
+    topic series, `tasks/`, numbered task notebooks and `azureml/`; a
+    document-precedence section; a caveat that `src/` still implements
+    Gaussianization placement (i) while (ii) is DECIDED; canonical
+    `(time, lat, lon)` dim order and ocean-grid orientation added to the
+    coordinate rules; `Settings` example and tool commands corrected.
+  - **Not ported.** 120-char lines, Google docstrings, `uv`/`make`, `src.`
+    imports, the API/database/clinical layers.
+
 - **2026-09-29 — Closed task 07: Tucker rank decided as 40% (248, 576),
   production copula + DMD (`r_dmd=100`) fit on the full 40% core, Azure
   VM infrastructure torn down** — `notebooks/07_placement2_tucker_on_anomalies.py`
