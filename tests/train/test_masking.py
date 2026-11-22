@@ -4,9 +4,14 @@ tasks/17-partition-nan-sentinel-policy.md)."""
 from typing import cast
 
 import numpy as np
+import pytest
+import xarray as xr
 from numpy.testing import assert_allclose
+from sklearn.base import clone
 
 from train.masking import (
+    LogTransform,
+    PartitionSentinelFiller,
     apply_partition_sentinel_policy,
     height_log_energy,
     land_mask_from_sigwh,
@@ -177,3 +182,146 @@ def test_period_sentinel_from_archive_ignores_non_finite() -> None:
 
     assert np.isfinite(estimate.conditional_median)
     assert np.isfinite(estimate.extrapolated_intercept)
+
+
+# --- PartitionSentinelFiller / LogTransform (model_design.md §5.3.1) ----------
+
+LAND_CELL = (0, 0)
+ABSENT_CELL = (1, 2)  # ocean cell where the wind-sea partition is absent at times
+TRUE_PERIOD_LIMIT_S = 3.0  # wsp -> this as wsh -> 0 in the fixture
+
+
+@pytest.fixture
+def partition_dataset() -> xr.Dataset:
+    """Canonical (time, wave_lat, wave_lon) window with land, absent partitions and
+    a known zero-height period limit."""
+    rng = np.random.default_rng(0)
+    shape = (400, 4, 5)
+    sigwh = rng.uniform(0.5, 4.0, shape)
+    wsh = rng.uniform(0.05, 3.0, shape)
+    wsp = TRUE_PERIOD_LIMIT_S + 1.5 * wsh + rng.normal(0.0, 0.01, shape)
+    wsd = rng.uniform(0.0, 360.0, shape)
+    for field in (sigwh, wsh, wsp, wsd):
+        field[:, LAND_CELL[0], LAND_CELL[1]] = np.nan
+    absent = np.zeros(shape, dtype=bool)
+    absent[::3, ABSENT_CELL[0], ABSENT_CELL[1]] = True
+    for field in (wsh, wsp, wsd):
+        field[absent] = np.nan
+    dims = ("time", "wave_lat", "wave_lon")
+    return xr.Dataset(
+        {"sigwh": (dims, sigwh), "wsh": (dims, wsh), "wsp": (dims, wsp), "wsd": (dims, wsd)}
+    )
+
+
+def _filler() -> PartitionSentinelFiller:
+    return PartitionSentinelFiller(partitions={"wsh": ("wsp", "wsd")})
+
+
+def test_partition_sentinel_filler_fills_ocean_nan_and_keeps_land_nan(
+    partition_dataset: xr.Dataset,
+) -> None:
+    """Absent-partition NaN at ocean cells become valid values; land stays NaN."""
+    filler = _filler().fit(partition_dataset)
+    out = filler.transform(partition_dataset)
+    i, j = ABSENT_CELL
+    absent_t = np.isnan(partition_dataset["wsh"].values[:, i, j])
+
+    assert absent_t.any()
+    assert_allclose(out["wsh"].values[absent_t, i, j], 0.0)
+    assert_allclose(out["wsp"].values[absent_t, i, j], filler.period_sentinels_["wsp"])
+    assert_allclose(out["wsd"].values[absent_t, i, j], 0.0)
+    for name in ("sigwh", "wsh", "wsp", "wsd"):
+        assert np.isnan(out[name].values[:, LAND_CELL[0], LAND_CELL[1]]).all()
+        ocean = filler.ocean_mask_
+        assert not np.isnan(out[name].values[:, ocean]).any()
+    present = ~absent_t
+    assert_allclose(
+        out["wsh"].values[present, i, j], partition_dataset["wsh"].values[present, i, j]
+    )
+
+
+def test_partition_sentinel_filler_period_sentinel_is_extrapolated_intercept(
+    partition_dataset: xr.Dataset,
+) -> None:
+    """The period sentinel is task 17's choice, the zero-height intercept, not the median."""
+    filler = _filler().fit(partition_dataset)
+    estimate = filler.period_sentinel_estimates_["wsp"]
+
+    assert filler.period_sentinels_["wsp"] == estimate.extrapolated_intercept
+    assert filler.period_sentinels_["wsp"] == pytest.approx(TRUE_PERIOD_LIMIT_S, abs=0.05)
+
+
+def test_partition_sentinel_filler_land_mask_comes_from_sigwh(
+    partition_dataset: xr.Dataset,
+) -> None:
+    """A cell where only the partition is NaN is ocean; the mask is sigwh's own."""
+    filler = _filler().fit(partition_dataset)
+
+    assert_allclose(filler.ocean_mask_, land_mask_from_sigwh(partition_dataset["sigwh"].values))
+    assert filler.ocean_mask_[ABSENT_CELL]
+    assert not filler.ocean_mask_[LAND_CELL]
+
+
+def test_partition_sentinel_filler_requires_sigwh(partition_dataset: xr.Dataset) -> None:
+    with pytest.raises(ValueError, match="sigwh"):
+        _filler().fit(partition_dataset.drop_vars("sigwh"))
+
+
+def test_partition_sentinel_filler_inverse_decodes_floor_to_zero(
+    partition_dataset: xr.Dataset,
+) -> None:
+    """Sentinel zeros survive the log round trip as the floor and decode back to 0.0."""
+    filler = _filler().fit(partition_dataset)
+    log = LogTransform(heights={"wsh": "logE_wsh"}, periods={"wsp": "T_wsp"}).fit(
+        filler.transform(partition_dataset)
+    )
+    roundtrip = filler.inverse_transform(
+        log.inverse_transform(log.transform(filler.transform(partition_dataset)))
+    )
+    i, j = ABSENT_CELL
+    absent_t = np.isnan(partition_dataset["wsh"].values[:, i, j])
+
+    assert np.array_equal(roundtrip["wsh"].values[absent_t, i, j], np.zeros(absent_t.sum()))
+    assert_allclose(
+        roundtrip["wsh"].values[~absent_t, i, j],
+        partition_dataset["wsh"].values[~absent_t, i, j],
+        rtol=1e-12,
+    )
+
+
+def test_log_transform_values_and_names(partition_dataset: xr.Dataset) -> None:
+    """logE = log(max(H, floor)^2), T = log(period); sources are replaced by tensor names."""
+    log = LogTransform(heights={"sigwh": "logE_sigwh"}, periods={"wsp": "T_wsp"})
+    out = log.fit_transform(partition_dataset)
+
+    assert "sigwh" not in out.data_vars and "wsp" not in out.data_vars
+    assert_allclose(
+        out["logE_sigwh"].values, np.log(partition_dataset["sigwh"].values ** 2), equal_nan=True
+    )
+    assert_allclose(out["T_wsp"].values, np.log(partition_dataset["wsp"].values), equal_nan=True)
+    assert "wsd" in out.data_vars
+
+
+def test_log_transform_inverse_transform(partition_dataset: xr.Dataset) -> None:
+    """transform -> inverse_transform reproduces heights above the floor and periods; NaN stays."""
+    log = LogTransform(heights={"sigwh": "logE_sigwh"}, periods={"wsp": "T_wsp"})
+    recovered = log.inverse_transform(log.fit_transform(partition_dataset))
+
+    for name in ("sigwh", "wsp"):
+        assert_allclose(
+            recovered[name].values, partition_dataset[name].values, rtol=1e-12, equal_nan=True
+        )
+
+
+def test_log_transform_rejects_missing_variable(partition_dataset: xr.Dataset) -> None:
+    with pytest.raises(ValueError, match="pswh"):
+        LogTransform(heights={"pswh": "logE_pswh"}, periods={}).fit(partition_dataset)
+
+
+def test_partition_sentinel_filler_and_log_transform_clone() -> None:
+    """__init__ stores parameters verbatim, so sklearn.clone round-trips them."""
+    filler = PartitionSentinelFiller(partitions={"wsh": ("wsp", "wsd")}, floor_m=0.02)
+    log = LogTransform(heights={"wsh": "logE_wsh"}, periods={"wsp": "T_wsp"}, floor_m=0.02)
+
+    assert clone(filler).get_params() == filler.get_params()
+    assert clone(log).get_params() == log.get_params()

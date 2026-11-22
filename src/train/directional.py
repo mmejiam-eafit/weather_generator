@@ -13,7 +13,9 @@ Both act on disjoint variable sets, run before `train.reproject.Reprojector`
 in the preprocessing Pipeline (so reprojection interpolates linear-safe
 ``(u, v)`` fields instead of angles), and can be composed in either order.
 Neither hardcodes a canonical pair list -- the caller states pairs
-explicitly at construction. The canonical tier assignment lives in
+explicitly at construction. `keep_speed` names magnitudes that must also
+survive as their own variable: the class-C partition heights, which become
+`logE` tensors (see docs/model_design.md §5.3). The canonical tier assignment lives in
 `weather.model`'s pipeline construction (§5.3).
 """
 
@@ -23,6 +25,17 @@ import numpy as np
 import xarray as xr
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
+
+
+def _validated_keep_speed(
+    pairs: tuple[tuple[str, str, str, str], ...], keep_speed: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Check every kept name is the speed variable of an owned pair (see §5.3)."""
+    speeds = {speed_var for speed_var, _, _, _ in pairs}
+    unknown = sorted(set(keep_speed) - speeds)
+    if unknown:
+        raise ValueError(f"keep_speed {unknown} are not speed variables of {sorted(speeds)}")
+    return tuple(keep_speed)
 
 
 class ComingFromToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
@@ -37,13 +50,16 @@ class ComingFromToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
     discontinuity).
     """
 
-    def __init__(self, pairs: list[tuple[str, str, str, str]]) -> None:
+    def __init__(
+        self, pairs: list[tuple[str, str, str, str]], keep_speed: tuple[str, ...] = ()
+    ) -> None:
         # Each pair: (speed_var, direction_var, u_out_name, v_out_name).
         # Required, no default (§3.7: "no silent defaulting" -- an agent
         # adding a new directional variable must explicitly choose a
-        # transformer). sklearn convention: store verbatim, validate lazily
-        # in fit().
+        # transformer). keep_speed: speed variables to keep alongside (u, v)
+        # (§5.3). sklearn convention: store verbatim, validate lazily in fit().
         self.pairs = pairs
+        self.keep_speed = keep_speed
 
     def fit(self, X: xr.Dataset, y: None = None) -> Self:
         """Record the (speed, direction, u, v) pairs this transformer owns.
@@ -58,8 +74,15 @@ class ComingFromToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         Returns
         -------
         self
+
+        Raises
+        ------
+        ValueError
+            If `keep_speed` names a variable that is not the speed of an
+            owned pair.
         """
         self.pairs_ = tuple(self.pairs)
+        self.keep_speed_ = _validated_keep_speed(self.pairs_, self.keep_speed)
         return self
 
     def transform(self, X: xr.Dataset) -> xr.Dataset:
@@ -86,7 +109,10 @@ class ComingFromToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             theta_to_rad = np.deg2rad(theta_to)
             result[u_out_name] = speed * np.sin(theta_to_rad)
             result[v_out_name] = speed * np.cos(theta_to_rad)
-            result = result.drop_vars([speed_var, direction_var])
+            dropped = (
+                [direction_var] if speed_var in self.keep_speed_ else [speed_var, direction_var]
+            )
+            result = result.drop_vars(dropped)
         return result
 
     def inverse_transform(self, X: xr.Dataset) -> xr.Dataset:
@@ -104,7 +130,10 @@ class ComingFromToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             `X` with each ``(u_out_name, v_out_name)`` pair replaced by
             ``(speed_var, direction_var)``, with `direction_var` restored
             in its native "coming from" convention (§2.4). Non-owned
-            variables pass through unchanged.
+            variables pass through unchanged. For a kept speed, the existing
+            variable is the magnitude and only the direction comes from
+            ``(u, v)``, avoiding `hypot`'s reconstruction bias
+            (docs/open_questions.md §2.3).
         """
         check_is_fitted(self, "pairs_")
         result = X.copy()
@@ -113,7 +142,8 @@ class ComingFromToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             v = result[v_out_name]
             # arg order (sin, cos) -- i.e. (u, v) -- not (y, x) (§2.4).
             theta_to = np.degrees(np.arctan2(u, v)) % 360.0
-            result[speed_var] = np.hypot(u, v)
+            if speed_var not in self.keep_speed_:
+                result[speed_var] = np.hypot(u, v)
             result[direction_var] = (theta_to + 180.0) % 360.0
             result = result.drop_vars([u_out_name, v_out_name])
         return result
@@ -131,11 +161,15 @@ class GoingToToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
     discontinuity).
     """
 
-    def __init__(self, pairs: list[tuple[str, str, str, str]]) -> None:
+    def __init__(
+        self, pairs: list[tuple[str, str, str, str]], keep_speed: tuple[str, ...] = ()
+    ) -> None:
         # Each pair: (speed_var, direction_var, u_out_name, v_out_name).
-        # Required, no default (§3.7: "no silent defaulting"). sklearn
+        # Required, no default (§3.7: "no silent defaulting"). keep_speed:
+        # speed variables to keep alongside (u, v) (§5.3). sklearn
         # convention: store verbatim, validate lazily in fit().
         self.pairs = pairs
+        self.keep_speed = keep_speed
 
     def fit(self, X: xr.Dataset, y: None = None) -> Self:
         """Record the (speed, direction, u, v) pairs this transformer owns.
@@ -150,8 +184,15 @@ class GoingToToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         Returns
         -------
         self
+
+        Raises
+        ------
+        ValueError
+            If `keep_speed` names a variable that is not the speed of an
+            owned pair.
         """
         self.pairs_ = tuple(self.pairs)
+        self.keep_speed_ = _validated_keep_speed(self.pairs_, self.keep_speed)
         return self
 
     def transform(self, X: xr.Dataset) -> xr.Dataset:
@@ -177,7 +218,10 @@ class GoingToToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             theta_to_rad = np.deg2rad(result[direction_var])
             result[u_out_name] = speed * np.sin(theta_to_rad)
             result[v_out_name] = speed * np.cos(theta_to_rad)
-            result = result.drop_vars([speed_var, direction_var])
+            dropped = (
+                [direction_var] if speed_var in self.keep_speed_ else [speed_var, direction_var]
+            )
+            result = result.drop_vars(dropped)
         return result
 
     def inverse_transform(self, X: xr.Dataset) -> xr.Dataset:
@@ -195,7 +239,10 @@ class GoingToToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             `X` with each ``(u_out_name, v_out_name)`` pair replaced by
             ``(speed_var, direction_var)``, with `direction_var` restored
             in its native "going to" convention (§2.4) -- no `+180` shift.
-            Non-owned variables pass through unchanged.
+            Non-owned variables pass through unchanged. For a kept speed, the existing
+            variable is the magnitude and only the direction comes from
+            ``(u, v)``, avoiding `hypot`'s reconstruction bias
+            (docs/open_questions.md §2.3).
         """
         check_is_fitted(self, "pairs_")
         result = X.copy()
@@ -203,7 +250,8 @@ class GoingToToUV(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             u = result[u_out_name]
             v = result[v_out_name]
             # arg order (sin, cos) -- i.e. (u, v) -- not (y, x) (§2.4).
-            result[speed_var] = np.hypot(u, v)
+            if speed_var not in self.keep_speed_:
+                result[speed_var] = np.hypot(u, v)
             result[direction_var] = np.degrees(np.arctan2(u, v)) % 360.0
             result = result.drop_vars([u_out_name, v_out_name])
         return result

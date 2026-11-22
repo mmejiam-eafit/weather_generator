@@ -1,23 +1,32 @@
-"""Land-mask derivation and per-cell NaN sentinel policy for wave-grid
-variables (see docs/variable_taxonomy.md §3.3.1, tasks/17-partition-nan-
-sentinel-policy.md).
+"""Land-mask derivation, partition NaN sentinel policy and log transforms for
+wave-grid variables (see docs/model_design.md §5.1, §5.3.1;
+docs/variable_taxonomy.md §3.3.1, §3.4; tasks/17-partition-nan-sentinel-policy.md).
 
-Notebook/src-helper scope only per task 17 -- NOT wired into
-src/weather/model.py's `_mask_and_stack` or src/train/ingest.py's existing
-mask logic. Promotion to production is deliberately deferred pending this
-policy's empirical validation (task 17 §4).
+Array-level helpers (`land_mask_from_sigwh`, `apply_partition_sentinel_policy`,
+`height_log_energy`, `period_sentinel_from_archive`, diagnostics) plus the two
+preprocessing transformers built on them, `PartitionSentinelFiller` and
+`LogTransform`. Task 17 validated the policy (`docs/open_questions.md` §5.6),
+which is what promoted it from notebook scope into the v3 pipeline.
 
 All field arrays here are canonical `(time, lat, lon)` -- time is axis 0,
 matching `core.config.CANONICAL_DIM_TEMPLATE` and everything these helpers
 compose with (`train.ingest.load_training_window`'s output, the
-`ClimatologyRemover`/`PerCellStandardizer`/`GaussianCopula` chain, and
-`train.tucker`, which decomposes `modes=[1, 2]` and leaves time full-rank).
-Derived *spatial* masks stay `(lat, lon)`.
+`ClimatologyRemover`/`PerCellStandardizer` chain, and `train.tucker`, which
+decomposes `modes=[1, 2]` and leaves time full-rank). Derived *spatial* masks
+stay `(lat, lon)`.
 """
 
 from dataclasses import dataclass
+from typing import Final, Self
 
 import numpy as np
+import xarray as xr
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
+
+from core.config import check_canonical
+
+LAND_MASK_VARIABLE: Final[str] = "sigwh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,3 +317,236 @@ def period_sentinel_from_archive(
         extrapolated_intercept=extrapolated_intercept,
         agreement=abs(conditional_median - extrapolated_intercept),
     )
+
+
+def _fill_ocean_nan(values: np.ndarray, ocean_mask: np.ndarray, fill: float) -> np.ndarray:
+    """Replace NaN at ocean cells with `fill`; land NaN stays NaN."""
+    result: np.ndarray = np.where(np.isnan(values) & ocean_mask[None, :, :], fill, values)
+    return result
+
+
+class PartitionSentinelFiller(BaseEstimator, TransformerMixin):  # type: ignore[misc]
+    """Fill partition-absence NaN at ocean cells; leave land NaN (see model_design.md §5.3.1).
+
+    The wind-sea and primary-swell partitions are NaN at genuine ocean cells
+    whenever that partition is absent (variable_taxonomy.md §3.3.1). This
+    stage turns those into valid observations -- height ``0.0``, period the
+    partition's zero-height limit, direction a ``0°`` placeholder -- and
+    leaves land NaN untouched for the later NaN-aware stages and the
+    Tucker mask. It runs first in the Pipeline, so nothing downstream ever
+    sees partition-absence NaN.
+
+    The land mask comes from `sigwh` alone, never from a partition's own
+    NaN (that conflation is the bug task 17 fixed), so `sigwh` must be in
+    the fitted Dataset. The direction placeholder is harmless: with zero
+    height, ``(u, v) = (0, 0)`` whatever the angle (§5.3).
+    """
+
+    def __init__(self, partitions: dict[str, tuple[str, str]], floor_m: float = 0.01) -> None:
+        # partitions: height variable -> (period variable, direction variable).
+        # floor_m: heights at or below this decode back to 0.0 on inversion
+        # (must match LogTransform's floor). sklearn convention: verbatim.
+        self.partitions = partitions
+        self.floor_m = floor_m
+
+    def fit(self, X: xr.Dataset, y: None = None) -> Self:
+        """Derive the land mask from `sigwh` and each partition's period sentinel.
+
+        The period sentinel is `period_sentinel_from_archive`'s
+        ``extrapolated_intercept`` at its default ``small_height_quantile``:
+        task 17 chose it because it stabilizes as the faint-partition bin
+        widens while the conditional median drifts toward the archive median
+        (tasks/17-partition-nan-sentinel-policy.md, ``T_SENTINEL_S``). Both
+        estimates and their agreement are kept for inspection.
+
+        Parameters
+        ----------
+        X : xr.Dataset
+            Raw training window containing `sigwh` and every partition's
+            height, period and direction.
+        y : None
+            Ignored (sklearn convention).
+
+        Returns
+        -------
+        self
+
+        Raises
+        ------
+        ValueError
+            If `sigwh` or a partition variable is missing from `X`.
+        """
+        check_canonical(X, context="PartitionSentinelFiller.fit")
+        required = {LAND_MASK_VARIABLE}
+        for height, (period, direction) in self.partitions.items():
+            required |= {height, period, direction}
+        missing = sorted(required - {str(name) for name in X.data_vars})
+        if missing:
+            raise ValueError(
+                f"PartitionSentinelFiller needs {missing} (the land mask comes from "
+                f"{LAND_MASK_VARIABLE!r}, docs/model_design.md §5.1)"
+            )
+
+        self.ocean_mask_ = land_mask_from_sigwh(X[LAND_MASK_VARIABLE].values)
+        self.period_sentinel_estimates_: dict[str, PeriodSentinelEstimate] = {}
+        self.period_sentinels_: dict[str, float] = {}
+        for height, (period, _direction) in self.partitions.items():
+            ocean = np.broadcast_to(self.ocean_mask_[None, :, :], X[height].shape)
+            estimate = period_sentinel_from_archive(
+                X[height].values[ocean], X[period].values[ocean]
+            )
+            self.period_sentinel_estimates_[period] = estimate
+            self.period_sentinels_[period] = estimate.extrapolated_intercept
+        return self
+
+    def transform(self, X: xr.Dataset) -> xr.Dataset:
+        """Fill each partition's ocean-cell NaN; land NaN passes through.
+
+        Parameters
+        ----------
+        X : xr.Dataset
+
+        Returns
+        -------
+        xr.Dataset
+            `X` with partition heights, periods and directions finite at
+            every ocean cell.
+        """
+        check_is_fitted(self, "ocean_mask_")
+        check_canonical(X, context="PartitionSentinelFiller.transform")
+        result = X.copy(deep=False)
+        for height, (period, direction) in self.partitions.items():
+            fills = {height: 0.0, period: self.period_sentinels_[period], direction: 0.0}
+            for name, fill in fills.items():
+                da = result[name]
+                result[name] = (da.dims, _fill_ocean_nan(da.values, self.ocean_mask_, fill))
+        return result
+
+    def inverse_transform(self, X: xr.Dataset) -> xr.Dataset:
+        """Decode heights at or below `floor_m` back to ``0.0`` (partition absent).
+
+        `LogTransform` floors every height at `floor_m`, so a sentinel
+        ``0.0`` comes back from its inverse as ``floor_m`` up to rounding in
+        ``exp(log(floor_m**2) / 2)``; the relative tolerance absorbs that.
+        Periods and directions pass through unchanged: where a partition is
+        absent they are physically undefined, and there is no inverse rule
+        for them yet (model_design.md §5.8, "Open in v3").
+
+        Parameters
+        ----------
+        X : xr.Dataset
+
+        Returns
+        -------
+        xr.Dataset
+        """
+        check_is_fitted(self, "ocean_mask_")
+        result = X.copy(deep=False)
+        threshold = self.floor_m * (1.0 + 1e-6)
+        for height in self.partitions:
+            if height not in result.data_vars:
+                continue
+            da = result[height]
+            values = da.values
+            result[height] = (da.dims, np.where(values <= threshold, 0.0, values))
+        return result
+
+
+class LogTransform(BaseEstimator, TransformerMixin):  # type: ignore[misc]
+    """Log-energy heights and log periods (see model_design.md §5.3.1).
+
+    ``logE = log(max(H, floor_m)**2)`` (`height_log_energy`) and
+    ``T = log(period)``, each renamed to its tensor name
+    (variable_taxonomy.md §3.4, §5). The floor applies everywhere, so a real
+    dead-calm ``H = 0`` stays finite as well as the sentinel zeros. NaN
+    (land) propagates through both directions.
+    """
+
+    def __init__(
+        self,
+        heights: dict[str, str],
+        periods: dict[str, str],
+        floor_m: float = 0.01,
+    ) -> None:
+        # heights / periods: source variable -> tensor name, e.g.
+        # {"wsh": "logE_wsh"} / {"wsp": "T_wsp"}. sklearn convention: verbatim.
+        self.heights = heights
+        self.periods = periods
+        self.floor_m = floor_m
+
+    def fit(self, X: xr.Dataset, y: None = None) -> Self:
+        """Record the source -> tensor name maps.
+
+        Parameters
+        ----------
+        X : xr.Dataset
+        y : None
+            Ignored (sklearn convention).
+
+        Returns
+        -------
+        self
+
+        Raises
+        ------
+        ValueError
+            If a listed source variable is missing from `X`.
+        """
+        missing = sorted(
+            (set(self.heights) | set(self.periods)) - {str(name) for name in X.data_vars}
+        )
+        if missing:
+            raise ValueError(f"LogTransform: variables {missing} not in the Dataset")
+        self.heights_ = dict(self.heights)
+        self.periods_ = dict(self.periods)
+        return self
+
+    def transform(self, X: xr.Dataset) -> xr.Dataset:
+        """Replace each height with its ``logE`` tensor and each period with ``T``.
+
+        Parameters
+        ----------
+        X : xr.Dataset
+
+        Returns
+        -------
+        xr.Dataset
+        """
+        check_is_fitted(self, "heights_")
+        result = X.copy(deep=False)
+        for source, tensor in self.heights_.items():
+            da = result[source]
+            result = result.drop_vars(source)
+            result[tensor] = (da.dims, height_log_energy(da.values, floor_m=self.floor_m))
+        for source, tensor in self.periods_.items():
+            da = result[source]
+            result = result.drop_vars(source)
+            result[tensor] = (da.dims, np.log(da.values))
+        return result
+
+    def inverse_transform(self, X: xr.Dataset) -> xr.Dataset:
+        """Map ``logE`` back to height (``exp(logE / 2)``) and ``T`` back to period.
+
+        Parameters
+        ----------
+        X : xr.Dataset
+
+        Returns
+        -------
+        xr.Dataset
+        """
+        check_is_fitted(self, "heights_")
+        result = X.copy(deep=False)
+        for source, tensor in self.heights_.items():
+            if tensor not in result.data_vars:
+                continue
+            da = result[tensor]
+            result = result.drop_vars(tensor)
+            result[source] = (da.dims, np.exp(da.values / 2.0))
+        for source, tensor in self.periods_.items():
+            if tensor not in result.data_vars:
+                continue
+            da = result[tensor]
+            result = result.drop_vars(tensor)
+            result[source] = (da.dims, np.exp(da.values))
+        return result

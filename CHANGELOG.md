@@ -941,6 +941,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **2026-11-22 — v3 preprocessing stages: partition sentinel fill, log
+  transform and `keep_speed`** — `src/train/masking.py`,
+  `src/train/directional.py`, `tests/train/test_masking.py`,
+  `tests/train/test_directional.py`. Steps 1–2 of the v3 implementation
+  (`docs/model_design.md` §5.3, §5.3.1). Nothing calls them yet; the
+  `WeatherModel` rewrite wires them in.
+  - **`PartitionSentinelFiller`.** Fits the land mask from `sigwh` alone
+    and each period's zero-height limit (`period_sentinel_from_archive`).
+    `transform` fills ocean NaN of an absent partition with height 0, that
+    period limit and a 0° direction placeholder; land stays NaN.
+    `inverse_transform` decodes heights at the 1 cm floor back to 0.
+  - **`LogTransform`.** Heights → `logE_* = log(max(H, floor)²)`, periods
+    → `T_* = log(period)`, and the exact inverse.
+  - **`keep_speed`** on `ComingFromToUV` and `GoingToToUV`. A listed speed
+    (the class-C partition heights) stays alongside its `(u, v)` and the
+    inverse takes the magnitude from it instead of `hypot(u, v)`.
+  - 13 new tests: the period sentinel recovers a known 3 s limit, land
+    stays NaN, the floor decodes back to 0 through the log round trip,
+    `clone()` round-trips, and kept speeds survive both directions.
+
 - **2026-11-21 — `structlog` runtime dependency (`>=26.1.0,<27.0.0`)** —
   `pyproject.toml`, `poetry.lock`. Added ahead of use: nothing imports it
   yet. It backs the planned `src/core/logger.py` (AGENTS.md *Logging*),
