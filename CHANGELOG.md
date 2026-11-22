@@ -7,6 +7,56 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — `model_design.md` v3: the handoff now specifies the
+  decided pipeline, ahead of the `model.py` rewrite** —
+  `docs/model_design.md` (header and windows, new "What changed in v3",
+  §3, §4, §5.1–§5.8 with new §5.3.1 and §5.5.1, §6 window dates, §7,
+  §8.5, §8.6, §9, §10), `docs/open_questions.md` §6.2 (new) and summary
+  table. `AGENTS.md` requires updating the handoff before implementing,
+  and v2 still described the superseded joint design.
+  - **Brought in from decisions already recorded elsewhere.**
+    - One independent `(T, lat, lon)` tensor per field, 17 in total, with
+      `logE` heights, `log T` periods and weighted `(u, v)`
+      (`variable_taxonomy.md`).
+    - A per-tensor masked Tucker via `partial_tucker_lowmem` at 40% of each
+      spatial dimension (task 07), replacing the joint `r_ocean`/`r_var`
+      fit.
+    - The copula on each Tucker core (placement ii).
+    - The land mask from `sigwh` and the partition sentinel fill (task 17).
+    - DMD + mode OU per variable group at `r_dmd = 100`, and the §5.6.2
+      diagnostics stage.
+  - **New specification.**
+    - `PartitionSentinelFiller` and `LogTransform` transformers in
+      `train/masking.py`, and a `keep_speed` option on the directional
+      transformers so class-C heights survive as `logE` tensors.
+    - `TuckerFit` becomes `(factor_lat, factor_lon, reconstruction_error,
+      n_iter)`, and `dmd_fit` takes a group's `(T, n_G)` joint state.
+    - Per-tensor and per-group artifacts.
+    - `WeatherModel` hyperparameters `tucker_rank_fraction`,
+      `tucker_max_iter`, `tucker_tol`, `groups`, `lim_rank`,
+      `tau_test_lags` and `n_bootstrap`.
+    - A sampler order that inverts per-cell statistics on grid cells, then
+      interpolates `(u, v)`, `logE` and `T`, then applies `exp`, `hypot`
+      and `atan2` pointwise. v2 interpolated direction angles.
+  - **Decided with the user (2026-11-22).**
+    - Train on 12 months of era 3 (2025-10-27 → 2026-10-27) and validate
+      from 2026-10-27 onward.
+    - The local residual is deferred for the first era-3 model
+      (`include_local_residual=False`); which space it would live in under
+      placement (ii) stays open (`open_questions.md` §6.2).
+  - **Flagged, not resolved.**
+    - Per-tensor Tucker on the 12-month window needs about 15–20 h and
+      45–50 GB per tensor, so it must run on a VM.
+    - Direction and period are undefined where a sampled partition height
+      falls below the 1 cm floor.
+    - The 12-month trend term is weakly identified (task 11).
+    - The production `wsh` core fails the tau test at 3 h.
+  - **Minimal fixes outside the rewritten sections**, because v3 made them
+    wrong: §2.2.1's era-3 end date (now open-ended); §6.A check 7, which
+    KS-tested `transform` output against N(0, 1) and now tests the held-out
+    Gaussianized core coefficients instead; and §12's 2022–2025 training
+    window.
+
 - **2026-11-21 — AGENTS.md: conventions ported from the radiologists
   preprocessing pipeline, plus a drift refresh** — `AGENTS.md`.
   - **Ported, adapted to 3.14 and this domain.** Python 3.14 feature table

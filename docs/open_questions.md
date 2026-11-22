@@ -1324,6 +1324,33 @@ simulation and hurricane-season-style checks that are not yet in place
 anywhere in this repo. **Remains open**; treat any specific numeric
 threshold as provisional until such a validation exists.
 
+### 6.2 Where does the local residual live under placement (ii)? — **DEFERRED** (2026-11-22: not part of the first era-3 model)
+
+Raised in: `model_design.md` v3 §3.10 and §5.7, while bringing the handoff
+in line with placement (ii) (§4.1).
+
+The local residual is fit after the mode-level OU, as $R = Z - Z_{\text{coherent}}$,
+with one independent OU per grid cell (`ornstein_uhlenbeck_processes.md`
+§4.1). Its $Z$ was v2's per-cell Gaussianized field. Placement (ii) moved
+the copula onto the Tucker core, so that field no longer exists, and the
+local residual has never been fit on real data (task 07 validated only the
+mode-level OU; task 10 is open). Three candidates:
+
+1. **Standardized-anomaly space.** $Z$ is the standardized log-energy
+   anomaly that Tucker consumes; $Z_{\text{coherent}}$ is DMD's
+   deterministic core, copula-inverted, then Tucker-inverted. The residual
+   is not Gaussian, which the OU fit assumes.
+2. **A per-cell copula on the residual**, then the OU. Gaussian innovations
+   again, at the cost of a second set of per-cell lookup tables (several GB)
+   and an extra inverse step at sampling.
+3. **Leave it out.**
+
+**Decision (2026-11-22): option 3 for the first era-3 model**
+(`include_local_residual=False`). Revisit once validation shows whether the
+missing small-scale variance matters. At 40% Tucker rank, about 23% of the
+standardized anomaly's norm lies outside the coherent layer (task 07 §12).
+Choosing between options 1 and 2 stays open until then.
+
 ---
 
 ## 7. Harmonic climatology's quasi-stationarity assumptions
@@ -1505,6 +1532,7 @@ mistaken for open items that need chasing:
 | 5.5 | Growing DMD modes | OPEN (mitigation proposed) |
 | 5.6 | Partition-absence NaN vs. land/ice NaN | DECIDED (policy validated empirically, task 17) |
 | 6.1 | OU variance-ratio floor | OPEN |
+| 6.2 | Local residual under placement (ii) | DEFERRED (not in the first era-3 model, 2026-11-22; space still open) |
 | 7.1 | Climatology quasi-stationarity | OPEN |
 | 7.2 | Diurnal reasoning resolution-dependence | OPEN (conditional, inactive) |
 | 8.1 | Direction-blind physical constraints | PARTIALLY ANSWERED |
