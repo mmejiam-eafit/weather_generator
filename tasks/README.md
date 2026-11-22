@@ -39,14 +39,14 @@ notebooks against real data.
 | # | Status | Task | Depends on | Key files |
 |---|---|---|---|---|
 | 15 | ✅ | Fixed `wad`/`wad_come_from` check's land-mask false positive | — | `15-wad-consistency-check-land-mask-artifact.md` |
-| 00 | ✅ | Gaussianization placement (`open_questions.md` §4.1) — decided (i, before Tucker); i-vs-ii left as deferred follow-on | 07 (soft, deferred) | `00-gaussianization-placement.md`, `notebooks/00_gaussianization_placement.ipynb` |
+| 00 | ✅ | Gaussianization placement (`open_questions.md` §4.1) — decided (ii, Tucker on log-energy anomalies then Gaussianize the core, before DMD; supersedes the earlier placement-i default, 2026-09-13) | 07 (soft, deferred) | `00-gaussianization-placement.md`, `notebooks/00_gaussianization_placement.ipynb` |
 | 01 | ⬜ | Copula family / tail dependence (§4.2) | — | `01-copula-family-tail-dependence.md`, `notebooks/01_copula_family_tail_dependence.ipynb` |
 | 02 | ⬜ | Rejection sampling vs. copula fix (§8.3) | 01 | `02-rejection-sampling-vs-copula-fix.md`, *shares* `notebooks/01_copula_family_tail_dependence.ipynb` |
 | 03 | ⬜ | Direction preservation under Gaussianization (§2.4) | 00 (soft) | `03-direction-gaussianization-angle-preservation.md`, `notebooks/03_direction_gaussianization_angle_preservation.ipynb` |
 | 04 | ⬜ | Joint-group selection (§3.2) | — | `04-joint-group-selection.md`, `notebooks/04_joint_group_selection.ipynb` |
 | 05 | ⬜ | Triplet coupling lost to independent Gaussianization (§2.2) | 04 | `05-triplet-coupling-gaussianization.md`, *shares* `notebooks/04_joint_group_selection.ipynb` |
 | 06 | ⬜ | Joint multi-channel Tucker vs. downstream, `{u,v,logE,F}` (§3.4/§3.5) | — | `06-joint-channel-tucker-vs-downstream.md`, `notebooks/06_joint_channel_tucker_vs_downstream.ipynb` |
-| 07 | ✅ | Tucker/DMD rank selection (§5.3) | 00 (soft), 17 (soft) | `07-tucker-dmd-rank-selection.md`, `notebooks/07_tucker_dmd_rank_selection.ipynb` |
+| 07 | ✅ | Tucker/DMD rank selection (§5.3) — **DMD decided: `r_dmd=100`** (2026-09-25, knee point between spectral/marginal generative-fidelity optima, confirmed via surrogate test + real-data 8-fold CV); Tucker rank still a 20% baseline (32.90% err), final rank deferred (cost cliff above ~20-30%; budget-constrained) | 00 (soft), 17 (soft) | `07-tucker-dmd-rank-selection.md`, `notebooks/07_tucker_dmd_rank_selection.ipynb` |
 | 08 | ⬜ | Masked-HOOI convergence (§5.4) | — | `08-masked-hooi-convergence.md`, `notebooks/08_masked_hooi_convergence.ipynb` |
 | 09 | ⬜ | Growing DMD modes (§5.5) | — | `09-growing-dmd-modes.md`, `notebooks/09_growing_dmd_modes.ipynb` |
 | 10 | ⬜ | OU variance-ratio floor (§6.1) | — | `10-ou-variance-floor-validation.md`, `notebooks/10_ou_variance_floor_sensitivity.ipynb` |

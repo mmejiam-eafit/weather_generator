@@ -511,6 +511,67 @@ The notebook's own reported shapes (`matrix_core.shape == (10, 20, 12)` for
 its one exploratory `sst` fit) exemplify this format only — they are not
 target values for any variable in the trained pipeline.
 
+### 5.1 Spatially-resolved error diagnostics: where does reconstruction error concentrate?
+
+The aggregate reconstruction-error number above is a single scalar; two
+ranks (or two variables) can report similar aggregate error while their
+errors are distributed completely differently across the domain — one
+rank polishing already-easy regions further, another genuinely resolving
+harder structure. Task 07's rank-selection work (2026-09-26,
+`tasks/07-tucker-dmd-rank-selection.md` §5) developed four complementary
+diagnostics for this, implemented in
+`notebooks/07_tucker_reconstruction_visual_check.py` and applied to a
+handful of cached true-field time-slices against a saved `(core,
+factor_lat, factor_lon)` fit:
+
+1. **Coastal vs. open-ocean RMSE.** Ocean cells within a small band
+   (default 3 grid cells) of land vs. everything else. Reconstruction
+   error is consistently higher near the coastline — a real but moderate
+   effect (a ~1.3x ratio measured on `wsh` at 20% rank), since land-ocean
+   is the domain's sharpest, most permanent discontinuity, and a Tucker
+   fit's factor matrices are smooth basis functions spanning the *entire*
+   lat or lon axis — a finite number of smooth global functions cannot
+   cleanly represent an arbitrary, irregular masked boundary (the same
+   flavor of issue as Gibbs-phenomenon ringing near a discontinuity in a
+   truncated Fourier series).
+2. **Gradient-conditioned error, restricted to open ocean only.**
+   Correlate `|error|` against the true field's local spatial-gradient
+   magnitude (`np.gradient`), for ocean cells far enough from land that
+   the gradient stencil never touches the land sentinel value. This
+   isolates the *same* mechanism as (1) but operating on open-ocean
+   phenomena themselves (storm cells, eddies, fronts) rather than the
+   coastline: measured at 0.75 (strong) on `wsh` at 20% rank, with
+   open-ocean cells binned into gradient-magnitude quartiles showing the
+   bottom three quartiles (flattest 75%) sitting close together while the
+   sharpest quartile alone carried more than 3x the error of the other
+   three combined.
+3. **Upper-half / lower-half RMSE ratio**, a single-number summary of (2):
+   `RMSE(sharper 50% of open-ocean cells by local gradient) /
+   RMSE(flatter 50%)`. Near 1 means error is roughly uniform regardless of
+   local structure; increasing above 1 means error is concentrating
+   specifically where the true field changes rapidly in space (2.52x on
+   `wsh` at 20% rank).
+4. **Shape of the open-ocean `|error|` distribution itself** — not the
+   per-quartile group-RMSEs in (2), which are only 4 numbers, too few to
+   support a moment estimate. Instead: the percentile ratio `(P100 - P50)
+   / IQR`, skewness, and excess kurtosis of the full per-cell `|error|`
+   sample. Large values of all three indicate a small minority of cells
+   carry disproportionate error rather than error being spread evenly
+   (24.5 / 3.0 / 10.8 respectively on `wsh` at 20% rank — strongly
+   right-skewed and heavy-tailed, consistent with (1)-(3)).
+
+**Why track all four rather than pick one**: they answer related but
+distinct questions (how much worse is the coastline specifically; does the
+same effect hold in the open ocean; how concentrated is that effect in one
+number; what does the full error distribution's shape say independent of
+any spatial conditioning). When comparing ranks, agreement across all four
+is reassuring but not the interesting case — the useful case is
+*disagreement*: e.g. a higher rank lowering the half-ratio while
+skewness/kurtosis stay flat would mean the extra rank is reducing error in
+the bulk without actually resolving the sharp-transition cells, a
+materially different (and less useful) kind of improvement than a drop in
+the single aggregate `err_pct` number alone would suggest.
+
 ## 6. Open questions and limitations
 
 - **Cross-variable coupling (repeated from §4.4).** The per-variable design

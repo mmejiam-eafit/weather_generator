@@ -24,6 +24,13 @@ def _searchsorted_per_column(sorted_matrix: np.ndarray, queries: np.ndarray) -> 
     offset large enough to separate columns' numeric ranges lets a single
     global `np.searchsorted` stand in for ``n_cells`` independent ones.
 
+    Every array here is `(n_bins-or-n_times, n_cells)`; at full-grid scale
+    (era 2: 894,240 cells) each is multiple GiB, so dead intermediates are
+    explicitly `del`eted and the offset-add is done in place instead of
+    leaving 4-5 of them simultaneously reachable until the function
+    returns -- that pileup, not the chunking of `queries` over time, is
+    what exhausted a 58GB VM during the era-2 rank sweep.
+
     Parameters
     ----------
     sorted_matrix : (n_bins, n_cells)
@@ -45,22 +52,33 @@ def _searchsorted_per_column(sorted_matrix: np.ndarray, queries: np.ndarray) -> 
     finite_queries = np.where(np.isfinite(queries), queries, 0.0)
     combined_min = min(finite_matrix.min(), finite_queries.min())
     combined_max = max(finite_matrix.max(), finite_queries.max())
+    del finite_matrix, finite_queries
     span = combined_max - combined_min + 1.0
 
-    safe_matrix = sorted_matrix.copy()
     nan_columns = np.all(np.isnan(sorted_matrix), axis=0)
+    safe_matrix = sorted_matrix.copy()
     if nan_columns.any():
         filler = np.linspace(combined_min, combined_max, n_bins)
         safe_matrix[:, nan_columns] = filler[:, None]
+    del nan_columns
 
     offsets = np.arange(n_cells, dtype=np.float64) * span
-    flat_reference = (safe_matrix + offsets[None, :]).ravel(order="F")
-    flat_queries = (np.nan_to_num(queries, nan=combined_min) + offsets[None, :]).ravel(order="F")
+    safe_matrix += offsets[None, :]
+    flat_reference = safe_matrix.ravel(order="F")
+    del safe_matrix
+
+    flat_queries = np.nan_to_num(queries, nan=combined_min)
+    flat_queries += offsets[None, :]
+    flat_queries = flat_queries.ravel(order="F")
+    del offsets
 
     global_idx: np.ndarray = np.searchsorted(flat_reference, flat_queries)
+    del flat_reference, flat_queries
     column_ids = np.repeat(np.arange(n_cells), n_times)
-    local_idx = global_idx - column_ids * n_bins
-    result: np.ndarray = local_idx.reshape(n_cells, n_times).T
+    column_ids *= n_bins
+    global_idx -= column_ids
+    del column_ids
+    result: np.ndarray = global_idx.reshape(n_cells, n_times).T
     return result
 
 
@@ -88,16 +106,23 @@ def _value_to_uniform(
     idx = _searchsorted_per_column(bin_values, values)
     idx_lower = np.clip(idx - 1, 0, n_bins - 2)
     idx_upper = idx_lower + 1
+    del idx
 
     lower_val = np.take_along_axis(bin_values, idx_lower, axis=0)
     upper_val = np.take_along_axis(bin_values, idx_upper, axis=0)
     lower_prob = bin_probs[idx_lower]
     upper_prob = bin_probs[idx_upper]
+    del idx_lower, idx_upper
 
     span = upper_val - lower_val
-    frac = np.where(span > 0, (values - lower_val) / np.where(span > 0, span, 1.0), 0.0)
+    denom = np.where(span > 0, span, 1.0)
+    frac = np.where(span > 0, (values - lower_val) / denom, 0.0)
+    del span, denom
     probs = lower_prob + frac * (upper_prob - lower_prob)
-    return np.where(np.isnan(values) | np.isnan(lower_val) | np.isnan(upper_val), np.nan, probs)
+    del frac, lower_prob, upper_prob
+    result = np.where(np.isnan(values) | np.isnan(lower_val) | np.isnan(upper_val), np.nan, probs)
+    del probs, lower_val, upper_val
+    return result
 
 
 def _uniform_to_value(
@@ -199,7 +224,9 @@ class GaussianCopula(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         """
         check_is_fitted(self, "sorted_anomalies_binned_")
         check_canonical(X, context="GaussianCopula.transform")
-        result = X.copy()
+        result = X.copy(
+            deep=False
+        )  # variables are replaced wholesale below, never mutated in place
         for variable, binned in self.sorted_anomalies_binned_.items():
             if variable not in result.data_vars:
                 continue
@@ -207,8 +234,10 @@ class GaussianCopula(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             values = da.values.reshape(da.shape[0], -1).astype(np.float64)
             binned_flat = binned.reshape(self.n_bins, -1).astype(np.float64)
             probs = _value_to_uniform(values, binned_flat, self.bin_probs_)
+            del values, binned_flat
             probs = np.clip(probs, _EPS, 1.0 - _EPS)
             z = norm.ppf(probs)
+            del probs
             result[variable] = (da.dims, z.reshape(da.shape))
         return result
 
@@ -227,7 +256,9 @@ class GaussianCopula(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         """
         check_is_fitted(self, "sorted_anomalies_binned_")
         check_canonical(X, context="GaussianCopula.inverse_transform")
-        result = X.copy()
+        result = X.copy(
+            deep=False
+        )  # variables are replaced wholesale below, never mutated in place
         for variable, binned in self.sorted_anomalies_binned_.items():
             if variable not in result.data_vars:
                 continue

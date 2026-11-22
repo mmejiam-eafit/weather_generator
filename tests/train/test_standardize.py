@@ -74,3 +74,47 @@ def test_standardizer_sklearn_clone() -> None:
     cloned = clone(standardizer)
     assert isinstance(cloned, PerCellStandardizer)
     assert not hasattr(cloned, "sigma_cell_")
+
+
+def test_standardizer_near_constant_cell_does_not_blow_up() -> None:
+    """A cell with a tiny (near-zero) fitted std passes its real anomaly through unscaled."""
+    rng = np.random.default_rng(4)
+    values = rng.normal(loc=0.0, scale=3.0, size=(200, 1, 2))
+    values[:, 0, 0] = 5.0 + rng.normal(scale=1e-10, size=200)  # near-constant cell
+    ds = _dataset(values)
+
+    standardizer = PerCellStandardizer().fit(ds)
+    assert standardizer.sigma_cell_["wsh"][0, 0] < 1e-6  # true fitted sigma stays tiny
+    result = standardizer.transform(ds)
+
+    assert np.all(np.isfinite(result["wsh"].values[:, 0, 0]))
+    assert_allclose(result["wsh"].values[:, 0, 0], values[:, 0, 0])
+
+
+def test_standardizer_exactly_constant_cell_no_nan_or_inf() -> None:
+    """A cell with std exactly 0.0 transforms to its own (finite) constant value."""
+    rng = np.random.default_rng(5)
+    values = rng.normal(loc=0.0, scale=2.0, size=(50, 1, 2))
+    values[:, 0, 0] = 7.0  # exactly constant
+    ds = _dataset(values)
+
+    standardizer = PerCellStandardizer().fit(ds)
+    assert standardizer.sigma_cell_["wsh"][0, 0] == 0.0
+    result = standardizer.transform(ds)
+
+    assert np.all(np.isfinite(result["wsh"].values[:, 0, 0]))
+    assert_allclose(result["wsh"].values[:, 0, 0], 7.0)
+
+
+def test_standardizer_inverse_transform_roundtrip_near_zero_sigma() -> None:
+    """fit -> transform -> inverse_transform recovers the original values at a near-constant cell."""
+    rng = np.random.default_rng(6)
+    values = rng.normal(loc=0.0, scale=4.0, size=(100, 1, 2))
+    values[:, 0, 0] = 5.0 + rng.normal(scale=1e-10, size=100)
+    ds = _dataset(values)
+
+    standardizer = PerCellStandardizer()
+    standardized = standardizer.fit_transform(ds)
+    recovered = standardizer.inverse_transform(standardized)
+
+    assert_allclose(recovered["wsh"].values, values, rtol=1e-6)

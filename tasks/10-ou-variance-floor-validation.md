@@ -18,6 +18,20 @@ scope is explicitly the floor's **direct, measurable effect** (how many
 cells become "active" at a given floor), not that larger, currently
 infeasible validation.
 
+**Update (task 07, 2026-09-29):** task 07 did fit mode-level OU noise
+(`notebooks/07_dmd_ou_generative_check.py`, using `train.dmd.fit_mode_ou`/
+`ModeOUFit`) and validated its generative fidelity across `r_dmd ∈
+{5,...,200}` — but that is a different OU model at a different layer of
+the pipeline: per-DMD-mode dynamics on the reduced-order residual
+`a_k(t) - a_det_k(t)`, with no `variance_floor`, no `active_mask`, and no
+per-cell variance-ratio concept anywhere in it. `train.dmd.fit_mode_ou`
+has no floor/clip logic at all; the floor this task is about lives only
+in `train.local_residual.fit_local_residual`, which task 07 never
+touches. Despite both being "OU", there is no code or data overlap — this
+task remains fully open. Its own notebook already has a complete,
+unexecuted scaffold (`variance_floor` swept over `[0.0, 0.01, 0.02, 0.05,
+0.1, 0.2]`).
+
 ## 2. Steps to answer it
 
 1. Load one variable (`wsh`) over a representative window, Gaussianize

@@ -7,6 +7,401 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-09-29 — Closed task 07: Tucker rank decided as 40% (248, 576),
+  production copula + DMD (`r_dmd=100`) fit on the full 40% core, Azure
+  VM infrastructure torn down** — `notebooks/07_placement2_tucker_on_anomalies.py`
+  (added `--early_stop_tol`, fractional-scale checkpoint-to-checkpoint
+  early stopping), `notebooks/07_placement2_copula_dmd_40pct.py` (new),
+  `tasks/07-tucker-dmd-rank-selection.md` §12. Final 40% VM run (rank
+  (248,576), 11h cap after an 8h cap proved too short) hit its wall-clock
+  cap at iteration 170/300, err_pct=23.2962% — one checkpoint shy of its
+  own `1e-4` early-stop threshold, effectively converged. Copula and DMD
+  (`r_dmd=100`, the rank decided in §10) both trained on the **full**
+  2192-timestep core, no train/holdout split (validation happens
+  separately against real data) — copula fit in 110s, DMD fit in 41.1s.
+  Decided pragmatically (not via a rigorous knee-point argument like
+  `r_dmd`, since Azure credit is now exhausted): 40% checkpoint error
+  (23.30%) beats 30% (27.47%) and 20%'s converged baseline (32.90%).
+  Deleted the VM, both its disks, NIC, public IP, NSG, and VNET; left the
+  raw data archive (`wxgenarchivee2`) and ML workspace resources
+  untouched. Also recorded three operational lessons hit for real this
+  run: Python's stdout block-buffers when redirected to a file (trust the
+  checkpoint CSV, not the log, for live status); `rsync --partial`,
+  killed mid-transfer, can rename its own incomplete download over an
+  already-good file at the same destination (caused one real 1.17GB
+  file corruption, recovered by re-downloading from the VM); and a local
+  background process — even one detached with `setsid`+`nohup` — did not
+  survive the local IDE crashing, while jobs on the VM (a separate
+  machine, run in `tmux`) survived every crash without issue.
+
+- **2026-09-27 — Confirmed Tucker's spatial residual and DMD's temporal
+  residual are genuinely different signals, not just different in
+  principle: the core doesn't carry the storm signature, and the core
+  itself is not a coarsened version of the map** —
+  `tasks/07-tucker-dmd-rank-selection.md` §11,
+  `notebooks/07_tucker_core_timelapse_gif.py` (new). corr(spatial
+  max-\|error\|, core energy/frame-to-frame core change) = 0.19/0.16,
+  weak — versus the 0.83-0.94 cross-rank correlation found in the spatial
+  error itself (previous entry). Visualized the raw core directly
+  (`notebooks/tucker_core_timelapse_20pct.gif`, 548 frames, 50.5MB): no
+  continents or basin-scale structure, just noise-like texture with
+  energy concentrated toward low mode-indices (surviving SVD ordering,
+  not spatial structure) — and it compressed far worse as a GIF than the
+  smooth field did, an incidental but consistent confirmation. Net
+  finding: whatever spatial detail a given Tucker rank can't represent is
+  discarded before the core is ever computed, so DMD/OU structurally
+  cannot compensate for it — confirms Tucker rank and `r_dmd` are correctly
+  treated as two independent decisions in this task, not one tradeoff.
+
+- **2026-09-27 — Animated true-vs-reconstruction timelapse across all
+  three Tucker ranks (20/30/40%), 548 frames over the full 9-month window
+  at 00/12 UTC daily** — `notebooks/07_tucker_rank_timelapse_gif.py`
+  (new), `notebooks/tucker_rank_timelapse.gif`,
+  `tasks/07-tucker-dmd-rank-selection.md` §5. Confirms the static
+  two-timestep finding generalizes: the coastline error trace is fixed
+  frame to frame, open-ocean error visibly follows storm/eddy boundaries
+  as weather evolves. Checked per-frame RMSE across all 548 frames (not
+  just the 2 originally-cached timesteps): the 20%>30%>40% ordering holds
+  at every frame with no overlap, and each rank's error is stable around
+  its own mean (total linear drift over the whole window ~= 1 standard
+  deviation of frame-to-frame noise) — confirms this residual is
+  genuinely weather-driven, not a leftover seasonal trend. GIF file size
+  needed active management: dpi=100 rendered at 345.8MB, dpi=70 at
+  175.9MB, settled on dpi=45 (75.2MB, still fully legible) — GIF
+  compresses this kind of high-detail, low-frame-to-frame-redundancy
+  content poorly regardless of resolution.
+
+- **2026-09-27 — 40% Tucker rank's reconstruction-quality diagnostics
+  measured, completing a 3-rank comparison (20%/30%/40%) — more rank keeps
+  helping overall, but a small extreme tail of cells resists it** —
+  `tasks/07-tucker-dmd-rank-selection.md` §5. 40% costs ~1.6x more per
+  iteration than 30% (~201 vs ~126 s/iter) and hit its 3h backstop at
+  iteration 50/80 (23.8276%) rather than completing — recovered fine
+  thanks to the per-checkpoint save. Across all three ranks: overall RMSE
+  and the coastal/open ratio both improve monotonically (0.336→0.284→0.244;
+  1.33x→1.29x→1.23x), but the error-distribution-shape trio worsens
+  monotonically at every step (percentile-ratio 24.5→27.7→28.3, skewness
+  3.01→3.35→3.51, excess kurtosis 10.8→13.6→15.3). Root-caused precisely
+  this time: it's not the top quartile falling behind (Q4 actually
+  improved *faster* than Q1 going 30%→40%) — it's specifically the single
+  most extreme cells (driving the distribution's max) improving much more
+  slowly than the bulk's own typical spread (IQR) shrinks, so the "how far
+  out is the worst case" ratio keeps growing even as every absolute number
+  gets better. Same Gibbs-phenomenon-style mechanism as before, now
+  characterized more precisely: not a general transition-zone problem, a
+  specific-extreme-tail one.
+
+- **2026-09-27 — 30% Tucker rank's reconstruction-quality diagnostics
+  measured: more rank helps the aggregate error, but disagrees with the
+  20% baseline on where that help goes** — `tasks/07-tucker-dmd-rank-selection.md`
+  §5. Short deliberate re-run (80 iterations, completed naturally this
+  time thanks to yesterday's per-checkpoint `.npz` fix) to recover tensors
+  the 8h run had lost. Same four measurements as the 20% baseline: overall
+  RMSE improved (0.336→0.284) and the coastal ratio barely moved
+  (1.33x→1.29x), but every concentration measure got *worse* — half-ratio
+  2.52x→2.69x, (max−median)/IQR 24.5→27.7, skewness 3.01→3.35, excess
+  kurtosis 10.8→13.6. Root cause: the flattest quartile of open-ocean
+  cells improved 19.6% going 20%→30%, the sharpest quartile only 13.7% —
+  the extra rank is disproportionately sharpening already-easy regions,
+  not closing the gap at genuine spatial transitions. Exactly the
+  "disagreement between metrics" case flagged as the interesting one when
+  this diagnostic suite was designed. 40% reconstruction-check re-run
+  launched immediately after, same pattern, in progress.
+
+- **2026-09-26 — 30% Tucker rank re-run hit its 8h cap without converging
+  (iter 220/300, err_pct=27.4651%); found and fixed a gap where the run's
+  Tucker factors were never saved** — `tasks/07-tucker-dmd-rank-selection.md`
+  §5, `notebooks/07_placement2_tucker_on_anomalies.py`. Power-law fit of
+  the error-delta trajectory (`delta ~ iter^-p`) stabilized at p=1.387 as
+  more checkpoints accumulated (up from p=1.339 using only the first 60
+  iterations) — confirms real, if slow, convergence, but also confirms
+  early extrapolation was unreliable: the iter≤60 fit predicted 25.91% at
+  iteration 165; actual was 27.55%, 1.64pp worse. Even short of full
+  convergence, 27.4651% is a 16.5% relative error reduction over 20%'s
+  converged 32.8975%. Separately: `07_placement2_tucker_on_anomalies.py`
+  only saved its `(core, factor_lat, factor_lon)` `.npz` bundle after the
+  checkpoint loop's normal completion — a process killed early by the
+  wall-clock cap never reached that line, so this run's factors were lost
+  entirely (only the checkpoint CSV survived), meaning no spatial
+  reconstruction check is possible for 30% this round. Fixed going
+  forward: the save now happens every checkpoint, overwriting the same
+  path, so any future run always leaves a recoverable snapshot regardless
+  of how it ends. Per the standing instruction, a cap-hit-without-
+  converging outcome means the VM was deallocated immediately and 40% was
+  **not** auto-launched (that only happens on a 30% success) — 40% remains
+  a deliberate next decision.
+
+- **2026-09-26 — New spatially-resolved reconstruction-error diagnostics
+  for Tucker rank comparison, beyond the single aggregate `err_pct`
+  number** — `notebooks/07_tucker_reconstruction_visual_check.py` (new),
+  `notebooks/07_tucker_checkpoint_timelapse.py` (new),
+  `docs/tucker_decomposition.md` §5.1,
+  `tasks/07-tucker-dmd-rank-selection.md` §5. Four complementary
+  measurements answer *where* reconstruction error concentrates, not just
+  how much of it there is: (1) coastal-vs-open-ocean RMSE ratio; (2)
+  correlation of `|error|` against the true field's local spatial-gradient
+  magnitude, open-ocean only, plus a gradient-magnitude-quartile RMSE
+  breakdown; (3) a single-number upper-half/lower-half (sharper 50%
+  vs. flatter 50%, by local gradient) RMSE ratio; (4) percentile ratio
+  `(P100-P50)/IQR`, skewness, and excess kurtosis of the open-ocean
+  `|error|` distribution itself. Measured on `wsh` at 20% rank
+  (124,288) against two cached true-field time-slices, extracted from the
+  VM's cached tensor via `mmap_mode="r"` (never loading the full ~7.8GB
+  array): coastal/open ratio 1.33x, gradient correlation 0.75, half-ratio
+  2.52x, percentile-ratio/skewness/excess-kurtosis 24.5/3.0/10.8 — all
+  agreeing that error is heavily concentrated at sharp spatial transitions
+  (coastlines and open-ocean storm/eddy edges alike), not spread evenly.
+  Visualized in `notebooks/tucker_reconstruction_check_20pct.png` (true /
+  reconstructed / error maps; needed a percentile-based, not raw-max,
+  color scale — a handful of extreme storm pixels otherwise washed out the
+  whole plot to near-white) and
+  `notebooks/tucker_checkpoint_timelapse_30pct_8hcap.png` (error and
+  per-checkpoint error-delta vs. iteration, for reading convergence
+  plateaus off a live or finished checkpoint CSV). Reusable against any
+  future rank's `.npz` for a direct, apples-to-apples cross-rank
+  comparison once 30%/40% converge.
+
+- **2026-09-26 — VM-validated the Tucker cost-cliff fix at 30% rank: real
+  ~1.72x speedup confirmed, but not enough to finish in a 3h box; also
+  corrected an earlier "zero checkpoints" claim that turned out to be
+  wrong** — `tasks/07-tucker-dmd-rank-selection.md` §5. Ran the fixed
+  `partial_tucker_lowmem` on the actual Azure VM at (186,432)/30%,
+  wall-clock-boxed to 3h via a remote `timeout`. Completed 80/300 requested
+  iterations before the cap fired; steady-state pace ~128 s/iter vs. the
+  old code's ~220 s/iter at the same rank (~1.72x speedup, real but more
+  modest than hoped — the SVD-method fix only cheapens the SVD portion of
+  each iteration, not the rank-independent tensor-contraction cost, which
+  forms a floor). Error decreased monotonically and smoothly throughout
+  (29.32%→27.79%), no memory blowup (~30GB peak of a 58GB cap, no swap).
+  While retrieving this data, found the two previously-"killed at ~11h/
+  ~11.5h, zero checkpoints" runs (30% and a separate 40% placement-i
+  attempt) had actually been making real, steady, monotonically-improving
+  progress the whole time (168/200 and 132/200 iterations respectively) —
+  the checkpoint CSVs were simply never checked before being stopped and
+  before writing that claim down. Corrected in the task doc. Even
+  unconverged, 30% rank at iteration 80 already beats 20%'s fully-converged
+  error (27.79% vs 32.90%) — a real, decision-relevant result even though
+  the 40% rank attempt wasn't reached tonight (per plan, only proceeds
+  after a 30% success within its own cap) and Tucker rank remains
+  undecided. Also fixed two unrelated VM infra issues found along the way:
+  an NSG rule only allowing SSH from a stale IP, and `results/` having
+  grown to 19GB on a 95%-full 29GB OS disk (moved to the attached 256GB
+  data disk). VM deallocated immediately once the cap fired.
+
+- **2026-09-26 — Diagnosed and fixed the Tucker rank cost cliff — two real
+  bugs in how this repo calls tensorly's masked `partial_tucker`, not a
+  language/speed problem** — `src/train/masked_tucker.py` (new),
+  `tests/train/test_masked_tucker.py` (new),
+  `tasks/07-tucker-dmd-rank-selection.md` §5. Read tensorly 0.9.0's
+  installed source directly: (1) the per-iteration masked-cell
+  re-imputation materializes ~4-5 full-size temporary arrays every
+  iteration, rank-independent (~31 GiB at era-2 scale for this line
+  alone); (2) the per-iteration factor-update SVD call never propagates
+  `method=svd`, so `svd="randomized_svd"` is silently ignored after
+  initialization — every iteration actually runs a full economy LAPACK
+  SVD instead. Fixed both via a small vendored `partial_tucker_lowmem`
+  (in-place mask-aware `copyto`, since this repo's mask is always strictly
+  `{0,1}`; propagates the requested SVD method every iteration), now used
+  by both rank-sweep notebook scripts in place of tensorly's function
+  directly. Verified locally against tensorly's own function for exact
+  numerical equivalence (holding the SVD method fixed) and structure
+  recovery (once genuinely using randomized SVD); full suite + mypy
+  --strict clean. Not yet validated on the VM — Numba/C++ were
+  considered and ruled out (the bottleneck is memory + an algorithm bug,
+  not Python-loop overhead; the hot path already runs compiled BLAS/
+  LAPACK code).
+
+- **2026-09-25 — Task 07: decided the final production `r_dmd = 100`** —
+  `docs/open_questions.md` §5.3, `tasks/07-tucker-dmd-rank-selection.md`
+  §10, plots in `notebooks/07_dmd_rank_fidelity_tradeoff.png` and
+  `notebooks/07_dmd_rank_cv_predictive_error.png`
+  (`notebooks/07_dmd_rank_summary_plots.py`). The generative check's two
+  fidelity metrics disagree on where "best" is (spectral at `r_dmd=150`,
+  marginal/KS at `r_dmd=80`); `r_dmd=100` is the knee point between them
+  — moving to either neighbor buys a small gain on one metric at a
+  disproportionate cost on the other (e.g. `r=80` trades a 12% better KS
+  for a 121% worse spectral match). The real-data CV result is flat
+  across all three candidates, so it imposes no penalty on this choice.
+  Closes the DMD half of task 07's rank-selection question; Tucker's own
+  rank remains open.
+
+- **2026-09-25 — Task 07: real-data (no surrogate) 8-fold cross-validation
+  confirms the DMD rank finding is not a single-split artifact —
+  `docs/open_questions.md` §5.3, `tasks/07-tucker-dmd-rank-selection.md`
+  §9.** Ran `notebooks/07_dmd_rank_cv_check.py` (design:
+  `dmd_rank_cv_plan.md`, now absorbed and deleted): 8-fold expanding-
+  window walk-forward CV (`TimeSeriesSplit`) on the same cached real
+  core, no synthetic surrogate at all, with a rolling anchor through each
+  fold's entire ~190-step real held-out block (142 anchors/fold) rather
+  than the single training-boundary anchor prior checks used.
+  Memory-capped at 25 GiB (`RLIMIT_AS`, never triggered). Result:
+  one-step predictive accuracy barely moves across the whole
+  `r_dmd=5-200` range (under 0.3 percentage points worst-to-best, ~4x
+  smaller than the original single-split test's ~1.2-point spread), and
+  this near-flatness replicates almost identically across all 8
+  independent real windows (fold-to-fold std 0.07-0.13 points). This is
+  the direct real-data confirmation of what the phase-randomized
+  surrogate test implied via a synthetic null model: rank truly doesn't
+  matter much for predictive accuracy here, not an artifact of the one
+  split every prior check rested on. `r_dmd` recommendation unchanged,
+  now on firmer footing: 50-100.
+
+- **2026-09-24 — Task 07: decisively confirmed the DMD "no elbow" result
+  is intrinsic noise, not missing structure or a search bug, and fixed a
+  real complex-conjugate-pair gap in OU generation along the way —
+  `docs/open_questions.md` §5.2, §5.3, `tasks/07-tucker-dmd-rank-selection.md`
+  §8.** Built 20 independent phase-randomized (Prichard-Theiler
+  multivariate FFT) surrogates of the Gaussianized core — stationary
+  Gaussian processes sharing the real data's exact second-order
+  statistics and nothing more — and reran the full DMD rank sweep on each
+  (`notebooks/07_dmd_surrogate_rank_check.py`). At every `r_dmd` from 5 to
+  200, real held-out error sits inside the surrogate band: the anomaly's
+  high effective rank is statistically indistinguishable from correlated
+  noise, not recoverable structure a higher rank could capture. Separately,
+  a full DMD+OU generative fidelity check
+  (`notebooks/07_dmd_ou_generative_check.py`) first exposed a real bug:
+  sampling each DMD mode's OU residual independently ignores that exact
+  DMD on real data produces algebraically exact conjugate mode pairs,
+  making the generated signal comparably imaginary as real
+  (`imag_real_ratio_mean` ≈0.93-1.04 at every rank) rather than safely
+  real-with-noise. Fixed by modeling only the shared magnitude
+  ($|\eta_k(t)|=|\eta_{k'}(t)|$ always, in log space) stochastically per
+  conjugate pair, with phase held deterministic at the mode's own
+  frequency — automatically conjugate-exact by construction, verified to
+  ≈1e-17 (machine precision) at every rank on the real 35,712-dimensional
+  core. This also closes `docs/open_questions.md` §5.2's long-open
+  "specific procedure" question for conjugate-pair sampling (production
+  port to `weather/simulate.py` remains task 9's job). After the fix,
+  spectral match keeps improving to `r_dmd≈150` then plateaus, while the
+  marginal-distribution match (KS) bottoms out around `r_dmd=50-80` and
+  degrades again by `200` — plausibly `cond(Φ)`'s known rise across this
+  range destabilizing the generative step numerically, a second,
+  independent reason (not yet confirmed) to prefer a moderate rank over
+  the top of the tested range. All four scripts ran entirely locally
+  against the already-cached core; no VM or Azure budget spent.
+
+- **2026-09-19 — Researched what real physics-based ocean/atmosphere
+  forecast models do, to interpret task 07's "no elbow found" DMD result
+  — `docs/open_questions.md` §5.3, `tasks/07-tucker-dmd-rank-selection.md`
+  §7.** Operational wave models (WAVEWATCH III/SWAN/WAM) solve the
+  phase-averaged spectral wave action balance equation, not Navier-Stokes
+  — true NS/Boussinesq/RANS models are 10-200x more expensive and
+  restricted to local/regional, minutes-to-days use, never basin-scale
+  multi-day forecasting, so this project's Tucker/DMD approach is in the
+  same statistical/spectral family as real operational practice, not a
+  simplification of a "more correct" method. Atmospheric predictability
+  has a hard, chaos-imposed ceiling around two weeks (operational wave
+  forecasts run 5-7.5 days out); past that horizon, poor skill is
+  provably not a model-quality problem, which reframes the ~1287-mode
+  requirement found in the previous entry as plausibly real deterministic
+  structure up to some horizon plus an irreducibly chaotic remainder no
+  rank fixes. Flagged (not actioned) one concrete lead: swell is far more
+  predictable than local wind-sea, so separating the two before
+  Tucker/DMD — analogous to climatology removal — could concentrate more
+  learnable structure into DMD and leave a cleaner residual for OU. Also
+  confirmed the DMD+OU split itself matches real operational practice
+  (SPPT/SKEB stochastic parameterization; OU-modeled EOF/mode-amplitude
+  autocorrelation in stochastic climate models), not a bespoke design
+  choice. Full source list (20+ papers/references, grouped by topic) in
+  the task doc.
+
+- **2026-09-18 — Task 07's DMD half: ran the first `r_dmd` sweep against a
+  real Gaussianized core under placement (ii); no elbow found, but settled
+  whether climatology removal is the cause (it isn't) —
+  `docs/open_questions.md` §5.3, `tasks/07-tucker-dmd-rank-selection.md`
+  §6.** Swept `r_dmd \in \{5,...,200\}` on the 20%-rank era-2 Tucker core
+  (`notebooks/07_dmd_rank_sweep.py`, copula and DMD both fit train-only on
+  an 80/20 split to avoid leaking the holdout period into the copula's
+  LUT): no growing modes anywhere, `cond(Phi)` climbing smoothly
+  2.2→227 with no sharp knee, and a corrected one-step-ahead error flat at
+  ~99% across the whole range — meaning `docs/open_questions.md` §5.3's
+  2026-08-16 finding that `cond(Phi)` tracks held-out quality does not
+  clearly hold once DMD's own input has been Gaussianized (that finding
+  was established on a raw, non-Gaussianized core). Root-caused the flat
+  ~99% error to rank capacity: a POD/SVD of the same core shows only
+  31.32% of its variance captured by 200 of 1754 possible modes (90%
+  needs ~1287). Getting a trustworthy held-out metric took two failed
+  attempts, both silent/plausible-looking wrong numbers rather than
+  crashes — worth a look in the task doc if revisiting this sweep.
+  Tested directly whether this is an artifact of removing climatology
+  before Tucker/DMD (`notebooks/07_dmd_climatology_only_check.py`,
+  projecting `ClimatologyRemover`'s fitted signal alone through the same
+  Tucker factors): needs only 3 modes for 90% of its own variance, and
+  DMD at `r_dmd=6` recovers the exact 365.3-day/182.6-day annual/
+  semi-annual periods at 0.07% error — confirming climatology genuinely
+  is the low-rank part of the signal, but arguing *against* putting it
+  back into DMD's input, since that structure is already captured exactly
+  and cheaply by the harmonic fit, and the anomaly's own high rank
+  requirement wouldn't shrink just because an unrelated low-rank
+  component sits alongside it. **Decision: climatology removal stays
+  exactly where it is.** `r_dmd` itself remains undecided — this sweep
+  was never memory/cost-bound (unlike Tucker's), so extending past 200 is
+  cheap and a natural next step.
+
+- **2026-09-13 — Reversed the Gaussianization-placement decision
+  (`docs/open_questions.md` §4.1): placement (ii) — Tucker on
+  climatology-removed/standardized anomalies, Gaussianize the Tucker core,
+  before DMD — supersedes the 2026-08-19 placement (i) default.** Task 07's
+  era-2 cloud rank sweep ran the task-07-derived i-vs-ii comparison that
+  both the 2026-08-19 decision and `tasks/00-gaussianization-placement.md`
+  had left as deferred follow-on work: same Tucker rank (31,72/5%) under
+  each placement gave `err_pct` 50.81% (i) vs. 53.04% (ii) — statistically
+  indistinguishable, contradicting the linear-rank-inflation hypothesis
+  that motivated re-testing this (per-cell Gaussianization provably
+  preserves rank/copula dependence by Sklar's theorem, but not the
+  linear/Pearson structure Tucker actually optimizes against). Placement
+  (ii) is adopted anyway, on architectural grounds: Tucker stays in
+  physically-grounded log-energy anomaly space, and Gaussianization moves
+  to sit immediately before DMD, the one stage that actually needs
+  Gaussian innovations, rather than broadly upstream of a stage that
+  doesn't benefit from it. `docs/open_questions.md` §4.1,
+  `docs/gaussian_copula_and_marginals.md` §6.1,
+  `tasks/00-gaussianization-placement.md`, `tasks/07-tucker-dmd-rank-
+  selection.md` §5, and `tasks/README.md` updated accordingly.
+
+- **2026-09-13 — Fixed a near-zero-variance division blow-up in
+  `PerCellStandardizer` (`src/train/standardize.py`), found while running
+  the placement (ii) comparison above.** A handful of cells (intermittently
+  ice-covered, near-constant through most of the 2-year fit window) got a
+  fitted `sigma_cell_` numerically near zero; dividing by it at transform
+  time produced values up to `~1e15` (verified: 21 of 500,773 era-2 ocean
+  cells, 322 cell-timesteps total). Previously invisible because placement
+  (i)'s `GaussianCopula.transform` clips every value into a bounded
+  quantile range downstream, silently absorbing the blow-up — placement
+  (ii) feeds standardized anomalies straight to Tucker with no such
+  clamp, so it's the first place this ever surfaced. Fixed by flooring the
+  divisor to `1.0` below a `1e-6` threshold inside `transform`/
+  `inverse_transform` only (`_floored_divisor`) — deliberately **not**
+  applied to the stored `sigma_cell_` itself, since
+  `weather.model._log_trend_significance` separately consults the true
+  fitted sigma to flag exactly these low-variance/high-trend cells, and
+  flooring the stored attribute would defeat that diagnostic. `NaN` (land)
+  cells are unaffected (`nan < eps` is `False`). 3 new tests added to
+  `tests/train/test_standardize.py`; full suite (176 tests) and
+  `mypy --strict` green.
+
+- **2026-09-13 — Task 07 era-2 rank sweep: 20% rank (124,288) working
+  baseline (32.90% err) under the new placement (ii); found a practical
+  cost ceiling around 20-30% rank, final production rank deferred
+  (`tasks/07-tucker-dmd-rank-selection.md` §5).** On a 9-month,
+  multi-season era-2 window (2024-01-01 → 2024-10-01, `T=2192`,
+  621×1440 grid) — a materially harder case than the single-season crop
+  task 07 concluded on earlier (§4 below) — swept 5% (31,72, 53.04% err)
+  and 20% (124,288, 32.90% err) to completion under placement (ii).
+  Per-iteration cost scaled mildly between them (2.3x time for a 4x
+  per-mode rank increase), but two independent 30-40%-rank attempts (one
+  under each placement) were each killed after 11-11.5 hours with **zero**
+  completed checkpoints — a real cost cliff, not a memory ceiling this
+  time (peak RSS stayed well under the VM's cap throughout), likely
+  because `randomized_svd`'s efficiency assumption (target rank small
+  relative to the matrix dimension) stops holding around 30-40% of a 1440-
+  cell dimension. 20% is recorded as the current working baseline, not a
+  final answer; deciding a production rank is deferred pending more
+  compute budget (the Azure subscription funding these runs had ~$59.62
+  in credit remaining as of 2026-09-13, expiring 2026-09-29) or a
+  cheaper/faster Tucker fitting approach able to actually reach 30-40%
+  for a fair comparison.
+
 - **2026-08-20 — Closed task 07 (`tasks/07-tucker-dmd-rank-selection.md`,
   `docs/open_questions.md` §5.3): full Tucker rank sweep on real
   `wsh`/`wsp` under task 17's corrected mask finds no elbow — memory, not
