@@ -809,5 +809,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **2026-11-21 — `structlog` runtime dependency (`>=26.1.0,<27.0.0`)** —
+  `pyproject.toml`, `poetry.lock`. Added ahead of use: nothing imports it
+  yet. It backs the planned `src/core/logger.py` (AGENTS.md *Logging*),
+  which will be created together with migrating the three training-path
+  `print(..., file=sys.stderr)` calls. Matches the structlog logger used
+  in the radiologists preprocessing pipeline.
+
 - Repo scaffolding: `pyproject.toml` (Poetry, black, isort, mypy config),
   `.gitignore`, `README.md`.
