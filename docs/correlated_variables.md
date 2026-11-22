@@ -858,6 +858,162 @@ This is exactly the scale and place both `tucker_decomposition.md` §4.4 and
 future cross-variable mechanism to live, if one were ever specified — this
 section is that specification.
 
+### 4.4 Validating a group: the tau test, correlated noise, and what independent fits lose
+
+§5 describes qualitatively what a good joint fit should show. This section
+makes it measurable. It does so by recognizing §4.2's joint regression for
+what it is in the climate literature (§7): a **Linear Inverse Model** (LIM,
+Penland & Sardeshmukh 1995), whose eigenmodes are Hasselmann's Principal
+Oscillation Patterns (POPs). Exact DMD's operator $A^{\mathcal V}$ is LIM's
+lag-one propagator estimated in a truncated basis, and DMD plus the
+mode-level OU stage (`ornstein_uhlenbeck_processes.md` §4.2) is a LIM whose
+stochastic forcing has been assumed independent across modes. LIM brings
+diagnostics this pipeline did not have.
+
+**Reduced coordinates.** Full covariance matrices are only estimable when
+the state dimension is well below the number of snapshots $T$. Each
+member's Gaussianized core is therefore reduced to its leading $r_v$
+principal components (method of snapshots on the time-centred core), and
+the group state is their concatenation
+
+$$
+z_t = \begin{pmatrix} z_t^{(v_1)} \\ \vdots \\ z_t^{(v_g)} \end{pmatrix} \in \mathbb R^{n},
+\qquad n = \sum_v r_v,
+$$
+
+keeping one block per member, so that every metric below can be attributed
+to a variable. Rule of thumb: $T \gtrsim 10\,n$. The fraction of each
+member's core variance retained by its $r_v$ components is the first
+"information lost" number, the **truncation loss**.
+
+**LIM fit.** With lagged covariances $C(\tau) = \langle z_{t+\tau}
+z_t^\top\rangle$ and a training lag $\tau_0$ (default one archive step,
+3 h):
+
+$$
+G(\tau_0) = C(\tau_0)\,C(0)^{-1}, \qquad
+L = \frac{\ln G(\tau_0)}{\tau_0}, \qquad
+Q = -\big(L\,C(0) + C(0)\,L^\top\big),
+$$
+
+the last being the fluctuation–dissipation relation of a stationary
+multivariate OU process $dz = L z\,dt + dW$, $\langle dW\,dW^\top\rangle =
+Q\,dt$. In discrete time at the training lag, $z_{t+\tau_0} = G(\tau_0) z_t
++ \varepsilon_t$, and $\Sigma(\tau_0)$ is the empirical covariance of the
+regression residuals $\varepsilon_t$.
+
+**Correlated noise (specification).** Within a group, stochastic forcing is
+drawn as **one joint Gaussian vector** with covariance $\Sigma(\tau_0)$, not
+as independent per-mode or per-variable draws, for two reasons:
+
+1. **Co-movement.** The off-diagonal blocks of $\Sigma$ carry noise
+   co-movement between members (for example, a gust burst that hits wind
+   and wind-sea in the same step). Independent draws discard it.
+2. **Conjugate pairs.** Noise drawn in real coordinates and projected onto
+   the DMD modes is conjugate-symmetric by construction, so it composes
+   with the conjugate-pair procedure of `open_questions.md` §5.2.
+
+$Q$ must be positive semidefinite. A negative eigenvalue means the
+linear-Markov model is internally inconsistent at this $\tau_0$: either
+nonlinearity, or $\tau_0$ near half the period of a resolved oscillation
+(the "Nyquist problem", Penland 2019). The production sampler port belongs
+to the `weather/simulate.py` rewrite. Until then,
+`train.linear_inverse.simulate_lim` is the reference implementation.
+
+**Tau test (goodness of fit of the linear-Markov assumption).** If $z$ really
+is a multivariate OU process, $L$ does not depend on the lag it was
+estimated at, and $G(\tau) = e^{L\tau}$ at every lag. Fit at $\tau_0$ and,
+for test lags $\tau$ (for example 1–16 steps, up to two days), report:
+
+- **operator drift** $\lVert L(\tau) - L(\tau_0)\rVert_F / \lVert
+  L(\tau_0)\rVert_F$, with $L(\tau) = \ln G_{\text{obs}}(\tau)/\tau$ and
+  $G_{\text{obs}}(\tau) = C(\tau)C(0)^{-1}$;
+- **propagator error** $\lVert e^{L\tau} - G_{\text{obs}}(\tau)\rVert_F /
+  \lVert G_{\text{obs}}(\tau)\rVert_F$;
+- **error-variance ratio**: the observed mean squared error of forecasting
+  $z_{t+\tau}$ by $e^{L\tau} z_t$, divided by the LIM's own predicted
+  forecast-error variance $\operatorname{tr}\big(C(0) - e^{L\tau} C(0)
+  e^{L^\top\tau}\big)$. It is about 1 when the model is right. Above 1, the
+  model is overconfident: the data decorrelate faster than the
+  $\tau_0$ fit implies. Below 1, it is underconfident: the data stay
+  predictable longer than the fit implies, typically because fast,
+  non-Markov variability at $\tau_0$ makes the dynamics look more damped
+  than they are, hiding slower memory.
+
+No universal threshold exists. Set the baseline by parametric bootstrap:
+simulate series of the same length from the fitted LIM itself
+(`simulate_lim`), rerun the tau test on them, and take the envelope
+(minimum to maximum) of those replicates as the band. This is the same
+logic as task 07's surrogate test. `model_design.md` §5.6.2 explains why an
+envelope rather than percentiles, and how to read a flagged lag.
+
+**Information lost by independent fits.** All quantities are Gaussian and
+measured in nats per $\tau_0$ step:
+
+- **Deterministic coupling**, per member $v$:
+  $\tfrac12 \ln\big(\det\Sigma_v^{\text{ind}} / \det\Sigma_v^{\text{joint}}\big)$,
+  where $\Sigma_v^{\text{ind}}$ is the residual covariance of regressing
+  $v$'s future on $v$'s own present only, and $\Sigma_v^{\text{joint}}$ is
+  the $v$ block of the joint residual covariance. This is half of Geweke's
+  (1982) Granger-causality measure, which for Gaussian processes equals the
+  transfer entropy from the other members into $v$ (Barnett, Barrett &
+  Seth 2009). It is the quantity §5's "regress the independent fit's
+  residuals on the other variables" diagnostic estimates. Each member's
+  one-step $R^2$, joint versus independent, gives the same comparison in
+  variance terms.
+- **Stochastic coupling**: $I_{\text{noise}} = \tfrac12\big(\sum_v \ln\det
+  \Sigma_{vv} - \ln\det\Sigma\big)$, the multi-information of the joint
+  innovations across members, which is exactly what independent
+  per-variable noise throws away. A pairwise version is reported for every
+  two members.
+
+Finite-sample estimates of both are biased upward, so their baseline is an
+**independence null**: fit each member's own LIM, assemble them into a
+block-diagonal model with no cross-member dynamics or noise, simulate it,
+and take the maximum coupling information over the replicates. A group
+whose deterministic and stochastic coupling information both stay within
+that null gains nothing from joint fitting. This is the empirical criterion
+`open_questions.md` §3.2 asks for.
+
+Implementation: `src/train/linear_inverse.py` (`group_pcs`, `fit_lim`,
+`tau_test`, `group_coupling_report`, `simulate_lim`). Inputs follow the
+canonical time-first convention, with each member's core shaped
+`(T, r_lat, r_lon)`, unlike §4.2's illustrative snippet. `diagnose_group`
+runs all of it with both bootstrap baselines as an explicit training stage:
+`model_design.md` §5.6.2.
+
+**First application (2026-11-21): single-member tau test on the production
+`wsh` core.** `notebooks/07_lim_tau_test_wsh_core.py` ran this on task 07's
+40% Gaussianized core (era 2, 2024-01 to 2024-09, $T=2192$) through the
+pipeline stage `diagnose_group` (`model_design.md` §5.6.2): $\tau_0 = 3$ h,
+envelopes from 100 bootstrap replicates. With only one variable there is no
+group, so this measures goodness of fit only, not coupling. Each cell gives
+the real value, then the bootstrap max or [min, max] in brackets.
+
+| PCs kept | Variance retained | Drift, 6 h | Ratio, 6 h | Ratio, 12 h | Ratio, 48 h |
+|---|---|---|---|---|---|
+| 20 | 3.3% | 0.23 (0.05) | 0.92 [0.99, 1.02] | 0.70 [0.99, 1.02] | 0.85 [0.97, 1.03] |
+| 100 | 11.4% | 0.53 (0.22) | 0.93 [0.99, 1.00] | 0.85 [0.97, 0.98] | 0.85 [0.90, 0.93] |
+
+Every lag from 6 h to 48 h is flagged at both ranks: by the error-variance
+ratio at every lag, and by operator drift at 6–12 h (20 PCs) and 6 h
+(100 PCs). $Q$ stayed positive definite and $\ln G$ real, so the fit is
+internally consistent at $\tau_0$, but it fails the tau test from the very
+next lag. At 100 PCs even the bootstrap's own ratio drifts below 1 at long
+lags (0.90–0.93 at 48 h). That is finite-sample bias for a 100-dimensional
+LIM on $T=2192$, and the reason the band must come from same-length
+replicates rather than the ideal value 1.
+The error-variance ratio below 1 says the core stays predictable for longer
+than a 3-hour linear-Markov fit implies: fast variability at the 3 h step
+masks slower memory. At 100 PCs the LIM is essentially production DMD's
+reduced operator (`r_dmd = 100`), so this applies to the production fit.
+Beyond about 12 h, operator drift loses discriminating power even in the
+bootstrap, because strongly damped modes leave $G(\tau)$ near the noise
+floor, so the error-variance ratio is the metric to read there. Candidate
+responses, none tested yet: a longer training lag ($\tau_0$ = 6–12 h),
+time-delay (Hankel) DMD (`train.dmd.dmd_fit(variant="hankel")`), or
+treating the fast component explicitly as noise.
+
 ---
 
 ## 5. Results: what a correctly joint-fit operator should show
@@ -907,7 +1063,9 @@ independent fit's wind-sea-mode OU residuals against lagged wind-mode DMD
 amplitudes — non-trivial explanatory power there is direct evidence of
 exactly the cross-variable structure the independent design has no
 mechanism to absorb, and that a correctly joint-fit $A^{\mathcal V}$
-should instead have already captured in its off-diagonal blocks.
+should instead have already captured in its off-diagonal blocks. §4.4's
+deterministic-coupling information is the quantitative form of this
+diagnostic.
 
 **Rank/data tradeoff, as a diagnostic to watch.** Because $n_{\mathcal V}$
 is the *sum* of the group's members' ranks, $r_{\text{dmd}}^{\mathcal V}$
@@ -1146,3 +1304,91 @@ available $T$ can support (§6).
   `open_questions.md` §4.1 (Gaussianization placement) has already been
   left explicitly unresolved pending equivalent empirical validation,
   rather than decided by argument alone.
+
+---
+
+## 7. Related literature
+
+Compiled 2026-11-21 from a targeted literature search. Entries with links
+were checked in that search; entries without links are standard references
+cited from memory and were not re-verified.
+
+**No published Lotka–Volterra model of wave energy was found.** The search
+returned only biological predator–prey models in which waves act as a
+forcing. §2.2's use of Lotka–Volterra is therefore a structural analogy
+only, as §2.4 already concludes.
+
+**Low-order physical models of wind sea and swell**
+
+- Hasselmann et al. (1976), *A parametric wave prediction model*, J. Phys.
+  Oceanogr. A wind-sea spectrum described by a few parameters evolved by
+  ODEs: the published ancestor of §2.3's reduced system.
+- [Günther & Rosenthal (1979), JGR 84(C8)](https://pure.mpg.de/pubman/item/item_2514728_2/component/file_3218660/JC084iC08p04855.pdf),
+  and the HYPA "coupled hybrid" model (Günther, Rosenthal & Dunckel 1979).
+  The wind sea is parametric and the swell is propagated along
+  characteristics with zero local source, with explicit energy transfer
+  from wind sea to swell and back. This is the closest published analogue
+  of a two-box wind-sea/swell model. Third-generation models replaced it
+  because the wind-sea spectral shape had to be prescribed, not because
+  the coupling was wrong ([ECMWF wave model documentation](https://www.ecmwf.int/sites/default/files/elibrary/2020/Part-VII-ECMWF_Wave_Model.pdf);
+  [2025 review](https://arxiv.org/pdf/2511.21856)).
+- [Ardhuin, Chapron & Collard (2009), GRL](https://arxiv.org/abs/0809.2497)
+  and [Collard, Ardhuin & Chapron (2009), JGR](https://data-ww3.ifremer.fr/BIB/Collard_etal_JGR2009.pdf).
+  Swell energy decays exponentially with distance, with e-folding scales
+  from about 2,800 km (steep swell) to more than 20,000 km, and about
+  3,300 km for 15 s swell. Consequence for this pipeline: wind-sea/swell
+  coupling is non-local, with swell at a cell generated thousands of km
+  away days earlier. A per-cell ODE cannot represent it; jointly fit
+  spatial DMD modes can.
+
+**Data-driven stochastic mode equations**
+
+- Hasselmann (1988), *PIPs and POPs*, JGR; von Storch et al. (1988).
+  Principal Oscillation Patterns: eigenmodes of a fitted multivariate
+  linear propagator, the direct ancestor of DMD modes.
+- Penland & Sardeshmukh (1995), *The optimal growth of tropical sea surface
+  temperature anomalies*, J. Climate. The Linear Inverse Model: $dz = Lz\,dt
+  + dW$ fit from lagged covariances, the tau test, and fluctuation–
+  dissipation. See [Penland (2019) on the Nyquist issue](https://repository.library.noaa.gov/view/noaa/28158/noaa_28158_DS1.pdf)
+  and the [ECMWF overview of the linear stochastically forced framework](https://www.ecmwf.int/sites/default/files/elibrary/2010/12091-global-climate-diagnosis-linear-stochastically-forced-framework.pdf).
+  §4.4 adopts this framework.
+- Kravtsov, Kondrashov & Ghil (2005), J. Climate
+  ([preprint](https://research.aos.ucla.edu/dkondras/tcd/PREPRINTS/KKG_EMR.pdf)),
+  and [Kondrashov, Kravtsov & Ghil (2006), J. Atmos. Sci.](https://dept.atmos.ucla.edu/tcd/publications/empirical-mode-reduction-model-extratropical-low-frequency-variability).
+  Empirical Model Reduction extends LIM with quadratic mode–mode terms
+  (the Lotka–Volterra-like bilinear structure) and multilevel red noise,
+  and reproduced the non-Gaussian statistics of a 45-variable
+  quasi-geostrophic model. Comparative study:
+  [Strounine et al.](https://hal-polytechnique.archives-ouvertes.fr/hal-01139724).
+  It is the natural next step if §4.4 shows the linear joint model missing
+  non-Gaussian co-occurrence. Its cost: about $n^2/2$ quadratic terms per
+  equation, so it is only feasible for small groups in a reduced basis with
+  regularization.
+- Brunton, Proctor & Kutz (2016), *Discovering governing equations from data
+  by sparse identification of nonlinear dynamical systems*, PNAS. SINDy has
+  no wind–wave application found, but could test whether §2.3's terms
+  ($U^2E$, $E^{3/2}$) appear in the data.
+
+**Information measures used in §4.4**
+
+- Geweke (1982), J. Amer. Statist. Assoc.: multivariate Granger-causality
+  measure $\ln(\det\Sigma_{\text{restricted}}/\det\Sigma_{\text{full}})$.
+- Barnett, Barrett & Seth (2009), Phys. Rev. Lett.: Granger causality and
+  transfer entropy are equivalent for Gaussian variables (transfer entropy
+  equals half of Geweke's measure).
+
+**Metocean engineering practice (single-point models)**
+
+- [Monbet, Ailliot & Prevosto (2007), Probabilistic Engineering Mechanics 22(2)](https://archimer.ifremer.fr/doc/00000/2679):
+  survey of stochastic models for wind and sea-state series at 1–6 h steps
+  (Gaussian transforms, resampling, autoregressive models).
+- [Ailliot & Monbet (2012), Environmental Modelling & Software](https://hal-univ-rennes1.archives-ouvertes.fr/hal-01083071):
+  Markov-switching autoregressive models with hidden weather regimes. A
+  [joint wind-speed/wave-height variant](https://ore.exeter.ac.uk/repository/handle/10871/121449?show=full)
+  exists (authors not confirmed).
+- [Obakrim et al. (2023), ASCMO 9](https://ascmo.copernicus.org/articles/9/67/2023):
+  statistical transfer from North Atlantic wind fields to significant wave
+  height at individual sites.
+
+These all work at a single location. This pipeline's full-field,
+mode-based approach is closer to LIM and POP than to any of them.

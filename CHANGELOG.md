@@ -35,6 +35,60 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - **Not ported.** 120-char lines, Google docstrings, `uv`/`make`, `src.`
     imports, the API/database/clinical layers.
 
+- **2026-11-21 — Linear-inverse-model diagnostics for correlated-variable
+  groups as an explicit training-pipeline stage: tau test, correlated
+  noise, information lost by independent fits** — `src/train/linear_inverse.py`
+  (new; `group_pcs`, `fit_lim`, `tau_test`, `group_coupling_report`,
+  `simulate_lim`, and the stage function `diagnose_group` with
+  `diagnostics_summary`; `tests/train/test_linear_inverse.py`, 21 tests),
+  `docs/model_design.md` §4 diagram and properties, §5.6.2 (new), §7, §8.5,
+  §8.6 Cell 7b, `docs/correlated_variables.md` §4.4 (new) and §7 (new,
+  related literature), `docs/open_questions.md` §3.2 update,
+  `notebooks/07_lim_tau_test_wsh_core.py` (new), `AGENTS.md` (Task Mapping
+  row, training-architecture paragraph, module-layout entry).
+  - **Pipeline stage.** `diagnose_group` runs once per variable group on the
+    Gaussianized cores DMD consumes, judging the tau test against an
+    envelope of LIM-simulated replicates and the coupling metrics against
+    an independence null (block-diagonal LIM). Results are stored on the
+    model (`group_diagnostics_`, persisted as `group_diagnostics.json` +
+    `lim_<group>.npz`) and logged, and never alter or gate the fit.
+    `WeatherModel` gains `groups`, `lim_rank`, `tau_test_lags` and
+    `n_bootstrap` hyperparameters in the handoff; wiring them in is part of
+    the pending `model.py` rewrite.
+  - **Bands are bootstrap envelopes, not percentiles.** The first draft used
+    5th/95th percentiles. With 10 replicates, a true OU process failed its
+    own 6 h tau test (ratio 1.003 against [0.995, 1.002]; 100 replicates
+    give [0.995, 1.006]), and a nominal 90% band flags a perfect model on
+    at least one of four lags about half the time. The envelope's
+    false-alarm rate is 2/(n+1), about 3% per lag at the default n = 100.
+    The stage tests therefore run at n = 100, on 10,000-step series.
+  - **Memory fix.** `group_pcs` always formed the T × T Gram matrix, which
+    is 20 GB for a 50,000-step, low-dimensional series and was killed by
+    the OOM killer. It now decomposes whichever of the Gram or covariance
+    matrix is smaller.
+  - **Framework.** A literature search found no Lotka–Volterra model of wave
+    energy, but found that §4.2's joint-group DMD is a Linear Inverse Model
+    (Penland & Sardeshmukh 1995; POPs, Hasselmann 1988). LIM brings the tau
+    test (lag invariance of the fitted operator) and fluctuation–dissipation
+    noise covariance.
+  - **Specification.** Within-group stochastic forcing is now specified as
+    one jointly correlated Gaussian draw, not independent per-mode or
+    per-variable draws. The production sampler port is deferred to the
+    `weather/simulate.py` rewrite.
+  - **Metrics, in nats per step.** Granger/transfer entropy into each member
+    (what an independent fit's dynamics lose) and the multi-information of
+    the joint innovations (what independent noise loses), plus each
+    member's truncation loss.
+  - **First result.** Run through `diagnose_group` with 100 replicates, the
+    production `wsh` 40% core fails the tau test at every lag from 6 h to
+    48 h at both 20 and 100 PCs. Its error-variance ratio of 0.70–0.93,
+    against bootstrap envelopes near 1, means the core stays predictable
+    longer than a 3 h linear-Markov fit implies, because fast 3 h
+    variability masks slower memory. The 100 PCs retain only 11.4% of the
+    core's variance. Since this LIM is essentially production DMD's reduced
+    operator, the finding applies to the `r_dmd = 100` fit. Candidate
+    responses (longer training lag, Hankel DMD) are untested.
+
 - **2026-09-29 — Closed task 07: Tucker rank decided as 40% (248, 576),
   production copula + DMD (`r_dmd=100`) fit on the full 40% core, Azure
   VM infrastructure torn down** — `notebooks/07_placement2_tucker_on_anomalies.py`

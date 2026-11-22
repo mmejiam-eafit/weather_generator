@@ -68,7 +68,13 @@ review.
 - **Decomposition + stochastic model** (`train/tucker.py`, `train/dmd.py`,
   `train/local_residual.py`) — pure functions taking arrays + hyperparameters,
   returning frozen dataclasses (`TuckerFit`, `DMDFit`, `ModeOUFit`,
-  `LocalResidualFit`). Not transformers.
+  `LocalResidualFit`). Not transformers. Alongside it, the **group dynamics
+  diagnostics** stage (`train/linear_inverse.py`, §5.6.2): `diagnose_group`
+  runs once per variable group on the Gaussianized cores DMD consumes, and
+  returns a `GroupDiagnostics`. It holds a tau test of the linear-Markov
+  assumption and the coupling information an independent fit loses, each
+  judged against a bootstrap envelope. Results are stored on the model and
+  logged; they never feed sampling or gate the fit.
 
 `weather.model.WeatherModel` inherits `BaseEstimator + TransformerMixin` and
 glues the two layers together. Sampling operations are **free functions** in
@@ -108,6 +114,7 @@ before changing the module. Section numbers without a file name refer to
 | `src/train/masked_tucker.py` | §5.5; `tasks/07-tucker-dmd-rank-selection.md` §5 | ✓ Exists — used by task 07 scripts only so far |
 | `src/train/masking.py` | `docs/variable_taxonomy.md` §3.3.1; task 17 | ✓ Exists — helper only, **not wired into production** |
 | `src/train/dmd.py` | §5.6, §5.6.1 | ✓ Exists |
+| `src/train/linear_inverse.py` | §5.6.2; `docs/correlated_variables.md` §4.4 | ✓ Exists — not yet wired into `WeatherModel.fit` (pending `model.py` rewrite) |
 | `src/train/local_residual.py` | §3.10, §5.7 | ✓ Exists |
 | `src/weather/model.py` | §7, §8.4, §8.5 | ✓ Exists |
 | `src/weather/simulate.py` | §5.8, §8.4 | ✓ Exists |
@@ -574,6 +581,7 @@ weather_generator/
 │   │   ├── masked_tucker.py             # partial_tucker_lowmem (vendored tensorly fix)
 │   │   ├── masking.py                   # Land mask + partition NaN-sentinel policy
 │   │   ├── dmd.py                       # dmd_fit, fit_mode_ou (pure functions)
+│   │   ├── linear_inverse.py            # group_pcs, fit_lim, tau_test, diagnose_group
 │   │   └── local_residual.py            # coherent_reconstruction, fit_local_residual
 │   └── weather/                         # Public API
 │       ├── __init__.py                  # Re-exports (see handoff §8.4)

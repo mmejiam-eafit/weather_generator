@@ -1,4 +1,4 @@
-git # Stochastic Weather Generator — Design Handoff (v2)
+# Stochastic Weather Generator — Design Handoff (v2)
 
 **Package:** `weather-generator` (Python, three sibling packages under `src/`: `core`, `train`, `weather`).
 
@@ -557,6 +557,14 @@ Three deterministic layers plus two stochastic layers.
    │   │      via pydmd.DMD (or BOPDMD variant)                 │       │
    │   │  fit_mode_ou  → ModeOUFit  (per-mode θ, σ, φ)          │       │
    │   └───────────┬────────────────────────────────────────────┘       │
+   │               │  same Gaussianized core(s) DMD consumed            │
+   │               ▼                                                    │
+   │   ┌────────── Group dynamics diagnostics (§5.6.2) ────────┐       │
+   │   │  diagnose_group → GroupDiagnostics, per group:         │       │
+   │   │      LIM fit, tau test, coupling information,          │       │
+   │   │      each judged against a bootstrap envelope          │       │
+   │   │  recorded + logged; never alters or gates the fit      │       │
+   │   └───────────┬────────────────────────────────────────────┘       │
    │               │  Z_coherent(s, t)                                  │
    │               ▼                                                    │
    │   ┌────────── Local residual (§5.7, new in v2) ───────────┐       │
@@ -605,6 +613,7 @@ Three deterministic layers plus two stochastic layers.
 - The preprocessing chain is one sklearn `Pipeline`. Its `inverse_transform` is the same object as its `transform` — no duplicated inverse logic.
 - Sampling is composed of two independent stochastic contributions: coherent (via ~100 mode-OU) and local (via `N_ocean × V` cell-OU). Both use closed-form OU transitions — no discrete stepping needed for point queries.
 - `WeatherModel.transform(X)` runs *only* the preprocessing Pipeline and returns Gaussianized anomalies at native grid resolution. Not `Z_coherent`, not `Z_local`. Consumers who want those get them from the fitted attributes directly.
+- Group dynamics diagnostics (§5.6.2) are a training stage whose results are stored on the model and logged, but never feed sampling. A failed tau test or significant coupling is input to the next modeling decision, not an error.
 
 ---
 
@@ -1050,6 +1059,105 @@ class ModeOUFit:
     dt:    float
 ```
 
+#### 5.6.2 Group dynamics diagnostics: linear inverse model, tau test, coupling information
+
+Lives in `train/linear_inverse.py`. The math, interpretation and literature
+are in `correlated_variables.md` §4.4 and §7; this section fixes where the
+stage sits and what it records.
+
+**What it answers.** DMD plus mode-level OU (§5.6, §5.6.1) is a linear
+regression of each Δt step on the previous one, with Gaussian noise. Read
+that way it is a Linear Inverse Model (LIM), which comes with checks this
+pipeline lacked. The stage runs once per variable group and records two
+answers on the model:
+
+1. **Goodness of fit.** Does a first-order linear model with Gaussian noise
+   hold at Δt? This is the tau test: the operator fitted at 3 h must
+   predict the 6–48 h behaviour.
+2. **Information lost.** What would fitting the group's members
+   independently throw away? This is Granger information (transfer entropy)
+   into each member and the mutual information of the joint innovations,
+   in nats per step.
+
+**Where.** Immediately after the cores DMD will consume exist, on the same
+Gaussianized cores: after each variable's own Tucker fit and the copula on
+its core (placement ii, `open_questions.md` §4.1; per-variable Tucker,
+`tucker_decomposition.md` §4.1). §5.5's joint ocean×variable Tucker is
+superseded on that point. This stage is specified against per-variable
+cores.
+
+**Groups.** The `groups` hyperparameter maps a group name to its member
+variables. `None` means one single-member group per modeled variable,
+which gives a tau test only, since coupling is zero by construction.
+Candidate multi-member groups are in `correlated_variables.md` §4.1.
+
+```python
+for name, members in groups.items():
+    group_diagnostics[name] = diagnose_group(
+        cores={v: gaussianized_core[v] for v in members},  # (T, r_lat, r_lon) each
+        ranks={v: lim_rank for v in members},
+        dt=window_era.cadence_seconds,
+        test_lags=list(tau_test_lags),
+        n_bootstrap=n_bootstrap,
+        rng=rng,
+    )
+```
+
+**Defaults.**
+
+| Parameter | Default | Reason |
+|---|---|---|
+| `lim_rank` | 20 PCs per member | A full-covariance fit needs T ≥ 10 n, where n is the total PCs in the group; the stage warns when that fails. |
+| `tau_test_lags` | `(1, 2, 4, 8, 16)` | 3 h to 48 h. |
+| `n_bootstrap` | 100 | Sets the envelope's coverage, below. |
+| training lag | 1 step | The lag DMD itself uses. |
+
+**Output.** A `GroupDiagnostics` per group with these fields:
+
+- `explained_variance`: core variance retained by each member's PCs (truncation loss)
+- `lim`: the `LIMFit` (operator, noise covariance, consistency flags)
+- `tau`, `drift_upper`, `ratio_band`, `tau_consistent`: the tau test, its bands and per-lag verdicts
+- `coupling`, `granger_null_upper`, `noise_mi_null_upper`, `coupling_significant`, `noise_coupling_significant`: coupling information against an independence null
+
+`diagnostics_summary` renders one group as text for the log and the
+notebook.
+
+**Bands.** Each band is the envelope (minimum to maximum) of `n_bootstrap`
+parametric-bootstrap replicates as long as the training window:
+
+- **Tau test**: replicates simulated from the fitted LIM, the null "the
+  linear-Markov model is right".
+- **Coupling**: replicates from a block-diagonal LIM fit member by member,
+  the null "members are independent".
+
+Under exchangeability, a correct model lands outside a two-sided envelope
+with probability 2/(n+1), about 3% per lag at n = 100, combining the
+two-sided ratio check with the one-sided drift check. Interpolated
+5th/95th percentiles were rejected: they are noisy at this replicate count,
+and their nominal 10% false-alarm rate compounds across lags. One flagged
+lag is weak evidence. Flags across consecutive lags, or values far outside
+the band, are the signal. The training lag itself is the fit, not a test,
+and always reads as consistent.
+
+**Never gates or alters the fit.** The production `wsh` core already fails
+the tau test from 6 h onward (`correlated_variables.md` §4.4, "First
+application"), so a hard gate would block every fit. The diagnostics are
+evidence for the decisions they inform: the training lag, `variant="hankel"`
+(§5.6), and group membership (`open_questions.md` §3.2). They also
+complement the held-out checks of §6. They are in-sample, and they measure
+the regression's assumptions rather than the samples.
+
+**Correlated noise.** Within a multi-member group, stochastic forcing is
+specified as one joint Gaussian draw with the group's innovation covariance
+(`correlated_variables.md` §4.4). That change is ported to the sampler with
+the `weather/simulate.py` rewrite; `simulate_lim` is the reference
+implementation. This stage only estimates the covariance and measures what
+independent draws would lose.
+
+**Cost.** Dominated by one principal-component decomposition per member:
+the T × T Gram matrix, under a minute at production scale. The bootstrap
+adds two times `n_bootstrap` simulations in the small PC space.
+
 ### 5.7 Local residual OU field (new in v2)
 
 Lives in `train/local_residual.py`. This is the field-valued analog of the mode-level OU — one independent OU process per ocean cell per variable, fit to the coherent-reconstruction residual.
@@ -1267,8 +1375,12 @@ Directory layout — one dir per model version:
 ├── tucker.npz             # U_ocean, U_var, reconstruction_error
 ├── dmd.npz                # Phi, Lambda, b0, lam_cont, dt, variant
 ├── mode_ou.npz            # theta_mode, sigma_mode, phi_mode
-└── local_residual.npz     # theta_local, sigma_local, phi_local,
-                           # variance_ratio, active_mask
+├── local_residual.npz     # theta_local, sigma_local, phi_local,
+│                          # variance_ratio, active_mask
+├── group_diagnostics.json # per group (§5.6.2): members, variance retained, tau-test
+│                          # lags / drift / ratio / bands / verdicts, coupling nats,
+│                          # null bands and significance flags
+└── lim_<group>.npz        # per group: G, L, Q, C0, innovation_cov, lag, dt
 ```
 
 **Why pickle for the preprocessing Pipeline.** sklearn transformers pickle cleanly; joblib.dump is the sklearn-native persistence path. The pipeline state (climatology coefficients + copula LUT) is a few GB, manageable.
@@ -1445,6 +1557,7 @@ from sklearn.pipeline import Pipeline
 
 from train.tucker import TuckerFit
 from train.dmd import DMDFit, ModeOUFit
+from train.linear_inverse import GroupDiagnostics
 from train.local_residual import LocalResidualFit
 
 
@@ -1485,6 +1598,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         dmd_              : DMDFit
         mode_ou_          : ModeOUFit
         local_residual_   : LocalResidualFit  (None if include_local_residual=False)
+        group_diagnostics_: dict[str, GroupDiagnostics]  (group name -> §5.6.2 stage output)
         ocean_mask_       : np.ndarray, shape (721, 1440), bool
         metadata_         : ModelMetadata
     """
@@ -1504,6 +1618,10 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         trend_significance_threshold: float = 0.1,
         include_local_residual: bool = True,
         local_residual_variance_floor: float = 0.02,
+        groups: dict[str, list[str]] | None = None,      # None: one group per variable (§5.6.2)
+        lim_rank: int = 20,
+        tau_test_lags: tuple[int, ...] = (1, 2, 4, 8, 16),
+        n_bootstrap: int = 100,
         random_state: int | None = None,
     ) -> None:
         # sklearn convention: __init__ only stores parameters, no validation.
@@ -1520,6 +1638,10 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         self.trend_significance_threshold = trend_significance_threshold
         self.include_local_residual = include_local_residual
         self.local_residual_variance_floor = local_residual_variance_floor
+        self.groups = groups
+        self.lim_rank = lim_rank
+        self.tau_test_lags = tau_test_lags
+        self.n_bootstrap = n_bootstrap
         self.random_state = random_state
 
     # --- sklearn transformer surface ---------------------------------------
@@ -1538,6 +1660,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         dmd: DMDFit,
         mode_ou: ModeOUFit,
         local_residual: LocalResidualFit | None,
+        group_diagnostics: dict[str, GroupDiagnostics],
         ocean_mask: np.ndarray,
         metadata: ModelMetadata,
     ) -> Self: ...
@@ -1618,6 +1741,20 @@ Cell 6  — DMD at chosen Tucker. `variant="exact"` here — this cell reruns on
 Cell 7  — Mode OU fit against the chosen DMD.
           mode_ou = fit_mode_ou(core, dmd)
 
+Cell 7b — Group dynamics diagnostics (§5.6.2): tau test + coupling, per group.
+          group_diagnostics = {
+              name: diagnose_group({v: cores[v] for v in members},
+                                   ranks={v: 20 for v in members}, dt=DT,
+                                   test_lags=[1, 2, 4, 8, 16],
+                                   n_bootstrap=100, rng=rng)
+              for name, members in groups.items()
+          }
+          for diag in group_diagnostics.values():
+              print(diagnostics_summary(diag))
+          # NO across consecutive lags → revisit the training lag or try
+          # variant="hankel" before trusting DMD's multi-step behaviour.
+          # Coupling not significant → the group gains nothing from a joint fit.
+
 Cell 8  — Coherent reconstruction, then local residual fit (NEW in v2).
           Z_coherent = coherent_reconstruction(core, tucker_400, dmd, mode_ou)
           local = fit_local_residual(Z.to_numpy(), Z_coherent, dt=DT,
@@ -1630,6 +1767,7 @@ Cell 9  — Assemble WeatherModel; save.
               preprocess=preprocess,
               tucker=tucker_400, dmd=dmd, mode_ou=mode_ou,
               local_residual=local,
+              group_diagnostics=group_diagnostics,
               ocean_mask=ocean_mask, metadata=metadata,
           )
           model.save(Path("./models/v0.1.0"))

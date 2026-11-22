@@ -551,7 +551,20 @@ choice to be made empirically (e.g. by checking, per §5 of
 actually shows non-negligible off-diagonal coupling terms; if it doesn't,
 the group was drawn too widely for no benefit).
 
-### 3.3 Is the wind-direction/wind-sea-direction alignment equilibrium a stable node, as the scalar energy case is? — **ANSWERED HERE**
+**Update (2026-11-21): tooling for that check now exists.**
+`correlated_variables.md` §4.4 recasts the joint-group regression as a
+Linear Inverse Model and specifies the measurements:
+
+- a tau test of the linear-Markov assumption;
+- correlated within-group noise;
+- information lost by independent fits, measured in nats: Granger/transfer
+  entropy into each member, and the mutual information of the joint
+  innovations.
+
+These are implemented in `src/train/linear_inverse.py`. A candidate group
+whose coupling information is indistinguishable from a bootstrap baseline
+gains nothing from a joint fit. The question itself stays open until
+per-variable cores exist for a candidate group (only `wsh` has one so far)./wind-sea-direction alignment equilibrium a stable node, as the scalar energy case is? — **ANSWERED HERE**
 
 Raised in: `correlated_variables.md` §3.2 and §6 ("§3.2's directional-alignment
 ODE is illustrative, not fully stability-analyzed... left open").
