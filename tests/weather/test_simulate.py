@@ -225,3 +225,40 @@ def test_sample_batch_rejects_an_unmodeled_variable(fitted_tier1_model: WeatherM
 
     with pytest.raises(ValueError, match="not modeled"):
         sample_batch(model, np.array([lat]), np.array([lon]), np.array([_time64(model, 0)]), "wad")
+
+
+def test_sample_batch_at_grid_nodes_reproduces_simulate_field(
+    fitted_tier1_model: WeatherModel,
+) -> None:
+    """Query times form one trajectory: at a simulate_field window's nodes, same seed, same values.
+
+    Covers the channel chain across consecutive query times (§5.8 step 1),
+    `sample_batch`'s time chunking (20 times > its chunk of 8), and that
+    per-cell inverses, interpolation at a node and pointwise inverses
+    reproduce the full Pipeline inverse. Nodes (3, 2) and (4, 1) have no land
+    in their stencils.
+    """
+    model = fitted_tier1_model
+    n_times = 20
+    t_start = model.t_start + timedelta(hours=9)
+    field = simulate_field(
+        model,
+        t_start,
+        t_start + timedelta(hours=3 * n_times),
+        ["sigwh", "wsh", "was", "wsd"],
+        seed=8,
+    )
+    reprojector = model.preprocess_.named_steps["reproject"]
+    nodes = [(3, 2), (4, 1)]
+    times = np.repeat(field["time"].values, len(nodes))
+    lats = np.tile([reprojector.target_lats_[i] for i, _ in nodes], n_times)
+    lons = np.tile([reprojector.target_lons_[j] for _, j in nodes], n_times)
+
+    sampled = sample_batch(model, lats, lons, times, ["sigwh", "wsh", "was", "wsd"], seed=8)
+
+    for k, (i, j) in enumerate(nodes):
+        at_node = sampled[k :: len(nodes)]
+        for v, name in enumerate(["sigwh", "wsh", "was"]):
+            assert_allclose(at_node[:, v], field[name].values[:, i, j], rtol=1e-9)
+        direction_gap = (at_node[:, 3] - field["wsd"].values[:, i, j] + 180.0) % 360.0 - 180.0
+        assert_allclose(direction_gap, 0.0, atol=1e-7)

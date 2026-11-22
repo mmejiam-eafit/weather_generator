@@ -1276,18 +1276,20 @@ def fit_local_residual(
 
 Free functions in `weather/simulate.py`. They read from the fitted `WeatherModel` and never mutate it.
 
-**Continuous-time point query — the `sample_batch` fast path.** For each unique query time `t_q`, use the closed-form OU transition rather than a grid simulation.
+**Continuous-time point query — the `sample_batch` fast path.** The query times of one call are one realization. The closed-form OU transition carries each group's channels from one sorted unique query time to the next, so no grid simulation is needed between them.
 
-**Step 1: Evolve each group's channels to `t_q`, then build its mode amplitudes** (§5.6.1).
+**Step 1: Evolve each group's channels across the query times, then build its mode amplitudes** (§5.6.1).
 ```
-Δn = (t_q − t_train_start).total_seconds() / dt      # can be fractional
-c_0 ~ N(0, P)                                         # one stationary draw per group and call, at t_train_start
-c(t_q) = φ^Δn ⊙ c_0 + w,   w ~ N(0, C(Δn))           # one correlated draw per group and unique time
+Δn_q = (t_q − t_train_start).total_seconds() / dt            # sorted unique times; fractional allowed
+c(t_1) ~ N(0, P)                                              # stationary draw at the first query time
+c(t_q) = φ^g ⊙ c(t_{q−1}) + w_q,  g = Δn_q − Δn_{q−1},  w_q ~ N(0, C(g))   # one correlated draw per step
 real channel (mode k):    η_k = c
 pair channel (k, k'):     η_k = exp(c + log_magnitude_mean) · exp(i · (phase_offset + Δn · arg Λ_k)),  η_k' = conj(η_k)
 a_k(t_q) = b0_k · Λ_k^Δn + η_k
 ```
-Every unique time jumps from the same reference draw with its own transition noise, so each time has the correct marginal, but points at distinct times are not one trajectory. Use `simulate_field` when a mutually consistent trajectory matters. The noise is one correlated draw per group (`Q` of §5.6.1), never independent per mode or per member (§5.6.2). `variant="bop"` already returns exact pairs; the same channel construction applies.
+The channels are Markov, so this is the exact joint law at every query time, regular or not: consecutive points along a route carry the model's temporal correlation. Each distinct gap is factorized once. The noise is one correlated draw per group (`Q` of §5.6.1), never independent per mode or per member (§5.6.2). `variant="bop"` already returns exact pairs; the same channel construction applies.
+
+*Rejected: jumping every query time from one reference draw at `t_train_start`* (v2's sampler, and this section until 2026-11-22). Each time then has the right marginal, but beyond a few decorrelation times `φ^Δn ≈ 0` and the points become independent draws. Measured on one channel with `φ = 0.9` at 3 h, a month past `t_train_start`, consecutive 3-hourly queries had lag-1 correlation −0.006 instead of 0.90; chaining gives 0.90.
 
 **Step 2: Joint state → per-tensor Gaussianized cores.**
 ```
@@ -1307,9 +1309,9 @@ split x_G by member blocks; reshape each to (r_lat, r_lon)
 
 **Open in v3.** Where the sampled height falls below the floor (partition absent), that partition's direction and period are physically undefined. They are returned as reconstructed, and `variable_taxonomy.md` §3.3.1 has no inverse rule yet.
 
-**Compute cost:** step 1 is `O(n_c³)` per group and unique time (one factorization of `C(Δn)`, `n_c ≤ r_dmd`). Steps 2–3 are `O(n_G · r_dmd)` plus the stencil evaluation. Step 4 is one elementwise grid pass per unique time. Steps 5–6 are `O(N_queries)`. Point queries never pay the full-grid Tucker inverse.
+**Compute cost:** step 1 is `O(n_c³)` per group and distinct gap between query times (one factorization of `C(g)`, `n_c ≤ r_dmd`), plus `O(n_c²)` per query time. Steps 2–3 are `O(n_G · r_dmd)` plus the stencil evaluation. Step 4 is one elementwise grid pass per unique time. Steps 5–6 are `O(N_queries)`. Point queries never pay the full-grid Tucker inverse.
 
-**Full-field simulation on the 3h grid** (`simulate_field`) uses the same steps over the full grid at `t_q ∈ {t_start, t_start + Δt, ...}`. It draws `c` from the stationary `P` at `t_start` and chains the one-step transition (`C(1) = Q`) instead of jumping from a reference time, so the trajectory is mutually consistent. Its steps 5–6 are grid-wise, with no interpolation: the whole fitted Pipeline's `inverse_transform`.
+**Full-field simulation on the 3h grid** (`simulate_field`) uses the same steps over the full grid at `t_q ∈ {t_start, t_start + Δt, ...}`: the same channel chain, with a single gap (`C(1) = Q`). Its steps 5–6 are grid-wise, with no interpolation: the whole fitted Pipeline's `inverse_transform`. With the same seed, `sample_batch` at a window's times and grid nodes returns `simulate_field`'s values there.
 
 ---
 

@@ -6,8 +6,9 @@ Free functions, not methods on `WeatherModel` — the model is a passive
 container of fitted state; these algorithms don't mutate it (see AGENTS.md
 "Sampling is free functions, not methods").
 
-Order of operations (§5.8): evolve each group's stochastic channels (one
-correlated draw per group, §5.6.1) → complex mode amplitudes, conjugate
+Order of operations (§5.8): evolve each group's stochastic channels as one
+Markov chain over the requested times (one correlated draw per group and
+time step, §5.6.1) → complex mode amplitudes, conjugate
 pairs exact → per-tensor Gaussianized cores → copula inverse → Tucker
 inverse on the cells needed, land NaN → the Pipeline's per-cell inverses on
 the grid → bilinear interpolation of the linear-safe tensors → the
@@ -87,39 +88,38 @@ def _stationary_draw(ou: ModeOUFit, rng: np.random.Generator) -> np.ndarray:
     return result
 
 
-def _jump_channels(
-    ou: ModeOUFit, start: np.ndarray, delta_n: np.ndarray, standard_normal: np.ndarray
-) -> np.ndarray:
-    """Channels at each `delta_n`, each jumping from `start` with its own noise (§5.8 step 1).
+def _channel_path(ou: ModeOUFit, delta_n: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """One realization of a group's channels at increasing times, ``(n_c, n_t)`` (§5.8 step 1).
+
+    A stationary draw at the first time, then the closed-form transition
+    across each gap to the next time. The channels are a Markov process, so
+    this gives the exact joint law at every requested time, regular grid or
+    not. Each distinct gap is factorized once: a regular grid needs one
+    factorization, and its one-step noise covariance is the innovation
+    covariance itself.
 
     Parameters
     ----------
     ou : ModeOUFit
-    start : (n_c,) channel state at step 0
-    delta_n : (n_t,)
-    standard_normal : (n_t, n_c) pre-drawn N(0, 1), so chunking cannot change the draw
+    delta_n : (n_t,) float, strictly increasing
+        Steps since the training window's first snapshot.
+    rng : np.random.Generator
 
     Returns
     -------
     (n_c, n_t) float64
     """
-    decay, noise_cov = ou_transition(ou, delta_n)
-    noise = np.einsum("tij,tj->ti", covariance_factor(noise_cov), standard_normal)
-    result: np.ndarray = (decay * start[None, :] + noise).T
-    return result
-
-
-def _chain_channels(ou: ModeOUFit, n_steps: int, rng: np.random.Generator) -> np.ndarray:
-    """A mutually consistent channel trajectory at the snapshot cadence, ``(n_c, n_steps)``.
-
-    Starts from a stationary draw and chains the one-step transition, whose
-    noise covariance is the innovation covariance itself (§5.6.1).
-    """
-    path = np.empty((ou.phi.size, n_steps), dtype=np.float64)
+    path = np.empty((ou.phi.size, delta_n.size), dtype=np.float64)
     path[:, 0] = _stationary_draw(ou, rng)
-    noise = rng.standard_normal((n_steps, ou.phi.size)) @ covariance_factor(ou.innovation_cov).T
-    for step in range(1, n_steps):
-        path[:, step] = ou.phi * path[:, step - 1] + noise[step]
+    if delta_n.size == 1:
+        return path
+    gaps, gap_index = np.unique(np.diff(delta_n), return_inverse=True)
+    decay, noise_cov = ou_transition(ou, gaps)
+    factors = covariance_factor(noise_cov)
+    standard_normal = rng.standard_normal((delta_n.size - 1, ou.phi.size))
+    for step in range(1, delta_n.size):
+        k = gap_index[step - 1]
+        path[:, step] = decay[k] * path[:, step - 1] + factors[k] @ standard_normal[step - 1]
     return path
 
 
@@ -241,13 +241,13 @@ def sample_batch(
 ) -> np.ndarray:
     """Batched point query — the fast path (see docs/model_design.md §5.8).
 
-    Each group's channels are drawn once from their stationary law at the
-    training window's start, then every unique query time jumps from that
-    draw in closed form with its own correlated noise. Each time therefore
-    has the correct marginal, but points at distinct times are not one
-    trajectory; use `simulate_field` when that matters. Only the stencil
-    rows and columns are Tucker-inverted; the per-cell inverses run on the
-    grid before interpolation, the pointwise inverses after.
+    All query times belong to one realization: each group's channels are a
+    Markov chain over the sorted unique times, so consecutive queries along
+    a route carry the model's temporal correlation. At the times and grid
+    nodes of a `simulate_field` window, with the same seed, the two
+    functions return the same values. Only the stencil rows and columns are
+    Tucker-inverted; the per-cell inverses run on the grid before
+    interpolation, the pointwise inverses after.
 
     Parameters
     ----------
@@ -279,10 +279,7 @@ def sample_batch(
     delta_n = _delta_n(unique_times, model.metadata_.t_train_start, _cadence_seconds(model))
 
     rng = np.random.default_rng(seed)
-    starts = {g: _stationary_draw(ou, rng) for g, ou in model.mode_ou_.items()}
-    normals = {
-        g: rng.standard_normal((unique_times.size, ou.phi.size)) for g, ou in model.mode_ou_.items()
-    }
+    channels = {g: _channel_path(ou, delta_n, rng) for g, ou in model.mode_ou_.items()}
 
     pointwise, per_cell = _split_pipeline(model)
     wave_lats, wave_lons = _wave_grid_coordinates(model)
@@ -291,12 +288,9 @@ def sample_batch(
     linear = np.full((lats.size, len(tensors)), np.nan, dtype=np.float64)
     for start in range(0, unique_times.size, _TIME_CHUNK):
         chunk = slice(start, start + _TIME_CHUNK)
-        channels = {
-            g: _jump_channels(ou, starts[g], delta_n[chunk], normals[g][chunk])
-            for g, ou in model.mode_ou_.items()
-        }
+        chunk_channels = {g: path[:, chunk] for g, path in channels.items()}
         blocks = _standardized_anomaly(
-            model, _gaussianized_cores(model, channels, delta_n[chunk]), rows, cols
+            model, _gaussianized_cores(model, chunk_channels, delta_n[chunk]), rows, cols
         )
         grid = _grid_dataset(
             model,
@@ -365,9 +359,8 @@ def simulate_field(
 
     (see docs/model_design.md §5.8)
 
-    Unlike `sample_batch`, this chains each group's channels step by step
-    from a stationary draw, giving one mutually consistent trajectory. The
-    whole fitted Pipeline inverts the grid; no interpolation.
+    The same channel chain as `sample_batch`, on a regular grid of times;
+    the whole fitted Pipeline inverts the grid, with no interpolation.
 
     Parameters
     ----------
@@ -400,7 +393,7 @@ def simulate_field(
     delta_n = _delta_n(times64, model.metadata_.t_train_start, dt)
 
     rng = np.random.default_rng(seed)
-    channels = {g: _chain_channels(ou, times64.size, rng) for g, ou in model.mode_ou_.items()}
+    channels = {g: _channel_path(ou, delta_n, rng) for g, ou in model.mode_ou_.items()}
     anomaly = _standardized_anomaly(model, _gaussianized_cores(model, channels, delta_n))
     physical: xr.Dataset = model.preprocess_.inverse_transform(
         _grid_dataset(model, anomaly, times64)

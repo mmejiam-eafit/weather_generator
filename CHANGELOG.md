@@ -7,6 +7,31 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — `sample_batch` treats a call's query times as one
+  trajectory** — `src/weather/simulate.py`, `tests/weather/test_simulate.py`,
+  `docs/model_design.md` §5.8.
+  - **Problem.** `sample_batch` jumped every unique query time from one
+    stationary draw at `t_train_start`, each with independent noise. Every
+    time had the right marginal, but beyond a few decorrelation times
+    `φ^Δn ≈ 0`, so consecutive points along a route were independent draws.
+    Measured on one channel with `φ = 0.9` at 3 h, a month past
+    `t_train_start`: lag-1 correlation −0.006 between consecutive 3-hourly
+    queries, against 0.90 for the process. v2's sampler had the same design.
+  - **Fix.** Each group's channels are now one Markov chain over the sorted
+    unique query times: a stationary draw at the first time, then the
+    closed-form transition across each gap (`_channel_path`). That is the
+    exact joint law at any set of times, at the same cost; each distinct
+    gap is factorized once. The same lag-1 check gives 0.898.
+    `simulate_field` uses the same function on its regular grid, so with the
+    same seed `sample_batch` at a window's times and grid nodes returns
+    `simulate_field`'s values there; a new test checks exactly that, across
+    `sample_batch`'s time chunks, and fails against the previous code.
+  - **Considered, not done (user decision, 2026-11-22).** Stencil-only
+    per-cell inverses (each unique query time still pays about 0.6 s of
+    full-grid work at era-3 size), renormalizing the bilinear weights over
+    ocean corners at coasts (stencils touching land stay NaN), and chunking
+    `simulate_field` over time.
+
 - **2026-11-22 — v3 pipeline implemented: per-tensor Tucker, copula on the
   core, per-group DMD and pair-coherent OU, a v3 sampler** —
   `src/train/tucker.py`, `src/train/dmd.py`, `src/train/linear_inverse.py`,
