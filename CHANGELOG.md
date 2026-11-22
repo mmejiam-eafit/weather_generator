@@ -7,6 +7,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — Training-time memory scaling recorded as an open question**
+  — `docs/open_questions.md` (new §9.1; "out of scope" renumbered to §10).
+  A global era-3 fit needs ≥ ~300 GB for in-memory tier-1 preprocessing over
+  12 months, and ~45–50 GB per masked-Tucker tensor. No machine available
+  today has that. The fitted model is the same whether the work is split by
+  cell, tensor or band. How the fit is computed (one large machine, split
+  jobs, or out-of-core arrays) is left to be decided together with the
+  training and production infrastructure.
+
 - **2026-11-22 — `sample_batch` treats a call's query times as one
   trajectory** — `src/weather/simulate.py`, `tests/weather/test_simulate.py`,
   `docs/model_design.md` §5.8.

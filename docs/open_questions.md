@@ -1483,7 +1483,69 @@ integration* of that fix is still to be done by whoever next edits
 
 ---
 
-## 9. Explicitly out of scope (not open questions — scope boundaries stated by design)
+## 9. Training infrastructure
+
+### 9.1 How does the era-3 training run fit in memory? — **OPEN** (decide together with the training infrastructure)
+
+Raised in: scoping the `model_design.md` §8.6 training notebook for a
+global era-3 fit (2026-11-22).
+
+The training path runs in memory from start to finish. `load_training_window`
+loads the whole window, the preprocessing Pipeline transforms it as one
+Dataset, and each Tucker fit holds its full tensor. At era-3 scale no machine
+available today fits that: the workstation has 31 GB, and the deleted task-07
+VM (`Standard_E8s_v7`) had 64 GB.
+
+Sizes, for era 3 (721 × 1440 = 1.04 M cells) over a 12-month window (2,920
+3-hourly snapshots), tier 1:
+
+| Quantity | Size |
+|---|---|
+| One field, float64 | 24.3 GB |
+| One field, float32 | 12.1 GB |
+| Raw input: 6 fields (`sigwh`, `wsh`, `wsp`, `wsd`, `was`, `wad_come_from`), float64 | ~146 GB |
+| Preprocessing peak: input plus the 7 output tensors, float64 | ≥ ~300 GB |
+| One masked-Tucker fit: float32 tensor, mask and imputation temporaries | ~45–50 GB |
+| One 40%-rank core `(288, 576)` over the window, float64 | 3.9 GB |
+| A joint group of all 7 cores, before the DMD SVD's workspace | ~27 GB |
+
+The preprocessing peak is a lower bound, since each Pipeline step briefly
+holds its input and output together. The Tucker figure scales task 07's
+measurement (peak ~30 GB for a 7.84 GB tensor after the memory fix,
+`tasks/07-tucker-dmd-rank-selection.md`) to the 12.1 GB era-3 tensor. Time
+matters as well as memory: task 07's 40% fit reached iteration 170 of 300 in
+11 h on a smaller tensor. Seven era-3 tensors run one after another on an
+8-core VM would plausibly take days for Tucker alone.
+
+**What does not depend on the answer: the fitted model.** The land mask,
+climatology and standardization are per cell. Tucker is per tensor, the
+copula is per core, and DMD and the mode OU are per group. Splitting the
+preprocessing by cells or tensors, and Tucker by tensors, therefore gives
+the same fitted model up to float rounding. The served artifact and the
+query path (§5.8) stay the same. One limit: Tucker cannot be split
+spatially, because it needs the whole `(T, H, W)` tensor. Its ~45–50 GB per
+tensor is the floor for any machine that runs it in memory.
+
+**What does depend on it: how the fit is computed.** Three families:
+
+1. **One large-memory machine** (~512 GB). Runs the in-memory §8.6 flow
+   unchanged.
+2. **Split the work** by tensor and/or latitude band. The pieces run as
+   parallel jobs (e.g. Azure ML) or one after another on a ~64 GB machine,
+   with intermediate tensors written to disk. This needs code changes in
+   the fit path: `WeatherModel.fit` takes one whole Dataset today.
+3. **Out-of-core arrays.** Try chunking with `numpy.memmap` first; a new
+   dependency such as `dask` needs approval (AGENTS.md *Dependency
+   Management*).
+
+The choice is also how retraining would run in production, so it is decided
+together with the training and production infrastructure, not ahead of it.
+Until then, the §8.6 notebook targets the current in-memory API: it runs
+unchanged on a large machine and on small windows locally.
+
+---
+
+## 10. Explicitly out of scope (not open questions — scope boundaries stated by design)
 
 These are not unresolved questions so much as places where a sibling
 document deliberately drew a boundary. Listed here only to avoid them being
@@ -1539,3 +1601,4 @@ mistaken for open items that need chasing:
 | 8.2 | Cross-cell/cross-time blindness | OPEN (structural) |
 | 8.3 | Rejection vs. copula fix | OPEN (= 4.2) |
 | 8.4 | Static PM check vs. young-sea transients | ANSWERED (not yet integrated) |
+| 9.1 | Fitting era-3 training in memory | OPEN (decide together with the training and production infrastructure, 2026-11-22) |
