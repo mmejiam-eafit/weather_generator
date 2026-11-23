@@ -28,6 +28,7 @@ from scipy import signal, stats
 from sklearn.utils.validation import check_is_fitted
 
 from core.io import require_utc
+from train.fidelity import fidelity_summary
 from train.ingest import load_training_window
 from train.linear_inverse import diagnostics_summary
 from train.tucker import fill_land, tucker_transform
@@ -556,6 +557,12 @@ def full_report(
         _text_page(
             "Group dynamics diagnostics (§5.6.2)",
             [diagnostics_summary(d) for d in model.group_diagnostics_.values()],
+        )
+    )
+    figures.append(
+        _text_page(
+            "Generative fidelity (§5.6.3)",
+            [fidelity_summary(d) for d in model.fidelity_diagnostics_.values()],
         )
     )
 

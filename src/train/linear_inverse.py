@@ -176,7 +176,8 @@ def _leading_pcs(x: np.ndarray, rank: int) -> tuple[np.ndarray, float]:
         eigvals, eigvecs = np.linalg.eigh(x @ x.T)  # ascending
         top = np.argsort(eigvals)[::-1][:rank]
         pcs = eigvecs[:, top] * np.sqrt(np.clip(eigvals[top], 0.0, None))
-    explained = float(np.clip(eigvals[top], 0.0, None).sum() / np.sum(x**2))
+    # vdot, not sum(x**2): no second (T, n_features) temporary (3.9 GB per production core).
+    explained = float(np.clip(eigvals[top], 0.0, None).sum() / np.vdot(x, x))
     return pcs, explained
 
 

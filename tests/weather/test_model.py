@@ -201,6 +201,7 @@ def test_from_components_matches_fit(fitted_tier1_model: WeatherModel) -> None:
         dmd=fitted.dmd_,
         mode_ou=fitted.mode_ou_,
         group_diagnostics=fitted.group_diagnostics_,
+        fidelity_diagnostics=fitted.fidelity_diagnostics_,
         ocean_mask=fitted.ocean_mask_,
         metadata=fitted.metadata_,
     )

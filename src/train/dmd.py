@@ -6,8 +6,9 @@ A group's state is its members' Gaussianized Tucker cores, flattened and
 concatenated (`group_state`). DMD fits the deterministic linear dynamics;
 `fit_mode_ou` fits the stochastic residual as one real AR(1) channel per real
 mode and per conjugate pair, with one innovation covariance for the group.
-`ou_transition`, `ou_stationary_cov` and `mode_amplitudes` are the closed-form
-pieces the sampler (`weather.simulate`) evolves.
+`ou_transition`, `ou_stationary_cov`, `channel_path` and `mode_amplitudes` are
+the closed-form pieces the sampler (`weather.simulate`) and the generative
+fidelity stage (`train.fidelity`) evolve.
 """
 
 from collections.abc import Mapping, Sequence
@@ -16,6 +17,8 @@ from typing import Final, Literal
 
 import numpy as np
 from pydmd import BOPDMD, DMD, HankelDMD
+
+from train.linear_inverse import covariance_factor
 
 CONJUGATE_PAIR_TOL: Final[float] = 1e-6  # |Λ_k' − conj(Λ_k)| below this pairs two modes
 _PHI_CLIP: Final[tuple[float, float]] = (1e-4, 0.9999)
@@ -271,12 +274,37 @@ def conjugate_pairs(
     )
 
 
+def measured_amplitudes(state: np.ndarray, dmd: DMDFit) -> np.ndarray:
+    """Least-squares mode amplitudes ``a(t) = Φ⁺ x_t`` of a group state (see §5.6.1).
+
+    Two real products against the real and imaginary parts of ``Φ⁺``
+    instead of one complex product: numpy would otherwise upcast the whole
+    ``(T, n_G)`` state to complex128, a temporary twice the state's size
+    (about 8 GB for one production core). A float64 state is read in place,
+    never copied.
+
+    Parameters
+    ----------
+    state : (T, n_G) float64
+        A group state (any trailing shape is flattened).
+    dmd : DMDFit
+
+    Returns
+    -------
+    (r_dmd, T) complex128
+    """
+    snapshots = state.reshape(state.shape[0], -1)
+    pinv_phi = np.linalg.pinv(dmd.Phi.astype(np.complex128))  # (r_dmd, n_G)
+    real_part = snapshots @ pinv_phi.real.T
+    imag_part = snapshots @ pinv_phi.imag.T
+    result: np.ndarray = (real_part + 1j * imag_part).T
+    return result
+
+
 def _residual_amplitudes(state: np.ndarray, dmd: DMDFit) -> np.ndarray:
     """``η_k(t) = (Φ⁺ x_t)_k − b0_k Λ_k^t`` over the training snapshots, ``(r_dmd, T)``."""
-    n_times = state.shape[0]
-    snapshots = state.reshape(n_times, -1).T.astype(np.float64)
-    measured = np.linalg.pinv(dmd.Phi.astype(np.complex128)) @ snapshots
-    steps = np.arange(n_times, dtype=np.float64)
+    measured = measured_amplitudes(state, dmd)
+    steps = np.arange(state.shape[0], dtype=np.float64)
     deterministic = dmd.b0[:, None] * dmd.Lambda[:, None] ** steps[None, :]
     result: np.ndarray = measured - deterministic
     return result
@@ -381,6 +409,49 @@ def ou_transition(ou: ModeOUFit, n_steps: np.ndarray) -> tuple[np.ndarray, np.nd
         / (1.0 - phi_products)[None]
     )
     return decay, noise_cov
+
+
+def _stationary_draw(ou: ModeOUFit, rng: np.random.Generator) -> np.ndarray:
+    """One draw of a group's channels from their joint stationary law, ``(n_c,)``."""
+    result: np.ndarray = covariance_factor(ou_stationary_cov(ou)) @ rng.standard_normal(ou.phi.size)
+    return result
+
+
+def channel_path(ou: ModeOUFit, delta_n: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """One realization of a group's channels at increasing times, ``(n_c, n_t)`` (§5.8 step 1).
+
+    A stationary draw at the first time, then the closed-form transition
+    across each gap to the next time. The channels are a Markov process, so
+    this gives the exact joint law at every requested time, regular grid or
+    not. Each distinct gap is factorized once: a regular grid needs one
+    factorization, and its one-step noise covariance is the innovation
+    covariance itself. The sampler (`weather.simulate`) and the generative
+    fidelity stage (`train.fidelity`, §5.6.3) share this function, so the
+    stage judges exactly the law the sampler draws from.
+
+    Parameters
+    ----------
+    ou : ModeOUFit
+    delta_n : (n_t,) float, strictly increasing
+        Steps since the training window's first snapshot.
+    rng : np.random.Generator
+
+    Returns
+    -------
+    (n_c, n_t) float64
+    """
+    path = np.empty((ou.phi.size, delta_n.size), dtype=np.float64)
+    path[:, 0] = _stationary_draw(ou, rng)
+    if delta_n.size == 1:
+        return path
+    gaps, gap_index = np.unique(np.diff(delta_n), return_inverse=True)
+    decay, noise_cov = ou_transition(ou, gaps)
+    factors = covariance_factor(noise_cov)
+    standard_normal = rng.standard_normal((delta_n.size - 1, ou.phi.size))
+    for step in range(1, delta_n.size):
+        k = gap_index[step - 1]
+        path[:, step] = decay[k] * path[:, step - 1] + factors[k] @ standard_normal[step - 1]
+    return path
 
 
 def mode_amplitudes(

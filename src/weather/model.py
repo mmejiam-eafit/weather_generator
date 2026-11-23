@@ -4,8 +4,9 @@
 
 v3 architecture: one preprocessing Pipeline ending at the standardized
 anomaly, then per tensor a masked Tucker fit and a Gaussian copula on its
-core, then per variable group a DMD, a mode-level OU and the §5.6.2
-diagnostics stage.
+core, then per variable group a DMD, a mode-level OU, the §5.6.2
+diagnostics stage and the §5.6.3 generative fidelity stage, which gates the
+fit: a model whose samples do not resemble its training cores is never built.
 """
 
 import importlib.metadata
@@ -33,6 +34,14 @@ from train.climatology import ClimatologyRemover
 from train.copula import GaussianCopula
 from train.directional import ComingFromToUV, GoingToToUV
 from train.dmd import DMDFit, ModeOUFit, dmd_fit, fit_mode_ou, group_state
+from train.fidelity import (
+    FidelityDiagnostics,
+    MemoryCheck,
+    TimeOfDayCheck,
+    VarianceCheck,
+    diagnose_fidelity,
+    fidelity_summary,
+)
 from train.ingest import load_training_window
 from train.linear_inverse import (
     GroupCouplingReport,
@@ -365,6 +374,78 @@ def _fit_group_dynamics(
     return dmd, mode_ou, diagnostics
 
 
+def _diagnose_group_fidelity(
+    gaussianized_core: Mapping[str, np.ndarray],
+    groups: Mapping[str, tuple[str, ...]],
+    dmd: Mapping[str, DMDFit],
+    mode_ou: Mapping[str, ModeOUFit],
+    times: np.ndarray,
+    fidelity_lags: tuple[int, ...],
+    lim_rank: int,
+    fidelity_replicates: int,
+    rng: np.random.Generator,
+) -> dict[str, FidelityDiagnostics]:
+    """Per group: the §5.6.3 generative fidelity stage on the state DMD was fit on.
+
+    PCs per member follow the §5.6.2 cap (`lim_rank`, the core size, `T`),
+    so the memory check reads the subspace the tau test reads.
+    """
+    fidelity: dict[str, FidelityDiagnostics] = {}
+    for group, members in groups.items():
+        state = group_state(gaussianized_core, members)
+        n_times = state.shape[0]
+        sizes = {member: gaussianized_core[member][0].size for member in members}
+        fidelity[group] = diagnose_fidelity(
+            state,
+            sizes,
+            dmd[group],
+            mode_ou[group],
+            times=times,
+            lags=list(fidelity_lags),
+            ranks={member: min(lim_rank, sizes[member], n_times) for member in members},
+            n_replicates=fidelity_replicates,
+            rng=rng,
+        )
+        _log_fidelity_diagnostics(group, fidelity[group])
+    return fidelity
+
+
+def _log_fidelity_diagnostics(group: str, diagnostics: FidelityDiagnostics) -> None:
+    """Log one group's §5.6.3 verdicts, at warning level when it fails."""
+    hours = diagnostics.dt / 3600.0
+    log = logger.info if diagnostics.passed else logger.warning
+    log(
+        "generative fidelity",
+        group=group,
+        passed=diagnostics.passed,
+        variance_ratio={m: c.ratio for m, c in diagnostics.variance.items()},
+        span_fraction={m: c.span_fraction for m, c in diagnostics.variance.items()},
+        memory_inconsistent_lags_h={
+            m: [float(lag * hours) for lag, ok in zip(c.lags, c.consistent) if not ok]
+            for m, c in diagnostics.memory.items()
+        },
+        time_of_day_share={m: c.share for m, c in diagnostics.time_of_day.items()},
+    )
+
+
+def _require_fidelity(fidelity: Mapping[str, FidelityDiagnostics]) -> None:
+    """Refuse a model whose samples fail the §5.6.3 checks; no bypass by design.
+
+    Raises
+    ------
+    ValueError
+        Naming the failing groups, with each one's `fidelity_summary`.
+    """
+    failed = {group: d for group, d in fidelity.items() if not d.passed}
+    if failed:
+        summaries = "\n\n".join(fidelity_summary(d) for d in failed.values())
+        raise ValueError(
+            f"generative fidelity checks failed for groups {sorted(failed)}: samples from the "
+            "fitted dynamics do not resemble the training cores, so no model is built "
+            f"(docs/model_design.md §5.6.3).\n\n{summaries}"
+        )
+
+
 class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
     """Hierarchical stochastic weather generator (see docs/model_design.md §8.5).
 
@@ -390,6 +471,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         dmd_               : dict[str, DMDFit]           (group -> fit)
         mode_ou_           : dict[str, ModeOUFit]        (group -> fit)
         group_diagnostics_ : dict[str, GroupDiagnostics] (group -> §5.6.2 output)
+        fidelity_diagnostics_ : dict[str, FidelityDiagnostics] (group -> §5.6.3, all passed)
         local_residual_    : None in v3 (§5.7)
         metadata_          : ModelMetadata
 
@@ -416,6 +498,8 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         groups: dict[str, list[str]] | None = None,
         lim_rank: int = 20,
         tau_test_lags: tuple[int, ...] = (1, 2, 4, 8, 16),
+        fidelity_lags: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128),
+        fidelity_replicates: int = 100,
         n_bootstrap: int = 100,
         random_state: int | None = None,
     ) -> None:
@@ -438,6 +522,8 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         self.groups = groups
         self.lim_rank = lim_rank
         self.tau_test_lags = tau_test_lags
+        self.fidelity_lags = fidelity_lags
+        self.fidelity_replicates = fidelity_replicates
         self.n_bootstrap = n_bootstrap
         self.random_state = random_state
 
@@ -492,6 +578,18 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             self.n_bootstrap,
             rng,
         )
+        fidelity = _diagnose_group_fidelity(
+            gaussianized_core,
+            groups,
+            dmd,
+            mode_ou,
+            a_std.coords["time"].values,
+            self.fidelity_lags,
+            self.lim_rank,
+            self.fidelity_replicates,
+            rng,
+        )
+        _require_fidelity(fidelity)
 
         self.preprocess_ = preprocess
         self.ocean_mask_ = ocean_mask
@@ -502,6 +600,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         self.dmd_ = dmd
         self.mode_ou_ = mode_ou
         self.group_diagnostics_ = diagnostics
+        self.fidelity_diagnostics_ = fidelity
         self.local_residual_ = None
         self.metadata_ = ModelMetadata(
             trained_at=datetime.now(timezone.utc),
@@ -553,8 +652,9 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         ------
         ValueError
             If `include_local_residual` is True (deferred in v3), `sigwh` is
-            missing from `variables`, or `groups` does not partition the
-            tensors.
+            missing from `variables`, `groups` does not partition the
+            tensors, a fidelity lag is not below half the window, or the
+            fitted dynamics fail the generative fidelity checks (§5.6.3).
         """
         self._fit_impl(X)
         return self
@@ -607,6 +707,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         dmd: dict[str, DMDFit],
         mode_ou: dict[str, ModeOUFit],
         group_diagnostics: dict[str, GroupDiagnostics],
+        fidelity_diagnostics: dict[str, FidelityDiagnostics],
         ocean_mask: np.ndarray,
         metadata: ModelMetadata,
     ) -> Self:
@@ -614,20 +715,28 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
 
         Production fits Tucker per tensor on a VM with checkpoints, so the
         pieces are fit separately and bundled here without re-running `fit`.
+        The §5.6.3 gate applies here too, so `load` (which goes through this
+        constructor) can only ever rebuild a model that passed it.
 
         Parameters
         ----------
         preprocess : Pipeline
             A fitted preprocessing Pipeline (§5.3–§5.4).
         tucker, core_copula : dict keyed by tensor
-        dmd, mode_ou, group_diagnostics : dict keyed by group
+        dmd, mode_ou, group_diagnostics, fidelity_diagnostics : dict keyed by group
         ocean_mask : (H, W) bool
         metadata : ModelMetadata
 
         Returns
         -------
         Self
+
+        Raises
+        ------
+        ValueError
+            If any group's `fidelity_diagnostics` failed (§5.6.3).
         """
+        _require_fidelity(fidelity_diagnostics)
         model = cls(
             t_start=metadata.t_train_start,
             t_end=metadata.t_train_end,
@@ -649,6 +758,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         model.dmd_ = dmd
         model.mode_ou_ = mode_ou
         model.group_diagnostics_ = group_diagnostics
+        model.fidelity_diagnostics_ = fidelity_diagnostics
         model.local_residual_ = None
         model.metadata_ = metadata
         return model
@@ -684,6 +794,10 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             _save_lim(model_dir / "lim" / f"{group}.npz", diagnostics.lim)
             records[group] = _diagnostics_record(diagnostics)
         (model_dir / "group_diagnostics.json").write_text(json.dumps(records, indent=2))
+        fidelity_records = {
+            group: _fidelity_record(self.fidelity_diagnostics_[group]) for group in self.groups_
+        }
+        (model_dir / "fidelity_diagnostics.json").write_text(json.dumps(fidelity_records, indent=2))
         (model_dir / "metadata.json").write_text(
             json.dumps(_metadata_record(self.metadata_), indent=2)
         )
@@ -707,6 +821,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         _warn_on_version_drift(record)
         metadata = _metadata_from_record(record)
         diagnostics_records = json.loads((model_dir / "group_diagnostics.json").read_text())
+        fidelity_records = json.loads((model_dir / "fidelity_diagnostics.json").read_text())
         return cls.from_components(
             preprocess=joblib.load(model_dir / "preprocess.pkl"),
             tucker={t: _load_tucker(model_dir / "tucker" / f"{t}.npz") for t in metadata.tensors},
@@ -720,6 +835,9 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
                     diagnostics_records[g], _load_lim(model_dir / "lim" / f"{g}.npz")
                 )
                 for g in metadata.groups
+            },
+            fidelity_diagnostics={
+                g: _fidelity_from_record(fidelity_records[g]) for g in metadata.groups
             },
             ocean_mask=np.load(model_dir / "ocean_mask.npy"),
             metadata=metadata,
@@ -971,4 +1089,84 @@ def _diagnostics_from_record(record: dict[str, Any], lim: LIMFit) -> GroupDiagno
         noise_mi_null_upper=float(record["noise_mi_null_upper"]),
         coupling_significant=dict(record["coupling_significant"]),
         noise_coupling_significant=bool(record["noise_coupling_significant"]),
+    )
+
+
+def _fidelity_record(d: FidelityDiagnostics) -> dict[str, Any]:
+    """`FidelityDiagnostics` as JSON-ready values (§5.6.3, §7)."""
+    return {
+        "members": list(d.members),
+        "n_replicates": d.n_replicates,
+        "dt": d.dt,
+        "variance": {
+            m: {
+                "training_energy": c.training_energy,
+                "replicate_energy": c.replicate_energy.tolist(),
+                "span_fraction": c.span_fraction,
+                "rms_quantiles": c.rms_quantiles.tolist(),
+                "saturated_training": c.saturated_training,
+                "saturated_sampled": c.saturated_sampled,
+                "consistent": c.consistent,
+            }
+            for m, c in d.variance.items()
+        },
+        "memory": {
+            m: {
+                "lags": c.lags.tolist(),
+                "training": c.training.tolist(),
+                "band": c.band.tolist(),
+                "replicate_mean": c.replicate_mean.tolist(),
+                "consistent": c.consistent.tolist(),
+            }
+            for m, c in d.memory.items()
+        },
+        "time_of_day": {
+            m: {
+                "share": c.share,
+                "null_mean": c.null_mean,
+                "null_max": c.null_max,
+                "consistent": c.consistent,
+            }
+            for m, c in d.time_of_day.items()
+        },
+    }
+
+
+def _fidelity_from_record(record: dict[str, Any]) -> FidelityDiagnostics:
+    """Inverse of `_fidelity_record`."""
+    return FidelityDiagnostics(
+        members=tuple(record["members"]),
+        n_replicates=int(record["n_replicates"]),
+        dt=float(record["dt"]),
+        variance={
+            m: VarianceCheck(
+                training_energy=float(c["training_energy"]),
+                replicate_energy=np.array(c["replicate_energy"], dtype=np.float64),
+                span_fraction=float(c["span_fraction"]),
+                rms_quantiles=np.array(c["rms_quantiles"], dtype=np.float64),
+                saturated_training=float(c["saturated_training"]),
+                saturated_sampled=float(c["saturated_sampled"]),
+                consistent=bool(c["consistent"]),
+            )
+            for m, c in record["variance"].items()
+        },
+        memory={
+            m: MemoryCheck(
+                lags=np.array(c["lags"], dtype=np.int64),
+                training=np.array(c["training"], dtype=np.float64),
+                band=np.array(c["band"], dtype=np.float64),
+                replicate_mean=np.array(c["replicate_mean"], dtype=np.float64),
+                consistent=np.array(c["consistent"], dtype=bool),
+            )
+            for m, c in record["memory"].items()
+        },
+        time_of_day={
+            m: TimeOfDayCheck(
+                share=float(c["share"]),
+                null_mean=float(c["null_mean"]),
+                null_max=float(c["null_max"]),
+                consistent=bool(c["consistent"]),
+            )
+            for m, c in record["time_of_day"].items()
+        },
     )

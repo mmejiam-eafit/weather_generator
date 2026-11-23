@@ -1094,6 +1094,52 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **2026-11-22 — Generative fidelity stage gates training; the test suite is
+  red until the sampler is redesigned** — `src/train/fidelity.py` (new),
+  `src/weather/model.py`, `src/train/dmd.py`, `src/train/copula.py`,
+  `src/train/linear_inverse.py`, `src/weather/simulate.py`,
+  `src/weather/validate.py`, `tests/conftest.py`,
+  `tests/weather/test_model.py`, `notebooks/07_generative_fidelity_wsh_core.py`
+  (new). Spec: `docs/model_design.md` §5.6.3.
+  - **The stage.** `diagnose_fidelity` simulates each group's fitted DMD and
+    mode OU exactly as the sampler does: `channel_path`, which moved here
+    from `weather/simulate.py`, then `mode_amplitudes`. Per member it
+    judges the variance, the autocorrelation of the leading PCs at
+    `fidelity_lags` (3 h to 16 days) and the residual daily cycle against
+    replicate envelopes and fixed tolerances. Member energies come from
+    `r × r` Gram matrices, so the sampled state is never materialized.
+  - **The gate.** `WeatherModel.fit` and `from_components` raise
+    `ValueError` with `fidelity_summary`'s text when a check fails; there
+    is no bypass. Results are persisted as `fidelity_diagnostics.json` and
+    get a page in `full_report`.
+  - **New hyperparameters.** `fidelity_lags`, and `fidelity_replicates`
+    (100). The plan was to reuse `n_bootstrap`, but the fixture's
+    `n_bootstrap = 2` gave meaningless envelopes. A fidelity replicate
+    costs one `r × T` simulation; a LIM bootstrap replicate refits the
+    LIM.
+  - **Memory.**
+    - `train.dmd.measured_amplitudes` (new, used by `fit_mode_ou`) computes
+      `Φ⁺x` with two real products and no complex upcast of the state.
+    - `linear_inverse._leading_pcs` uses `vdot` instead of `sum(x**2)`.
+      That removes a full-size temporary, 3.9 GB per production core,
+      found when the real-data run hit its memory cap.
+    - `train.copula.SATURATION_Z` (new) is the copula's saturation point,
+      about 4.753.
+  - **Real data.** On task 07's production `wsh` core, under an 8 GiB
+    address-space cap (5.3 GiB peak), all three checks fail:
+    - variance: 3.84 times the training energy;
+    - memory: every lag from 12 h to 16 days;
+    - time of day: share 0.148 against a 0.002 null.
+
+    The numbers are in `model_design.md` §5.6.3. The cap was lowered from
+    the planned 10 GiB because only 10.1 GiB was free.
+  - **Tests: 36 fail, as expected.** Every test that fits the tier-1
+    fixture now raises, because the current sampler fails the gate on any
+    data tried: white noise, and a latent AR(1) process. The other 195 pass.
+    `train/fidelity.py` has no unit tests yet. This is committed
+    deliberately in this state so the work is kept. Landing it is
+    `docs/open_questions.md` §5.9, priorities 1 and 5.
+
 - **2026-11-22 — v3 preprocessing stages: partition sentinel fill, log
   transform and `keep_speed`** — `src/train/masking.py`,
   `src/train/directional.py`, `tests/train/test_masking.py`,

@@ -90,6 +90,8 @@ def small_tier1_model(seed: int = 0, **overrides: Any) -> WeatherModel:
         "copula_lut_bins": 50,
         "lim_rank": 3,
         "tau_test_lags": (1, 2, 4),
+        "fidelity_lags": (1, 2, 4, 8),  # below T / 2 = 30 (§5.6.3)
+        "fidelity_replicates": 40,  # envelopes need tens of replicates; each costs r x T
         "n_bootstrap": 2,  # bands are not under test here; the bootstrap dominates fit time
         "random_state": seed,
     }

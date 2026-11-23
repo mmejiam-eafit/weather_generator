@@ -12,6 +12,12 @@ from sklearn.utils.validation import check_is_fitted
 from core.config import check_canonical
 
 _EPS: Final[float] = 1e-6
+# Largest |z| the copula distinguishes. `transform` clips probabilities to
+# [_EPS, 1 - _EPS], so training values never exceed it; `inverse_transform`
+# maps every |z| beyond it within a probability of _EPS of the same
+# extrapolated extreme. Sampled values past it are saturated
+# (see docs/model_design.md §5.6.3).
+SATURATION_Z: Final[float] = float(norm.ppf(1.0 - _EPS))
 
 
 def _searchsorted_per_column(sorted_matrix: np.ndarray, queries: np.ndarray) -> np.ndarray:

@@ -25,14 +25,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_is_fitted
 
 from core.io import require_utc
-from train.dmd import (
-    ModeOUFit,
-    mode_amplitudes,
-    ou_stationary_cov,
-    ou_transition,
-    split_group_state,
-)
-from train.linear_inverse import covariance_factor
+from train.dmd import channel_path, mode_amplitudes, split_group_state
 from train.reproject import lonlat_interpolator
 from train.tucker import tucker_inverse
 from weather.model import PER_CELL_FIRST_STEP, WeatherModel, core_dataset
@@ -80,47 +73,6 @@ def _delta_n(times64: np.ndarray, t_train_start: datetime, dt: float) -> np.ndar
         )
     result: np.ndarray = seconds / dt
     return result
-
-
-def _stationary_draw(ou: ModeOUFit, rng: np.random.Generator) -> np.ndarray:
-    """One draw of a group's channels from their joint stationary law, ``(n_c,)``."""
-    result: np.ndarray = covariance_factor(ou_stationary_cov(ou)) @ rng.standard_normal(ou.phi.size)
-    return result
-
-
-def _channel_path(ou: ModeOUFit, delta_n: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """One realization of a group's channels at increasing times, ``(n_c, n_t)`` (§5.8 step 1).
-
-    A stationary draw at the first time, then the closed-form transition
-    across each gap to the next time. The channels are a Markov process, so
-    this gives the exact joint law at every requested time, regular grid or
-    not. Each distinct gap is factorized once: a regular grid needs one
-    factorization, and its one-step noise covariance is the innovation
-    covariance itself.
-
-    Parameters
-    ----------
-    ou : ModeOUFit
-    delta_n : (n_t,) float, strictly increasing
-        Steps since the training window's first snapshot.
-    rng : np.random.Generator
-
-    Returns
-    -------
-    (n_c, n_t) float64
-    """
-    path = np.empty((ou.phi.size, delta_n.size), dtype=np.float64)
-    path[:, 0] = _stationary_draw(ou, rng)
-    if delta_n.size == 1:
-        return path
-    gaps, gap_index = np.unique(np.diff(delta_n), return_inverse=True)
-    decay, noise_cov = ou_transition(ou, gaps)
-    factors = covariance_factor(noise_cov)
-    standard_normal = rng.standard_normal((delta_n.size - 1, ou.phi.size))
-    for step in range(1, delta_n.size):
-        k = gap_index[step - 1]
-        path[:, step] = decay[k] * path[:, step - 1] + factors[k] @ standard_normal[step - 1]
-    return path
 
 
 def _gaussianized_cores(
@@ -279,7 +231,7 @@ def sample_batch(
     delta_n = _delta_n(unique_times, model.metadata_.t_train_start, _cadence_seconds(model))
 
     rng = np.random.default_rng(seed)
-    channels = {g: _channel_path(ou, delta_n, rng) for g, ou in model.mode_ou_.items()}
+    channels = {g: channel_path(ou, delta_n, rng) for g, ou in model.mode_ou_.items()}
 
     pointwise, per_cell = _split_pipeline(model)
     wave_lats, wave_lons = _wave_grid_coordinates(model)
@@ -393,7 +345,7 @@ def simulate_field(
     delta_n = _delta_n(times64, model.metadata_.t_train_start, dt)
 
     rng = np.random.default_rng(seed)
-    channels = {g: _channel_path(ou, delta_n, rng) for g, ou in model.mode_ou_.items()}
+    channels = {g: channel_path(ou, delta_n, rng) for g, ou in model.mode_ou_.items()}
     anomaly = _standardized_anomaly(model, _gaussianized_cores(model, channels, delta_n))
     physical: xr.Dataset = model.preprocess_.inverse_transform(
         _grid_dataset(model, anomaly, times64)
