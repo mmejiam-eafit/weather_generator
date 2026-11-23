@@ -7,6 +7,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — Probes behind the LIM tau-test stage kept** —
+  `notebooks/probes/07_lim_tau_test_first_run.py`,
+  `notebooks/probes/07_lim_bootstrap_envelope.py` (new).
+  - **First run.** The first tau test on the production `wsh` core, with
+    5–95% percentile bands. `notebooks/07_lim_tau_test_wsh_core.py`, which
+    runs the pipeline stage, superseded it.
+  - **Bootstrap envelope.** `diagnose_group`'s bands at 10 and 100
+    replicates on a known coupled process. This backs the choice of
+    min–max envelopes over percentiles.
+
+  Both rerun against this tree.
+
 - **2026-11-22 — Probes behind the v3 sampler decisions kept** —
   `notebooks/probes/sampler_jump_vs_chain.py`,
   `notebooks/probes/sampler_per_time_cost.py` (new).
