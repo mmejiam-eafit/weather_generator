@@ -7,6 +7,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — `fastjsonschema` 2.22.0 → 2.22.3 in the lock file** —
+  `poetry.lock`. A dev-group transitive dependency (through `nbformat`); the
+  lock now also records its `python >= 3.10` requirement. No runtime change.
+
 - **2026-11-22 — Training-time memory scaling recorded as an open question**
   — `docs/open_questions.md` (new §9.1; "out of scope" renumbered to §10).
   A global era-3 fit needs ≥ ~300 GB for in-memory tier-1 preprocessing over
