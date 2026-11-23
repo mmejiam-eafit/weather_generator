@@ -1,6 +1,7 @@
 """Tests for train.directional (see docs/model_design.md §2.4, §3.7, §5.3)."""
 
 import numpy as np
+import pytest
 import xarray as xr
 from numpy.testing import assert_allclose
 from sklearn.base import clone
@@ -192,3 +193,56 @@ def test_sklearn_clone_going_to_to_uv() -> None:
     cloned = clone(transformer)
     assert isinstance(cloned, GoingToToUV)
     assert not hasattr(cloned, "pairs_")
+
+
+# ---------------------------------------------------------------------------
+# keep_speed (class-C heights survive as their own variable, §5.3)
+# ---------------------------------------------------------------------------
+
+
+def test_coming_from_to_uv_keep_speed_retains_magnitude() -> None:
+    """A kept speed stays in the Dataset next to (u, v); its direction is still replaced."""
+    ds = _cardinal_dataset("wsh", "wsd")
+    transformer = ComingFromToUV(pairs=[("wsh", "wsd", "u_wsea", "v_wsea")], keep_speed=("wsh",))
+
+    Z = transformer.fit_transform(ds)
+
+    assert {"wsh", "u_wsea", "v_wsea"} <= set(Z.data_vars)
+    assert "wsd" not in Z.data_vars
+    assert_allclose(Z["wsh"].values, ds["wsh"].values)
+
+
+def test_coming_from_to_uv_keep_speed_inverse_uses_kept_magnitude() -> None:
+    """With a kept speed, the inverse takes magnitude from it and only direction from (u, v)."""
+    ds = _cardinal_dataset("wsh", "wsd")
+    transformer = ComingFromToUV(pairs=[("wsh", "wsd", "u_wsea", "v_wsea")], keep_speed=("wsh",))
+    Z = transformer.fit_transform(ds)
+    Z["wsh"] = Z["wsh"] * 0.7  # differs from hypot(u, v) = 10 on purpose
+
+    recovered = transformer.inverse_transform(Z)
+
+    assert_allclose(recovered["wsh"].values, 0.7 * _SPEED_VAL)
+    assert_allclose(recovered["wsd"].values.ravel(), _CARDINAL_THETAS, atol=1e-10)
+
+
+def test_going_to_to_uv_keep_speed_inverse_uses_kept_magnitude() -> None:
+    """Same contract for the going-to transformer."""
+    ds = _cardinal_dataset("ocs", "ocd")
+    transformer = GoingToToUV(pairs=[("ocs", "ocd", "u_current", "v_current")], keep_speed=("ocs",))
+    Z = transformer.fit_transform(ds)
+    Z["ocs"] = Z["ocs"] * 0.5
+
+    recovered = transformer.inverse_transform(Z)
+
+    assert "ocd" not in Z.data_vars
+    assert_allclose(recovered["ocs"].values, 0.5 * _SPEED_VAL)
+    assert_allclose(recovered["ocd"].values.ravel(), _CARDINAL_THETAS, atol=1e-10)
+
+
+def test_coming_from_to_uv_keep_speed_rejects_unknown_variable() -> None:
+    """keep_speed must name the speed of an owned pair; validated lazily in fit()."""
+    ds = _cardinal_dataset("wsh", "wsd")
+    transformer = ComingFromToUV(pairs=[("wsh", "wsd", "u_wsea", "v_wsea")], keep_speed=("wsd",))
+
+    with pytest.raises(ValueError, match="keep_speed"):
+        transformer.fit(ds)

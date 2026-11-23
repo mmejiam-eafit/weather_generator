@@ -8,6 +8,8 @@ import xarray as xr
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
+from core.config import check_canonical
+
 # Default diurnal-harmonic variables when `diurnal_variables` is unset (see §5.4).
 # Waves have no diurnal cycle at 0.25° global resolution, so wave-grid scalars
 # are deliberately excluded.
@@ -128,6 +130,7 @@ class ClimatologyRemover(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         -------
         self
         """
+        check_canonical(X, context="ClimatologyRemover.fit")
         first_time = X["time"].values[0]
         last_time = X["time"].values[-1]
         self.t_train_start_ = first_time.astype("datetime64[s]").item().replace(tzinfo=timezone.utc)
@@ -187,6 +190,7 @@ class ClimatologyRemover(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         xr.Dataset
             `X` with each variable replaced by its anomaly (value minus climatology).
         """
+        check_canonical(X, context="ClimatologyRemover.transform")
         result = X.copy()
         for variable, mu in self._climatology(X).items():
             result[variable] = result[variable] - mu
@@ -205,6 +209,7 @@ class ClimatologyRemover(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         xr.Dataset
             `X` with each variable's climatology added back.
         """
+        check_canonical(X, context="ClimatologyRemover.inverse_transform")
         result = X.copy()
         for variable, mu in self._climatology(X).items():
             result[variable] = result[variable] + mu

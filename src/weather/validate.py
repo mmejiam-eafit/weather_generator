@@ -2,10 +2,11 @@
 
 (see docs/model_design.md §6)
 
-Checks 1-7 are implemented here. Check 8 ("end-to-end consumer test") is
-explicitly out of scope for this library: it requires running a
-consumer-specific downstream application on real vs. synthetic weather,
-which cannot be automated generically.
+Implements the QQ, spectra, variogram, joint-density, extreme-statistics,
+throughput and held-out Gaussianized-core checks, and adds a page with the
+§5.6.2 group diagnostics. The end-to-end consumer test is out of scope for
+this library: it requires running a consumer-specific downstream application
+on real vs. synthetic weather, which cannot be automated generically.
 """
 
 import matplotlib
@@ -27,8 +28,11 @@ from scipy import signal, stats
 from sklearn.utils.validation import check_is_fitted
 
 from core.io import require_utc
+from train.fidelity import fidelity_summary
 from train.ingest import load_training_window
-from weather.model import WeatherModel
+from train.linear_inverse import diagnostics_summary
+from train.tucker import fill_land, tucker_transform
+from weather.model import PER_CELL_FIRST_STEP, WeatherModel, core_dataset
 from weather.simulate import sample_batch, simulate_field
 
 _EARTH_RADIUS_KM: Final[float] = 6371.0
@@ -49,17 +53,16 @@ def _load_real_physical(
 
     (see docs/model_design.md §4, §6)
 
-    Runs only the directional-decompose / reproject / directional-recombine
-    steps of the fitted preprocessing chain, skipping climatology,
-    standardization, and the copula, so the result is directly comparable
-    to `weather.simulate.simulate_field`'s physical-unit output.
+    Runs the fitted Pipeline forward through reprojection and back, skipping
+    climatology and standardization. The round trip applies what the
+    sampler applies to its own output -- absent partitions decode to height
+    0, wind is resampled onto the wave grid -- so the result is directly
+    comparable to `weather.simulate.simulate_field`'s.
     """
     x_raw = load_training_window(data_dir, t_start, t_end, model.variables)
-    coming_from = model.preprocess_.named_steps["coming_from_to_uv"]
-    going_to = model.preprocess_.named_steps["going_to_to_uv"]
-    reproject = model.preprocess_.named_steps["reproject"]
-    on_wave_grid = reproject.transform(going_to.transform(coming_from.transform(x_raw)))
-    result: xr.Dataset = coming_from.inverse_transform(going_to.inverse_transform(on_wave_grid))
+    names = [name for name, _ in model.preprocess_.steps]
+    to_wave_grid = model.preprocess_[: names.index(PER_CELL_FIRST_STEP) + 1]
+    result: xr.Dataset = to_wave_grid.inverse_transform(to_wave_grid.transform(x_raw))
     return result
 
 
@@ -183,7 +186,7 @@ def spectra_check(
     """
     rng = np.random.default_rng(rng)
     cells = _random_ocean_cells(model, n_cells, rng)
-    fs = 1.0 / model.dmd_.dt
+    fs = 1.0 / next(iter(model.dmd_.values())).dt  # every group shares the snapshot cadence
 
     fig, axes = plt.subplots(1, len(variables), figsize=(5 * len(variables), 5), squeeze=False)
     for ax, variable in zip(axes[0], variables):
@@ -422,16 +425,18 @@ def held_out_normality_check(
     held_out_dir: Path,
     held_out_start: datetime,
     held_out_end: datetime,
-    n_cells: int = 30,
+    n_coefficients: int = 30,
     rng: np.random.Generator | None = None,
 ) -> dict[str, np.ndarray]:
-    """KS-test p-values for standard normality at random cells (see docs/model_design.md §6 check 7).
+    """KS-test p-values of held-out Gaussianized core coefficients (see model_design.md §6 check 7).
 
-    Applies only the fitted preprocessing chain (`model.transform`) to
-    held-out data — no simulation involved — and checks whether the
-    resulting per-cell values are standard normal, per internal (post-
-    decomposition) variable. Systematic non-normality means the copula or
-    climatology overfit the training window.
+    v3 Gaussianizes the Tucker core, not grid cells (§5.5.1), so this
+    applies the preprocessing chain (`model.transform`), projects each
+    tensor onto its Tucker factors, applies that tensor's core copula, and
+    tests `n_coefficients` random coefficient series against N(0, 1).
+    Systematic non-normality means the copula or climatology overfit the
+    training window. Snapshots with NaN at an ocean cell (an ingest gap)
+    are dropped before projecting.
 
     Parameters
     ----------
@@ -439,30 +444,33 @@ def held_out_normality_check(
     held_out_dir : Path
     held_out_start, held_out_end : datetime
         UTC-aware.
-    n_cells : int
+    n_coefficients : int
     rng : np.random.Generator | None
 
     Returns
     -------
     dict[str, np.ndarray]
-        KS-test p-values, one array of length `n_cells` per variable
-        (``nan`` at cells with fewer than 8 non-NaN samples).
+        Tensor -> p-values, one per sampled coefficient (``nan`` when fewer
+        than 8 snapshots remain).
     """
     rng = np.random.default_rng(rng)
-    gaussianized = model.transform(held_out_dir, held_out_start, held_out_end)
-    cells = _random_ocean_cells(model, n_cells, rng)
-
+    anomalies = model.transform(held_out_dir, held_out_start, held_out_end)
+    ocean = model.ocean_mask_
     p_values: dict[str, np.ndarray] = {}
-    for variable in gaussianized.data_vars:
-        variable_name = str(variable)
-        pvalues_for_variable = np.full(cells.shape[0], np.nan)
-        for i, (lat_idx, lon_idx) in enumerate(cells):
-            series = gaussianized[variable_name].values[:, lat_idx, lon_idx]
-            series = series[~np.isnan(series)]
-            if series.shape[0] < 8:
-                continue
-            pvalues_for_variable[i] = stats.kstest(series, "norm").pvalue
-        p_values[variable_name] = pvalues_for_variable
+    for tensor in model.tensor_names_:
+        field = anomalies[tensor].values
+        complete = ~np.isnan(field[:, ocean]).any(axis=1)
+        core = tucker_transform(fill_land(field[complete], ocean), model.tucker_[tensor])
+        gaussianized = model.core_copula_[tensor].transform(core_dataset(tensor, core))
+        flat = gaussianized[tensor].values.reshape(core.shape[0], -1)
+        chosen = rng.choice(flat.shape[1], size=min(n_coefficients, flat.shape[1]), replace=False)
+        p_values[tensor] = np.array(
+            [
+                stats.kstest(flat[:, j], "norm").pvalue if flat.shape[0] >= 8 else np.nan
+                for j in chosen
+            ],
+            dtype=np.float64,
+        )
     return p_values
 
 
@@ -542,7 +550,21 @@ def full_report(
         f"frac p<0.05={np.nanmean(values < 0.05):.2%}"
         for variable, values in p_values.items()
     ]
-    figures.append(_text_page("Held-out normality, KS test (§6 check 7)", normality_lines))
+    figures.append(
+        _text_page("Held-out Gaussianized-core normality, KS test (§6 check 7)", normality_lines)
+    )
+    figures.append(
+        _text_page(
+            "Group dynamics diagnostics (§5.6.2)",
+            [diagnostics_summary(d) for d in model.group_diagnostics_.values()],
+        )
+    )
+    figures.append(
+        _text_page(
+            "Generative fidelity (§5.6.3)",
+            [fidelity_summary(d) for d in model.fidelity_diagnostics_.values()],
+        )
+    )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with PdfPages(output) as pdf:

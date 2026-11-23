@@ -45,6 +45,43 @@ it.
    for a variable/region with a smaller contiguous land region and check
    whether sensitivity correlates with land-region size, as hypothesized.
 
+**Update (task 07, 2026-09-29):** task 07's cost-cliff investigation found
+and fixed two real bugs in `tensorly`'s masked-ALS loop — a memory-hungry
+mask-blend and a silently-ignored `svd="randomized_svd"` request — now
+vendored in `src/train/masked_tucker.py::partial_tucker_lowmem`. That work
+validated the fixed implementation converges monotonically and
+predictably at real full-grid scale (20/30/40% ranks, all fixed-seed,
+multi-hour VM runs), but never tested multi-initialization sensitivity —
+every run used a single fixed `random_state`. Task 08's own notebook was
+originally scaffolded before any of task 07's work existed (raw `wsh`,
+era 3, 1 month, mask derived from `wsh`'s own NaN pattern — the exact
+task-17 conflation bug above — and plain unfixed `tensorly.partial_tucker`
+with `init="random"`), so it did *not* actually call the fixed
+implementation despite this note previously implying it did.
+
+**Redefined 2026-09-29** to genuinely reuse task 07's artifacts: era-2
+grid, `wsh`, a 2-month sub-window (2024-01-01 to 2024-03-01) inside the
+span task 07's fitted transformers cover; loads `era2_ocean_mask.npy`
+(already computed via `land_mask_from_sigwh`, satisfying this step's own
+requirement) instead of deriving a mask from NaN; applies the
+already-fitted `wsh_climatology.joblib`/`wsh_standardize.joblib`
+(`.transform()` only, no re-fit) through the same pipeline order as
+`notebooks/07_placement2_tucker_on_anomalies.py`; and now genuinely calls
+`partial_tucker_lowmem`. One real wrinkle: that function only supports
+`init="svd"` or an `(core, factors)` tuple — `init="random"` is
+unsupported by design ("no call site here ever uses it"). The notebook
+now builds a genuinely-random `(core, factors)` tuple per seed itself
+(uniform-random factors, projected through `multi_mode_dot` for a
+correctly-shaped initial core) rather than using an SVD-anchored start,
+which stays true to this task's actual question — do different starting
+points converge to different local optima. Rank (`[20, 40]`, ~3% of the
+era-2 grid) and iteration budget (fixed `n_iter_max=100`, not full
+convergence) were both chosen deliberately small for local tractability
+across 8 separate fits, not for production realism — this task's
+question is about spread across inits, not full convergence, so early
+divergence is itself a valid signal. This task remains open — the
+notebook is redefined and ready to execute, but has not been run.
+
 ## 3. Notebook(s) needed
 
 - `notebooks/08_masked_hooi_convergence.ipynb` — loads `wsh`, fits 8

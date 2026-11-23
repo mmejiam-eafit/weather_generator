@@ -1,17 +1,23 @@
 """WeatherModel: sklearn-compatible wrapper gluing preprocessing to Tucker/DMD/OU.
 
 (see docs/model_design.md §7, §8.4, §8.5)
+
+v3 architecture: one preprocessing Pipeline ending at the standardized
+anomaly, then per tensor a masked Tucker fit and a Gaussian copula on its
+core, then per variable group a DMD, a mode-level OU, the §5.6.2
+diagnostics stage and the §5.6.3 generative fidelity stage, which gates the
+fit: a model whose samples do not resemble its training cores is never built.
 """
 
 import importlib.metadata
 import json
 import subprocess
-import sys
 import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Self
+from typing import Any, Final, Literal, Self
 
 import joblib
 import numpy as np
@@ -23,15 +29,64 @@ from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_is_fitted
 
 from core.archive_eras import era_for_timestamp
+from core.logger import logger
 from train.climatology import ClimatologyRemover
 from train.copula import GaussianCopula
 from train.directional import ComingFromToUV, GoingToToUV
-from train.dmd import DMDFit, ModeOUFit, dmd_fit, fit_mode_ou
+from train.dmd import DMDFit, ModeOUFit, dmd_fit, fit_mode_ou, group_state
+from train.fidelity import (
+    FidelityDiagnostics,
+    MemoryCheck,
+    TimeOfDayCheck,
+    VarianceCheck,
+    diagnose_fidelity,
+    fidelity_summary,
+)
 from train.ingest import load_training_window
-from train.local_residual import LocalResidualFit, coherent_reconstruction, fit_local_residual
+from train.linear_inverse import (
+    GroupCouplingReport,
+    GroupDiagnostics,
+    LIMFit,
+    TauTestResult,
+    diagnose_group,
+)
+from train.masking import LogTransform, PartitionSentinelFiller
 from train.reproject import Reprojector
 from train.standardize import PerCellStandardizer
-from train.tucker import TuckerFit, tucker_fit, tucker_transform
+from train.tucker import TuckerFit, fill_land, tucker_fit
+
+# Canonical tensor derivation (docs/model_design.md §5.3, §5.3.1, §10). A
+# pair, partition or log entry is wired in only when all of its source
+# variables are in `WeatherModel.variables`, so one table serves every tier.
+PARTITIONS: Final[dict[str, tuple[str, str]]] = {
+    "wsh": ("wsp", "wsd"),
+    "pswh": ("pswp", "pswd"),
+}
+COMING_FROM_PAIRS: Final[tuple[tuple[str, str, str, str], ...]] = (
+    ("wsh", "wsd", "u_wsea", "v_wsea"),
+    # `wad_come_from`, never `wad`: the source of truth for wind (§3.7, §9 gotcha 5a).
+    ("was", "wad_come_from", "u_wind", "v_wind"),
+    ("pwh", "pwd", "u_pwave", "v_pwave"),
+    ("pswh", "pswd", "u_pswell", "v_pswell"),
+)
+GOING_TO_PAIRS: Final[tuple[tuple[str, str, str, str], ...]] = (
+    ("ocs", "ocd", "u_current", "v_current"),
+)
+KEPT_SPEEDS: Final[tuple[str, ...]] = ("wsh", "pswh")  # class C: also their own logE tensor
+LOG_HEIGHTS: Final[dict[str, str]] = {
+    "sigwh": "logE_sigwh",
+    "wsh": "logE_wsh",
+    "pswh": "logE_pswh",
+}
+LOG_PERIODS: Final[dict[str, str]] = {"wsp": "T_wsp", "pwp": "T_pwp", "pswp": "T_pswp"}
+LOG_FLOOR_M: Final[float] = 0.01
+
+# The first per-cell Pipeline step: steps before it are pointwise (the
+# sampler applies them after interpolation), steps from it onward are per
+# grid cell (applied before), see §5.8 steps 4 and 6.
+PER_CELL_FIRST_STEP: Final[str] = "reproject"
+
+_CORE_DIMS: Final[tuple[str, str, str]] = ("time", "core_lat", "core_lon")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,9 +97,10 @@ class ModelMetadata:
     t_train_start: datetime
     t_train_end: datetime
     t_ref: datetime  # climatology trend reference epoch (training window midpoint)
-    variables: tuple[str, ...]
-    r_ocean: int
-    r_var: int
+    variables: tuple[str, ...]  # raw archive fields loaded
+    tensors: tuple[str, ...]  # modeled tensors (§10)
+    groups: dict[str, tuple[str, ...]]  # group name -> member tensors
+    tucker_ranks: dict[str, tuple[int, int]]  # tensor -> (r_lat, r_lon)
     r_dmd: int
     dmd_variant: str
     include_trend: bool
@@ -71,43 +127,115 @@ def _current_git_commit() -> str:
         return "unknown"
 
 
-def _mask_and_stack(gaussianized: xr.Dataset) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
-    """Build the ocean mask and ravel Gaussianized variables into ``(T, N_ocean, V)``.
+def build_preprocess(
+    variables: list[str],
+    diurnal_variables: list[str] | None = None,
+    include_trend: bool = True,
+    trend_significance_threshold: float = 0.1,
+) -> Pipeline:
+    """The v3 preprocessing Pipeline for a set of raw archive fields (see §5.3, §5.3.1, §5.4).
 
-    (see docs/model_design.md §5.1)
-
-    The mask is the intersection of not-NaN across every training
-    snapshot and every modeled variable on the (post-reprojection) wave
-    grid: a cell that is NaN in any modeled variable at even one
-    snapshot (land, or ice-covered mid-training) is excluded.
+    Order: sentinel fill → ``(u, v)`` decomposition → log transforms →
+    reprojection → climatology → standardization. Each table entry above is
+    included only when its source variables are all present, so tier 1's
+    variables give tier 1's seven tensors. `GoingToToUV` stays in the
+    Pipeline even with no pairs, where tier 3's currents will go (§5.3).
 
     Parameters
     ----------
-    gaussianized : xr.Dataset
-        Output of the fitted preprocessing Pipeline, dims
-        ``(time, wave_lat, wave_lon)`` per variable.
+    variables : list[str]
+        Raw archive fields (§10). Must include ``sigwh``, which defines the
+        land mask (§5.1).
+    diurnal_variables, include_trend, trend_significance_threshold
+        Passed to `ClimatologyRemover` (§5.4).
 
     Returns
     -------
-    ocean_mask : (n_lat, n_lon) bool
-    variable_names : tuple[str, ...]
-        `gaussianized`'s variables, in the order stacked into `Z`.
-    Z : (T, N_ocean, V) float64
+    Pipeline
+        Unfitted.
     """
-    variable_names = tuple(str(name) for name in gaussianized.data_vars)
-    spatial_shape = gaussianized[variable_names[0]].shape[1:]
+    present = set(variables)
+    partitions = {
+        height: fields for height, fields in PARTITIONS.items() if {height, *fields} <= present
+    }
+    coming_from = [pair for pair in COMING_FROM_PAIRS if {pair[0], pair[1]} <= present]
+    going_to = [pair for pair in GOING_TO_PAIRS if {pair[0], pair[1]} <= present]
+    kept = tuple(speed for speed, *_ in coming_from if speed in KEPT_SPEEDS)
+    heights = {source: tensor for source, tensor in LOG_HEIGHTS.items() if source in present}
+    periods = {source: tensor for source, tensor in LOG_PERIODS.items() if source in present}
+    return Pipeline(
+        [
+            ("sentinel", PartitionSentinelFiller(partitions=partitions, floor_m=LOG_FLOOR_M)),
+            ("coming_from_to_uv", ComingFromToUV(pairs=coming_from, keep_speed=kept)),
+            ("going_to_to_uv", GoingToToUV(pairs=going_to)),
+            ("log", LogTransform(heights=heights, periods=periods, floor_m=LOG_FLOOR_M)),
+            (PER_CELL_FIRST_STEP, Reprojector(target_grid="wave")),
+            (
+                "climatology",
+                ClimatologyRemover(
+                    diurnal_variables=diurnal_variables,
+                    include_trend=include_trend,
+                    trend_significance_threshold=trend_significance_threshold,
+                ),
+            ),
+            ("standardize", PerCellStandardizer()),
+        ]
+    )
 
-    ocean_mask = np.ones(spatial_shape, dtype=bool)
-    for name in variable_names:
-        ocean_mask &= ~np.isnan(gaussianized[name].values).any(axis=0)
 
-    n_times = gaussianized[variable_names[0]].shape[0]
-    n_ocean = int(ocean_mask.sum())
-    z = np.empty((n_times, n_ocean, len(variable_names)), dtype=np.float64)
-    for i, name in enumerate(variable_names):
-        z[:, :, i] = gaussianized[name].values[:, ocean_mask]
+def core_dataset(tensor: str, core: np.ndarray) -> xr.Dataset:
+    """Wrap one tensor's ``(T, r_lat, r_lon)`` core so `GaussianCopula` accepts it (§5.5.1).
 
-    return ocean_mask, variable_names, z
+    The copula checks canonical ``(time, *_lat, *_lon)`` dims; the core's
+    coefficient axes are named ``core_lat`` / ``core_lon`` to pass it.
+    """
+    return xr.Dataset({tensor: (_CORE_DIMS, core)})
+
+
+def resolve_groups(
+    groups: Mapping[str, list[str]] | None, tensors: tuple[str, ...]
+) -> dict[str, tuple[str, ...]]:
+    """Variable groups for DMD, one single-member group per tensor by default (§5.6.2).
+
+    Parameters
+    ----------
+    groups : Mapping[str, list[str]] | None
+        Group name -> member tensors, or `None`.
+    tensors : tuple[str, ...]
+        Every modeled tensor.
+
+    Returns
+    -------
+    dict[str, tuple[str, ...]]
+
+    Raises
+    ------
+    ValueError
+        If the groups name an unknown tensor, or do not cover every tensor
+        exactly once: a tensor outside every group would have no dynamics to
+        sample from.
+    """
+    if groups is None:
+        return {tensor: (tensor,) for tensor in tensors}
+    resolved = {name: tuple(members) for name, members in groups.items()}
+    assigned = [member for members in resolved.values() for member in members]
+    unknown = sorted(set(assigned) - set(tensors))
+    if unknown:
+        raise ValueError(f"groups name unknown tensors {unknown}; tensors are {list(tensors)}")
+    repeated = sorted({m for m in assigned if assigned.count(m) > 1})
+    missing = sorted(set(tensors) - set(assigned))
+    if repeated or missing:
+        raise ValueError(
+            f"groups must cover every tensor exactly once (docs/model_design.md §5.6.2); "
+            f"repeated: {repeated}, missing: {missing}"
+        )
+    return resolved
+
+
+def _tucker_rank(fraction: float, grid_shape: tuple[int, ...]) -> tuple[int, int]:
+    """``round(fraction · (H, W))``, at least 1 per mode (§5.5)."""
+    n_lat, n_lon = grid_shape
+    return max(1, round(fraction * n_lat)), max(1, round(fraction * n_lon))
 
 
 def _log_trend_significance(
@@ -119,52 +247,233 @@ def _log_trend_significance(
 
     (see docs/model_design.md §3.9, §5.4)
 
-    Per variable, ``ratio = |c_lin_[v]| / sigma_cell_[v]``: the fitted trend
+    Per tensor, ``ratio = |c_lin_[v]| / sigma_cell_[v]``: the fitted trend
     slope's magnitude relative to that cell's temporal standard deviation.
-    `climatology.c_lin_` only has entries when `climatology.include_trend`
-    was `True` at fit time, so this is a no-op (nothing logged) when the
-    trend term was disabled.
-
-    Parameters
-    ----------
-    climatology : ClimatologyRemover
-        Fitted; consulted for `c_lin_`.
-    standardize : PerCellStandardizer
-        Fitted; consulted for `sigma_cell_`.
-    threshold : float
-        Ratio above which a cell's trend is considered significant.
+    `climatology.c_lin_` only has entries when the trend term was fitted, so
+    nothing is logged when it was disabled.
     """
-    for variable, c_lin in climatology.c_lin_.items():
-        sigma = standardize.sigma_cell_[variable]
-        ratio = np.abs(c_lin) / sigma
-        exceeds_fraction = float(np.nanmean(ratio > threshold))
-        print(
-            f"trend significance ({variable!r}): {exceeds_fraction:.1%} of cells exceed "
-            f"|c_lin|/sigma_cell > {threshold}",
-            file=sys.stderr,
+    for tensor, c_lin in climatology.c_lin_.items():
+        ratio = np.abs(c_lin) / standardize.sigma_cell_[tensor]
+        logger.info(
+            "trend significance",
+            tensor=tensor,
+            exceeds_fraction=float(np.nanmean(ratio > threshold)),
+            threshold=threshold,
+        )
+
+
+def _log_period_sentinels(sentinel: PartitionSentinelFiller) -> None:
+    """Log each partition's period sentinel and its two estimators' agreement (§5.3.1)."""
+    for period, estimate in sentinel.period_sentinel_estimates_.items():
+        logger.info(
+            "period sentinel",
+            period=period,
+            sentinel_s=estimate.extrapolated_intercept,
+            conditional_median_s=estimate.conditional_median,
+            agreement_s=estimate.agreement,
+        )
+
+
+def _log_group_diagnostics(group: str, diagnostics: GroupDiagnostics) -> None:
+    """Log one group's §5.6.2 verdicts: lags outside the tau-test band, coupling flags."""
+    hours = diagnostics.lim.dt / 3600.0
+    logger.info(
+        "group diagnostics",
+        group=group,
+        members=list(diagnostics.members),
+        tau_inconsistent_lags_h=[
+            float(lag * hours)
+            for lag, ok in zip(diagnostics.tau.lags, diagnostics.tau_consistent)
+            if not ok
+        ],
+        coupling_significant=diagnostics.coupling_significant,
+        noise_coupling_significant=diagnostics.noise_coupling_significant,
+    )
+
+
+def _fit_tensor_compression(
+    a_std: xr.Dataset,
+    ocean_mask: np.ndarray,
+    rank_fraction: float,
+    max_iter: int,
+    tol: float,
+    copula_lut_bins: int,
+    rng: np.random.Generator,
+) -> tuple[dict[str, TuckerFit], dict[str, GaussianCopula], dict[str, np.ndarray]]:
+    """Per tensor: masked Tucker, then a copula on its core (§5.5, §5.5.1).
+
+    Returns
+    -------
+    tucker : tensor -> TuckerFit
+    core_copula : tensor -> fitted GaussianCopula
+    gaussianized_core : tensor -> ``(T, r_lat, r_lon)``
+    """
+    rank = _tucker_rank(rank_fraction, ocean_mask.shape)
+    tucker: dict[str, TuckerFit] = {}
+    core_copula: dict[str, GaussianCopula] = {}
+    gaussianized_core: dict[str, np.ndarray] = {}
+    for name in a_std.data_vars:
+        tensor = str(name)
+        x = fill_land(a_std[tensor].values, ocean_mask)
+        fit, core = tucker_fit(x, ocean_mask, rank, rng, n_iter_max=max_iter, tol=tol)
+        logger.info(
+            "tucker fit",
+            tensor=tensor,
+            rank=list(rank),
+            reconstruction_error=fit.reconstruction_error,
+            n_iter=fit.n_iter,
+        )
+        copula = GaussianCopula(n_bins=copula_lut_bins).fit(core_dataset(tensor, core))
+        tucker[tensor] = fit
+        core_copula[tensor] = copula
+        gaussianized_core[tensor] = copula.transform(core_dataset(tensor, core))[tensor].values
+    return tucker, core_copula, gaussianized_core
+
+
+def _fit_group_dynamics(
+    gaussianized_core: Mapping[str, np.ndarray],
+    groups: Mapping[str, tuple[str, ...]],
+    dt: float,
+    r_dmd: int,
+    dmd_variant: Literal["exact", "bop", "hankel"],
+    lim_rank: int,
+    tau_test_lags: tuple[int, ...],
+    n_bootstrap: int,
+    rng: np.random.Generator,
+) -> tuple[dict[str, DMDFit], dict[str, ModeOUFit], dict[str, GroupDiagnostics]]:
+    """Per group: DMD and mode OU on the joint state, then the §5.6.2 diagnostics.
+
+    A group's DMD rank is ``min(r_dmd, n_G, T − 1)`` (§5.6), and each
+    member's LIM rank is capped at its core size and `T`, which small test
+    grids otherwise exceed.
+    """
+    dmd: dict[str, DMDFit] = {}
+    mode_ou: dict[str, ModeOUFit] = {}
+    diagnostics: dict[str, GroupDiagnostics] = {}
+    for group, members in groups.items():
+        state = group_state(gaussianized_core, members)
+        n_times, n_state = state.shape
+        dmd[group] = dmd_fit(
+            state,
+            r_dmd=min(r_dmd, n_state, n_times - 1),
+            dt=dt,
+            rng=rng,
+            variant=dmd_variant,
+        )
+        mode_ou[group] = fit_mode_ou(state, dmd[group])
+        cores = {member: gaussianized_core[member] for member in members}
+        diagnostics[group] = diagnose_group(
+            cores=cores,
+            ranks={member: min(lim_rank, cores[member][0].size, n_times) for member in members},
+            dt=dt,
+            test_lags=list(tau_test_lags),
+            n_bootstrap=n_bootstrap,
+            rng=rng,
+        )
+        _log_group_diagnostics(group, diagnostics[group])
+    return dmd, mode_ou, diagnostics
+
+
+def _diagnose_group_fidelity(
+    gaussianized_core: Mapping[str, np.ndarray],
+    groups: Mapping[str, tuple[str, ...]],
+    dmd: Mapping[str, DMDFit],
+    mode_ou: Mapping[str, ModeOUFit],
+    times: np.ndarray,
+    fidelity_lags: tuple[int, ...],
+    lim_rank: int,
+    fidelity_replicates: int,
+    rng: np.random.Generator,
+) -> dict[str, FidelityDiagnostics]:
+    """Per group: the §5.6.3 generative fidelity stage on the state DMD was fit on.
+
+    PCs per member follow the §5.6.2 cap (`lim_rank`, the core size, `T`),
+    so the memory check reads the subspace the tau test reads.
+    """
+    fidelity: dict[str, FidelityDiagnostics] = {}
+    for group, members in groups.items():
+        state = group_state(gaussianized_core, members)
+        n_times = state.shape[0]
+        sizes = {member: gaussianized_core[member][0].size for member in members}
+        fidelity[group] = diagnose_fidelity(
+            state,
+            sizes,
+            dmd[group],
+            mode_ou[group],
+            times=times,
+            lags=list(fidelity_lags),
+            ranks={member: min(lim_rank, sizes[member], n_times) for member in members},
+            n_replicates=fidelity_replicates,
+            rng=rng,
+        )
+        _log_fidelity_diagnostics(group, fidelity[group])
+    return fidelity
+
+
+def _log_fidelity_diagnostics(group: str, diagnostics: FidelityDiagnostics) -> None:
+    """Log one group's §5.6.3 verdicts, at warning level when it fails."""
+    hours = diagnostics.dt / 3600.0
+    log = logger.info if diagnostics.passed else logger.warning
+    log(
+        "generative fidelity",
+        group=group,
+        passed=diagnostics.passed,
+        variance_ratio={m: c.ratio for m, c in diagnostics.variance.items()},
+        span_fraction={m: c.span_fraction for m, c in diagnostics.variance.items()},
+        memory_inconsistent_lags_h={
+            m: [float(lag * hours) for lag, ok in zip(c.lags, c.consistent) if not ok]
+            for m, c in diagnostics.memory.items()
+        },
+        time_of_day_share={m: c.share for m, c in diagnostics.time_of_day.items()},
+    )
+
+
+def _require_fidelity(fidelity: Mapping[str, FidelityDiagnostics]) -> None:
+    """Refuse a model whose samples fail the §5.6.3 checks; no bypass by design.
+
+    Raises
+    ------
+    ValueError
+        Naming the failing groups, with each one's `fidelity_summary`.
+    """
+    failed = {group: d for group, d in fidelity.items() if not d.passed}
+    if failed:
+        summaries = "\n\n".join(fidelity_summary(d) for d in failed.values())
+        raise ValueError(
+            f"generative fidelity checks failed for groups {sorted(failed)}: samples from the "
+            "fitted dynamics do not resemble the training cores, so no model is built "
+            f"(docs/model_design.md §5.6.3).\n\n{summaries}"
         )
 
 
 class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
-    """Stochastic weather generator with an sklearn-compatible transformer surface.
+    """Hierarchical stochastic weather generator (see docs/model_design.md §8.5).
 
-    (see docs/model_design.md §8.5)
+    Architecture (v3): per-tensor climatology + standardization, per-tensor
+    masked Tucker, Gaussian copula on each core, DMD + mode OU per variable
+    group. sklearn-compatible transformer surface.
 
     sklearn surface (via BaseEstimator + TransformerMixin):
         ``__init__`` carries hyperparameters only.
         ``fit(X, y=None)`` — end-to-end training.
         ``transform(X)`` — runs the preprocessing chain only.
-        ``fit_transform(X, y=None)`` — fit and transform in one pass, reusing
-            the anomalies computed during fit.
-        ``get_params()`` / ``set_params()`` — inherited from BaseEstimator.
+        ``fit_transform(X, y=None)`` — fit and transform in one pass.
 
     Custom surface: ``save``, ``load``, ``from_components``.
 
     Fitted attributes (trailing underscore per sklearn convention):
-        preprocess_, tucker_, dmd_, mode_ou_, local_residual_, ocean_mask_,
-        variable_names_, metadata_
-
-        `local_residual_` is `None` when fit with `include_local_residual=False`.
+        preprocess_        : Pipeline (sentinel fill → standardize)
+        ocean_mask_        : (H, W) bool, from sigwh (§5.1)
+        tensor_names_      : tuple[str, ...]
+        groups_            : dict[str, tuple[str, ...]]
+        tucker_            : dict[str, TuckerFit]        (tensor -> fit)
+        core_copula_       : dict[str, GaussianCopula]   (tensor -> fitted copula)
+        dmd_               : dict[str, DMDFit]           (group -> fit)
+        mode_ou_           : dict[str, ModeOUFit]        (group -> fit)
+        group_diagnostics_ : dict[str, GroupDiagnostics] (group -> §5.6.2 output)
+        fidelity_diagnostics_ : dict[str, FidelityDiagnostics] (group -> §5.6.3, all passed)
+        local_residual_    : None in v3 (§5.7)
+        metadata_          : ModelMetadata
 
     Sampling is **not** a method on this class — use the free functions in
     `weather.simulate` (`sample`, `sample_batch`, `simulate_field`).
@@ -175,16 +484,23 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         t_start: datetime,
         t_end: datetime,
         variables: list[str],
-        r_ocean: int = 300,
-        r_var: int = 6,
+        tucker_rank_fraction: float = 0.4,
+        tucker_max_iter: int = 300,
+        tucker_tol: float = 1e-5,
         r_dmd: int = 100,
         dmd_variant: Literal["exact", "bop", "hankel"] = "exact",
         copula_lut_bins: int = 500,
         diurnal_variables: list[str] | None = None,
         include_trend: bool = True,
         trend_significance_threshold: float = 0.1,
-        include_local_residual: bool = True,
+        include_local_residual: bool = False,
         local_residual_variance_floor: float = 0.02,
+        groups: dict[str, list[str]] | None = None,
+        lim_rank: int = 20,
+        tau_test_lags: tuple[int, ...] = (1, 2, 4, 8, 16),
+        fidelity_lags: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128),
+        fidelity_replicates: int = 100,
+        n_bootstrap: int = 100,
         random_state: int | None = None,
     ) -> None:
         # sklearn convention: __init__ only stores parameters, verbatim, no
@@ -192,8 +508,9 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         self.t_start = t_start
         self.t_end = t_end
         self.variables = variables
-        self.r_ocean = r_ocean
-        self.r_var = r_var
+        self.tucker_rank_fraction = tucker_rank_fraction
+        self.tucker_max_iter = tucker_max_iter
+        self.tucker_tol = tucker_tol
         self.r_dmd = r_dmd
         self.dmd_variant = dmd_variant
         self.copula_lut_bins = copula_lut_bins
@@ -202,109 +519,102 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         self.trend_significance_threshold = trend_significance_threshold
         self.include_local_residual = include_local_residual
         self.local_residual_variance_floor = local_residual_variance_floor
+        self.groups = groups
+        self.lim_rank = lim_rank
+        self.tau_test_lags = tau_test_lags
+        self.fidelity_lags = fidelity_lags
+        self.fidelity_replicates = fidelity_replicates
+        self.n_bootstrap = n_bootstrap
         self.random_state = random_state
 
-    def _fit_impl(self, X: Path, y: None = None) -> xr.Dataset:
-        """Shared fit logic; returns the Gaussianized anomalies for `fit_transform` to reuse."""
+    def _fit_impl(self, X: Path) -> xr.Dataset:
+        """Shared fit logic; returns the standardized anomalies for `fit_transform`."""
+        if self.include_local_residual:
+            raise ValueError(
+                "include_local_residual=True is not available in v3: the local residual "
+                "is deferred (docs/model_design.md §5.7, docs/open_questions.md §6.2)"
+            )
         rng = np.random.default_rng(self.random_state)
-
         x_raw = load_training_window(X, self.t_start, self.t_end, self.variables)
         # load_training_window already confirmed [t_start, t_end) falls in a single
-        # archive era (see train.ingest._resolve_window_era) — safe to derive dt
-        # from t_start alone rather than trusting a flat, era-2-only constant
-        # (see tasks/16-archive-grid-resolution-drift.md).
-        window_era = era_for_timestamp(self.t_start)
-        preprocess = Pipeline(
-            [
-                (
-                    "coming_from_to_uv",
-                    ComingFromToUV(
-                        pairs=[
-                            ("wsh", "wsd", "u_wsea", "v_wsea"),
-                            ("was", "wad_come_from", "u_wind", "v_wind"),
-                        ]
-                    ),
-                ),
-                (
-                    # Empty for tier 1; populated when tier 3 (ocean currents,
-                    # `ocd`) is enabled (see docs/model_design.md §5.3, §3.8).
-                    # `wad` is never wired here — `wad_come_from` is the source
-                    # of truth for wind direction (§3.7, §9 gotcha 5a).
-                    "going_to_to_uv",
-                    GoingToToUV(pairs=[]),
-                ),
-                ("reproject", Reprojector(target_grid="wave")),
-                (
-                    "climatology",
-                    ClimatologyRemover(
-                        diurnal_variables=self.diurnal_variables,
-                        include_trend=self.include_trend,
-                        trend_significance_threshold=self.trend_significance_threshold,
-                    ),
-                ),
-                ("standardize", PerCellStandardizer()),
-                ("gaussianize", GaussianCopula(n_bins=self.copula_lut_bins)),
-            ]
-        )
-        gaussianized: xr.Dataset = preprocess.fit_transform(x_raw)
+        # archive era, so dt comes from that era's cadence, not a flat constant
+        # (tasks/16-archive-grid-resolution-drift.md).
+        dt = era_for_timestamp(self.t_start).cadence_seconds
 
+        preprocess = build_preprocess(
+            self.variables,
+            self.diurnal_variables,
+            self.include_trend,
+            self.trend_significance_threshold,
+        )
+        a_std: xr.Dataset = preprocess.fit_transform(x_raw)
+        _log_period_sentinels(preprocess.named_steps["sentinel"])
         _log_trend_significance(
             preprocess.named_steps["climatology"],
             preprocess.named_steps["standardize"],
             self.trend_significance_threshold,
         )
 
-        ocean_mask, variable_names, z = _mask_and_stack(gaussianized)
-        tucker_fit_result = tucker_fit(z, r_ocean=self.r_ocean, r_var=self.r_var, rng=rng)
-        core = tucker_transform(z, tucker_fit_result)
-        dmd_fit_result = dmd_fit(
-            core,
-            r_dmd=self.r_dmd,
-            dt=window_era.cadence_seconds,
-            rng=rng,
-            variant=self.dmd_variant,
+        ocean_mask: np.ndarray = preprocess.named_steps["sentinel"].ocean_mask_
+        tensors = tuple(str(name) for name in a_std.data_vars)
+        groups = resolve_groups(self.groups, tensors)
+        tucker, core_copula, gaussianized_core = _fit_tensor_compression(
+            a_std,
+            ocean_mask,
+            self.tucker_rank_fraction,
+            self.tucker_max_iter,
+            self.tucker_tol,
+            self.copula_lut_bins,
+            rng,
         )
-        mode_ou_fit = fit_mode_ou(core, dmd_fit_result)
-
-        local_residual_fit: LocalResidualFit | None = None
-        if self.include_local_residual:
-            # DMD's deterministic-only reconstruction (b0 * Lambda**t, no
-            # mode-OU stochastic wobble added) — matches the pattern in
-            # weather.simulate's sample_batch/simulate_field. See
-            # train.local_residual.coherent_reconstruction's docstring for
-            # why the residual fit below is only meaningful without that
-            # wobble folded in.
-            tt = np.arange(z.shape[0])
-            a_det = dmd_fit_result.b0[:, None] * (dmd_fit_result.Lambda[:, None] ** tt[None, :])
-            x_det = (dmd_fit_result.Phi @ a_det).real
-            core_deterministic = x_det.T.reshape(z.shape[0], self.r_ocean, self.r_var)
-            z_coherent = coherent_reconstruction(core_deterministic, tucker_fit_result)
-            local_residual_fit = fit_local_residual(
-                z,
-                z_coherent,
-                dt=window_era.cadence_seconds,
-                variance_floor=self.local_residual_variance_floor,
-            )
+        dmd, mode_ou, diagnostics = _fit_group_dynamics(
+            gaussianized_core,
+            groups,
+            dt,
+            self.r_dmd,
+            self.dmd_variant,
+            self.lim_rank,
+            self.tau_test_lags,
+            self.n_bootstrap,
+            rng,
+        )
+        fidelity = _diagnose_group_fidelity(
+            gaussianized_core,
+            groups,
+            dmd,
+            mode_ou,
+            a_std.coords["time"].values,
+            self.fidelity_lags,
+            self.lim_rank,
+            self.fidelity_replicates,
+            rng,
+        )
+        _require_fidelity(fidelity)
 
         self.preprocess_ = preprocess
-        self.tucker_ = tucker_fit_result
-        self.dmd_ = dmd_fit_result
-        self.mode_ou_ = mode_ou_fit
-        self.local_residual_ = local_residual_fit
         self.ocean_mask_ = ocean_mask
-        self.variable_names_ = variable_names
+        self.tensor_names_ = tensors
+        self.groups_ = groups
+        self.tucker_ = tucker
+        self.core_copula_ = core_copula
+        self.dmd_ = dmd
+        self.mode_ou_ = mode_ou
+        self.group_diagnostics_ = diagnostics
+        self.fidelity_diagnostics_ = fidelity
+        self.local_residual_ = None
         self.metadata_ = ModelMetadata(
             trained_at=datetime.now(timezone.utc),
             t_train_start=self.t_start,
             t_train_end=self.t_end,
-            # Reuse the fitted ClimatologyRemover's own t_ref_ (the training
-            # window's midpoint, see train.climatology's docstring) rather
-            # than recomputing it independently — avoids two sources of
-            # truth for the same value.
+            # The fitted ClimatologyRemover's own t_ref_ (the training window's
+            # midpoint) — one source of truth for the trend epoch (§9 gotcha 13).
             t_ref=preprocess.named_steps["climatology"].t_ref_,
-            variables=variable_names,
-            r_ocean=self.r_ocean,
-            r_var=self.r_var,
+            variables=tuple(self.variables),
+            tensors=tensors,
+            groups=groups,
+            tucker_ranks={
+                t: (fit.factor_lat.shape[1], fit.factor_lon.shape[1]) for t, fit in tucker.items()
+            },
             r_dmd=self.r_dmd,
             dmd_variant=self.dmd_variant,
             include_trend=self.include_trend,
@@ -317,10 +627,14 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             # the only way to recover its installed version.
             pydmd_version=importlib.metadata.version("pydmd"),
         )
-        return gaussianized
+        return a_std
 
     def fit(self, X: Path, y: None = None) -> Self:
         """Train the model end-to-end on the archive rooted at `X`.
+
+        In-process training is the path for small windows and tests; a
+        production era-3 window runs Tucker per tensor on a VM and assembles
+        the model with `from_components` (§8.5, §8.6).
 
         Parameters
         ----------
@@ -333,8 +647,16 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         Returns
         -------
         self
+
+        Raises
+        ------
+        ValueError
+            If `include_local_residual` is True (deferred in v3), `sigwh` is
+            missing from `variables`, `groups` does not partition the
+            tensors, a fidelity lag is not below half the window, or the
+            fitted dynamics fail the generative fidelity checks (§5.6.3).
         """
-        self._fit_impl(X, y)
+        self._fit_impl(X)
         return self
 
     def transform(
@@ -343,7 +665,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         t_start: datetime | None = None,
         t_end: datetime | None = None,
     ) -> xr.Dataset:
-        """Apply the fitted preprocessing chain to a new data window.
+        """Apply the fitted preprocessing chain to a data window.
 
         Parameters
         ----------
@@ -351,15 +673,14 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             Root of the data archive (the training `data_dir` or a
             differently-rooted held-out mirror with the same layout).
         t_start, t_end : datetime | None
-            UTC-aware window bounds; both default to the training window
-            (`self.t_start`, `self.t_end`) when omitted. Pass explicit
-            bounds to run on a held-out window (see §6 validation check 7).
+            UTC-aware window bounds; both default to the training window.
+            Pass explicit bounds for a held-out window (§6 check 7).
 
         Returns
         -------
         xr.Dataset
-            Gaussianized standardized anomalies, dims
-            ``(time, wave_lat, wave_lon)`` per variable.
+            Standardized anomalies, one ``(time, wave_lat, wave_lon)``
+            variable per tensor; land NaN. Not cores, not Gaussianized.
         """
         check_is_fitted(self, "preprocess_")
         window_start = self.t_start if t_start is None else t_start
@@ -369,76 +690,81 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         return result
 
     def fit_transform(self, X: Path, y: None = None) -> xr.Dataset:
-        """Fit and return the Gaussianized anomalies in one pass.
+        """Fit and return the standardized anomalies in one pass.
 
-        Overridden (rather than relying on `TransformerMixin`'s default
-        ``fit(X).transform(X)``) because `fit` already computes this
-        Dataset internally — recomputing it would repeat the whole
-        preprocessing pass.
+        Overridden because `fit` already computes this Dataset; the default
+        ``fit(X).transform(X)`` would repeat the whole preprocessing pass.
         """
-        return self._fit_impl(X, y)
+        return self._fit_impl(X)
 
     @classmethod
     def from_components(
         cls,
         *,
         preprocess: Pipeline,
-        tucker: TuckerFit,
-        dmd: DMDFit,
-        mode_ou: ModeOUFit,
-        local_residual: LocalResidualFit | None,
+        tucker: dict[str, TuckerFit],
+        core_copula: dict[str, GaussianCopula],
+        dmd: dict[str, DMDFit],
+        mode_ou: dict[str, ModeOUFit],
+        group_diagnostics: dict[str, GroupDiagnostics],
+        fidelity_diagnostics: dict[str, FidelityDiagnostics],
         ocean_mask: np.ndarray,
         metadata: ModelMetadata,
     ) -> Self:
-        """Construct from already-fit components.
+        """Construct from already-fit components (the §8.6 notebook path).
 
-        Used by the notebook workflow when Tucker/DMD/mode-OU/local-residual
-        hyperparameters were iterated on separately and the chosen versions
-        need bundling into a saveable `WeatherModel` without re-running `fit`.
+        Production fits Tucker per tensor on a VM with checkpoints, so the
+        pieces are fit separately and bundled here without re-running `fit`.
+        The §5.6.3 gate applies here too, so `load` (which goes through this
+        constructor) can only ever rebuild a model that passed it.
 
         Parameters
         ----------
         preprocess : Pipeline
-            A fitted preprocessing Pipeline (see §5.2-§5.4).
-        tucker : TuckerFit
-        dmd : DMDFit
-        mode_ou : ModeOUFit
-        local_residual : LocalResidualFit | None
-            `None` when the model was fit with `include_local_residual=False`.
-        ocean_mask : np.ndarray
-            Boolean, ``(n_lat, n_lon)``.
+            A fitted preprocessing Pipeline (§5.3–§5.4).
+        tucker, core_copula : dict keyed by tensor
+        dmd, mode_ou, group_diagnostics, fidelity_diagnostics : dict keyed by group
+        ocean_mask : (H, W) bool
         metadata : ModelMetadata
 
         Returns
         -------
         Self
+
+        Raises
+        ------
+        ValueError
+            If any group's `fidelity_diagnostics` failed (§5.6.3).
         """
+        _require_fidelity(fidelity_diagnostics)
         model = cls(
             t_start=metadata.t_train_start,
             t_end=metadata.t_train_end,
             variables=list(metadata.variables),
-            r_ocean=metadata.r_ocean,
-            r_var=metadata.r_var,
             r_dmd=metadata.r_dmd,
-            # ModelMetadata.dmd_variant is a plain str (always one of the three
-            # Literal values in practice, since it's only ever populated from
-            # this same __init__ param at fit() time).
+            # ModelMetadata.dmd_variant is a plain str, only ever populated from
+            # this same __init__ parameter at fit time.
             dmd_variant=metadata.dmd_variant,  # type: ignore[arg-type]
             include_trend=metadata.include_trend,
             include_local_residual=metadata.include_local_residual,
+            groups={name: list(members) for name, members in metadata.groups.items()},
         )
         model.preprocess_ = preprocess
+        model.ocean_mask_ = ocean_mask
+        model.tensor_names_ = metadata.tensors
+        model.groups_ = dict(metadata.groups)
         model.tucker_ = tucker
+        model.core_copula_ = core_copula
         model.dmd_ = dmd
         model.mode_ou_ = mode_ou
-        model.local_residual_ = local_residual
-        model.ocean_mask_ = ocean_mask
-        model.variable_names_ = metadata.variables
+        model.group_diagnostics_ = group_diagnostics
+        model.fidelity_diagnostics_ = fidelity_diagnostics
+        model.local_residual_ = None
         model.metadata_ = metadata
         return model
 
     def save(self, model_dir: Path) -> None:
-        """Persist fitted state to disk (see docs/model_design.md §7).
+        """Persist fitted state in the §7 layout.
 
         Parameters
         ----------
@@ -446,63 +772,42 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
             Destination directory, created if absent.
         """
         check_is_fitted(self, "preprocess_")
-        model_dir.mkdir(parents=True, exist_ok=True)
+        for sub in ("tucker", "core_copula", "dmd", "mode_ou", "lim"):
+            (model_dir / sub).mkdir(parents=True, exist_ok=True)
 
         joblib.dump(self.preprocess_, model_dir / "preprocess.pkl")
         np.save(model_dir / "ocean_mask.npy", self.ocean_mask_)
-        np.savez(
-            model_dir / "tucker.npz",
-            # float32 on disk per §7's dtype policy (large arrays); TuckerFit
-            # itself stays float64 in memory (train.tucker's contract) — load()
-            # upcasts back after reading.
-            U_ocean=self.tucker_.U_ocean.astype(np.float32),
-            U_var=self.tucker_.U_var.astype(np.float32),
-            r_ocean=self.tucker_.r_ocean,
-            r_var=self.tucker_.r_var,
-            reconstruction_error=self.tucker_.reconstruction_error,
-        )
-        np.savez(
-            model_dir / "dmd.npz",
-            Phi=self.dmd_.Phi,
-            Lambda=self.dmd_.Lambda,
-            b0=self.dmd_.b0,
-            lam_cont=self.dmd_.lam_cont,
-            dt=self.dmd_.dt,
-            variant=self.dmd_.variant,
-        )
-        np.savez(
-            model_dir / "mode_ou.npz",
-            theta=self.mode_ou_.theta,
-            sigma=self.mode_ou_.sigma,
-            phi=self.mode_ou_.phi,
-            dt=self.mode_ou_.dt,
-        )
-        if self.local_residual_ is not None:
-            np.savez(
-                model_dir / "local_residual.npz",
-                theta=self.local_residual_.theta,
-                sigma=self.local_residual_.sigma,
-                phi=self.local_residual_.phi,
-                variance_ratio=self.local_residual_.variance_ratio,
-                active_mask=self.local_residual_.active_mask,
-                dt=self.local_residual_.dt,
+        for tensor in self.tensor_names_:
+            _save_tucker(model_dir / "tucker" / f"{tensor}.npz", self.tucker_[tensor])
+            _save_copula(
+                model_dir / "core_copula" / f"{tensor}.npz", tensor, self.core_copula_[tensor]
             )
-
-        metadata_dict = asdict(self.metadata_)
-        metadata_dict["trained_at"] = self.metadata_.trained_at.isoformat()
-        metadata_dict["t_train_start"] = self.metadata_.t_train_start.isoformat()
-        metadata_dict["t_train_end"] = self.metadata_.t_train_end.isoformat()
-        metadata_dict["t_ref"] = self.metadata_.t_ref.isoformat()
-        metadata_dict["variables"] = list(self.metadata_.variables)
-        (model_dir / "metadata.json").write_text(json.dumps(metadata_dict, indent=2))
+        records: dict[str, Any] = {}
+        for group, members in self.groups_.items():
+            sizes = [
+                self.tucker_[m].factor_lat.shape[1] * self.tucker_[m].factor_lon.shape[1]
+                for m in members
+            ]
+            _save_dmd(model_dir / "dmd" / f"{group}.npz", self.dmd_[group], members, sizes)
+            _save_mode_ou(model_dir / "mode_ou" / f"{group}.npz", self.mode_ou_[group])
+            diagnostics = self.group_diagnostics_[group]
+            _save_lim(model_dir / "lim" / f"{group}.npz", diagnostics.lim)
+            records[group] = _diagnostics_record(diagnostics)
+        (model_dir / "group_diagnostics.json").write_text(json.dumps(records, indent=2))
+        fidelity_records = {
+            group: _fidelity_record(self.fidelity_diagnostics_[group]) for group in self.groups_
+        }
+        (model_dir / "fidelity_diagnostics.json").write_text(json.dumps(fidelity_records, indent=2))
+        (model_dir / "metadata.json").write_text(
+            json.dumps(_metadata_record(self.metadata_), indent=2)
+        )
 
     @classmethod
     def load(cls, model_dir: Path) -> Self:
-        """Reconstruct from disk. Inverse of `save` (see docs/model_design.md §7).
+        """Reconstruct from disk; the inverse of `save` (see docs/model_design.md §7).
 
         Warns if the runtime's sklearn/numpy/tensorly/pydmd versions differ
-        from the versions recorded at training time (see §9 gotcha 17) — a
-        mismatch on tensorly or pydmd almost always breaks loading.
+        from those recorded at training time (§9 gotcha 17).
 
         Parameters
         ----------
@@ -512,108 +817,356 @@ class WeatherModel(BaseEstimator, TransformerMixin):  # type: ignore[misc]
         -------
         Self
         """
-        metadata_dict = json.loads((model_dir / "metadata.json").read_text())
-
-        if metadata_dict["sklearn_version"] != sklearn.__version__:
-            warnings.warn(
-                f"model was trained with scikit-learn {metadata_dict['sklearn_version']!r}, "
-                f"runtime has {sklearn.__version__!r}; preprocess.pkl may not load correctly.",
-                stacklevel=2,
-            )
-        if metadata_dict["numpy_version"] != np.__version__:
-            warnings.warn(
-                f"model was trained with numpy {metadata_dict['numpy_version']!r}, "
-                f"runtime has {np.__version__!r}.",
-                stacklevel=2,
-            )
-        if metadata_dict["tensorly_version"] != tensorly.__version__:
-            warnings.warn(
-                f"model was trained with tensorly {metadata_dict['tensorly_version']!r}, "
-                f"runtime has {tensorly.__version__!r}; tucker.npz may not be interpreted "
-                "correctly.",
-                stacklevel=2,
-            )
-        pydmd_version = importlib.metadata.version("pydmd")
-        if metadata_dict["pydmd_version"] != pydmd_version:
-            warnings.warn(
-                f"model was trained with pydmd {metadata_dict['pydmd_version']!r}, "
-                f"runtime has {pydmd_version!r}; dmd.npz may not be interpreted correctly.",
-                stacklevel=2,
-            )
-
-        metadata = ModelMetadata(
-            trained_at=datetime.fromisoformat(metadata_dict["trained_at"]),
-            t_train_start=datetime.fromisoformat(metadata_dict["t_train_start"]),
-            t_train_end=datetime.fromisoformat(metadata_dict["t_train_end"]),
-            t_ref=datetime.fromisoformat(metadata_dict["t_ref"]),
-            variables=tuple(metadata_dict["variables"]),
-            r_ocean=metadata_dict["r_ocean"],
-            r_var=metadata_dict["r_var"],
-            r_dmd=metadata_dict["r_dmd"],
-            dmd_variant=metadata_dict["dmd_variant"],
-            include_trend=metadata_dict["include_trend"],
-            include_local_residual=metadata_dict["include_local_residual"],
-            git_commit=metadata_dict["git_commit"],
-            sklearn_version=metadata_dict["sklearn_version"],
-            numpy_version=metadata_dict["numpy_version"],
-            tensorly_version=metadata_dict["tensorly_version"],
-            pydmd_version=metadata_dict["pydmd_version"],
-        )
-
-        preprocess = joblib.load(model_dir / "preprocess.pkl")
-        ocean_mask = np.load(model_dir / "ocean_mask.npy")
-
-        with np.load(model_dir / "tucker.npz") as data:
-            tucker_fit_result = TuckerFit(
-                # Stored as float32 (§7 dtype policy); upcast to match
-                # TuckerFit's float64 contract (train.tucker docstring).
-                U_ocean=data["U_ocean"].astype(np.float64),
-                U_var=data["U_var"].astype(np.float64),
-                r_ocean=int(data["r_ocean"]),
-                r_var=int(data["r_var"]),
-                reconstruction_error=float(data["reconstruction_error"]),
-            )
-        with np.load(model_dir / "dmd.npz") as data:
-            dmd_fit_result = DMDFit(
-                Phi=data["Phi"],
-                Lambda=data["Lambda"],
-                b0=data["b0"],
-                lam_cont=data["lam_cont"],
-                dt=float(data["dt"]),
-                variant=str(data["variant"]),
-            )
-        with np.load(model_dir / "mode_ou.npz") as data:
-            mode_ou_fit = ModeOUFit(
-                theta=data["theta"],
-                sigma=data["sigma"],
-                phi=data["phi"],
-                dt=float(data["dt"]),
-            )
-
-        local_residual_path = model_dir / "local_residual.npz"
-        local_residual_fit: LocalResidualFit | None = None
-        if local_residual_path.exists():
-            with np.load(local_residual_path) as data:
-                local_residual_fit = LocalResidualFit(
-                    theta=data["theta"],
-                    sigma=data["sigma"],
-                    phi=data["phi"],
-                    variance_ratio=data["variance_ratio"],
-                    active_mask=data["active_mask"],
-                    dt=float(data["dt"]),
-                )
-
+        record = json.loads((model_dir / "metadata.json").read_text())
+        _warn_on_version_drift(record)
+        metadata = _metadata_from_record(record)
+        diagnostics_records = json.loads((model_dir / "group_diagnostics.json").read_text())
+        fidelity_records = json.loads((model_dir / "fidelity_diagnostics.json").read_text())
         return cls.from_components(
-            preprocess=preprocess,
-            tucker=tucker_fit_result,
-            dmd=dmd_fit_result,
-            mode_ou=mode_ou_fit,
-            local_residual=local_residual_fit,
-            ocean_mask=ocean_mask,
+            preprocess=joblib.load(model_dir / "preprocess.pkl"),
+            tucker={t: _load_tucker(model_dir / "tucker" / f"{t}.npz") for t in metadata.tensors},
+            core_copula={
+                t: _load_copula(model_dir / "core_copula" / f"{t}.npz", t) for t in metadata.tensors
+            },
+            dmd={g: _load_dmd(model_dir / "dmd" / f"{g}.npz") for g in metadata.groups},
+            mode_ou={g: _load_mode_ou(model_dir / "mode_ou" / f"{g}.npz") for g in metadata.groups},
+            group_diagnostics={
+                g: _diagnostics_from_record(
+                    diagnostics_records[g], _load_lim(model_dir / "lim" / f"{g}.npz")
+                )
+                for g in metadata.groups
+            },
+            fidelity_diagnostics={
+                g: _fidelity_from_record(fidelity_records[g]) for g in metadata.groups
+            },
+            ocean_mask=np.load(model_dir / "ocean_mask.npy"),
             metadata=metadata,
         )
 
     def ocean_mask(self) -> np.ndarray:
-        """Boolean ``(n_lat, n_lon)`` — True where the model can produce samples."""
+        """Boolean ``(H, W)`` — True where the model can produce samples."""
         check_is_fitted(self, "ocean_mask_")
         return self.ocean_mask_
+
+
+# --- Persistence helpers (§7) ----------------------------------------------
+
+
+def _metadata_record(metadata: ModelMetadata) -> dict[str, Any]:
+    """`ModelMetadata` as JSON-ready values (datetimes as ISO strings)."""
+    record = asdict(metadata)
+    for key in ("trained_at", "t_train_start", "t_train_end", "t_ref"):
+        record[key] = getattr(metadata, key).isoformat()
+    return record
+
+
+def _metadata_from_record(record: dict[str, Any]) -> ModelMetadata:
+    """Inverse of `_metadata_record`."""
+    return ModelMetadata(
+        trained_at=datetime.fromisoformat(record["trained_at"]),
+        t_train_start=datetime.fromisoformat(record["t_train_start"]),
+        t_train_end=datetime.fromisoformat(record["t_train_end"]),
+        t_ref=datetime.fromisoformat(record["t_ref"]),
+        variables=tuple(record["variables"]),
+        tensors=tuple(record["tensors"]),
+        groups={name: tuple(members) for name, members in record["groups"].items()},
+        tucker_ranks={t: (int(r[0]), int(r[1])) for t, r in record["tucker_ranks"].items()},
+        r_dmd=int(record["r_dmd"]),
+        dmd_variant=str(record["dmd_variant"]),
+        include_trend=bool(record["include_trend"]),
+        include_local_residual=bool(record["include_local_residual"]),
+        git_commit=str(record["git_commit"]),
+        sklearn_version=str(record["sklearn_version"]),
+        numpy_version=str(record["numpy_version"]),
+        tensorly_version=str(record["tensorly_version"]),
+        pydmd_version=str(record["pydmd_version"]),
+    )
+
+
+def _warn_on_version_drift(record: dict[str, Any]) -> None:
+    """Warn for each library whose runtime version differs from the training one (gotcha 17)."""
+    runtime = {
+        "sklearn": sklearn.__version__,
+        "numpy": np.__version__,
+        "tensorly": tensorly.__version__,
+        "pydmd": importlib.metadata.version("pydmd"),
+    }
+    for library, version in runtime.items():
+        trained = record[f"{library}_version"]
+        if trained != version:
+            warnings.warn(
+                f"model was trained with {library} {trained!r}, runtime has {version!r}; "
+                "persisted artifacts may not load or behave identically.",
+                stacklevel=3,
+            )
+
+
+def _save_tucker(path: Path, fit: TuckerFit) -> None:
+    # Factors float32 on disk (§7 dtype policy); TuckerFit stays float64 in memory.
+    np.savez(
+        path,
+        factor_lat=fit.factor_lat.astype(np.float32),
+        factor_lon=fit.factor_lon.astype(np.float32),
+        reconstruction_error=fit.reconstruction_error,
+        n_iter=fit.n_iter,
+    )
+
+
+def _load_tucker(path: Path) -> TuckerFit:
+    with np.load(path) as data:
+        return TuckerFit(
+            factor_lat=data["factor_lat"].astype(np.float64),
+            factor_lon=data["factor_lon"].astype(np.float64),
+            reconstruction_error=float(data["reconstruction_error"]),
+            n_iter=int(data["n_iter"]),
+        )
+
+
+def _save_copula(path: Path, tensor: str, copula: GaussianCopula) -> None:
+    # Fitted arrays, not a pickled object (§7): rebuilt by `_load_copula`.
+    np.savez(
+        path,
+        bin_probs=copula.bin_probs_,
+        sorted_core_binned=copula.sorted_anomalies_binned_[tensor],
+    )
+
+
+def _load_copula(path: Path, tensor: str) -> GaussianCopula:
+    """Rebuild a fitted `GaussianCopula` from its lookup table."""
+    with np.load(path) as data:
+        copula = GaussianCopula(n_bins=int(data["bin_probs"].shape[0]))
+        copula.bin_probs_ = data["bin_probs"]
+        copula.sorted_anomalies_binned_ = {tensor: data["sorted_core_binned"]}
+    return copula
+
+
+def _save_dmd(path: Path, fit: DMDFit, members: tuple[str, ...], sizes: list[int]) -> None:
+    np.savez(
+        path,
+        Phi=fit.Phi,
+        Lambda=fit.Lambda,
+        b0=fit.b0,
+        lam_cont=fit.lam_cont,
+        dt=fit.dt,
+        variant=fit.variant,
+        members=np.array(members, dtype=np.str_),
+        member_sizes=np.array(sizes, dtype=np.int64),
+    )
+
+
+def _load_dmd(path: Path) -> DMDFit:
+    with np.load(path) as data:
+        return DMDFit(
+            Phi=data["Phi"],
+            Lambda=data["Lambda"],
+            b0=data["b0"],
+            lam_cont=data["lam_cont"],
+            dt=float(data["dt"]),
+            variant=str(data["variant"]),
+        )
+
+
+def _save_mode_ou(path: Path, fit: ModeOUFit) -> None:
+    np.savez(
+        path,
+        mode=fit.mode,
+        partner=fit.partner,
+        phi=fit.phi,
+        innovation_cov=fit.innovation_cov,
+        log_magnitude_mean=fit.log_magnitude_mean,
+        phase_offset=fit.phase_offset,
+        dt=fit.dt,
+    )
+
+
+def _load_mode_ou(path: Path) -> ModeOUFit:
+    with np.load(path) as data:
+        return ModeOUFit(
+            mode=data["mode"],
+            partner=data["partner"],
+            phi=data["phi"],
+            innovation_cov=data["innovation_cov"],
+            log_magnitude_mean=data["log_magnitude_mean"],
+            phase_offset=data["phase_offset"],
+            dt=float(data["dt"]),
+        )
+
+
+def _save_lim(path: Path, lim: LIMFit) -> None:
+    np.savez(
+        path,
+        G=lim.G,
+        L=lim.L,
+        Q=lim.Q,
+        C0=lim.C0,
+        innovation_cov=lim.innovation_cov,
+        lag=lim.lag,
+        dt=lim.dt,
+        q_min_eigenvalue=lim.q_min_eigenvalue,
+        logm_imag_fraction=lim.logm_imag_fraction,
+    )
+
+
+def _load_lim(path: Path) -> LIMFit:
+    with np.load(path) as data:
+        return LIMFit(
+            G=data["G"],
+            L=data["L"],
+            Q=data["Q"],
+            C0=data["C0"],
+            innovation_cov=data["innovation_cov"],
+            lag=int(data["lag"]),
+            dt=float(data["dt"]),
+            q_min_eigenvalue=float(data["q_min_eigenvalue"]),
+            logm_imag_fraction=float(data["logm_imag_fraction"]),
+        )
+
+
+def _diagnostics_record(d: GroupDiagnostics) -> dict[str, Any]:
+    """Everything in `GroupDiagnostics` except the LIM matrices (those go to ``lim/``)."""
+    return {
+        "members": list(d.members),
+        "explained_variance": d.explained_variance,
+        "tau": {
+            "training_lag": d.tau.training_lag,
+            "lags": d.tau.lags.tolist(),
+            "operator_drift": d.tau.operator_drift.tolist(),
+            "propagator_error": d.tau.propagator_error.tolist(),
+            "error_variance_ratio": d.tau.error_variance_ratio.tolist(),
+        },
+        "drift_upper": d.drift_upper.tolist(),
+        "ratio_band": d.ratio_band.tolist(),
+        "tau_consistent": d.tau_consistent.tolist(),
+        "coupling": {
+            "lag": d.coupling.lag,
+            "r2_joint": d.coupling.r2_joint,
+            "r2_independent": d.coupling.r2_independent,
+            "granger_nats": d.coupling.granger_nats,
+            "noise_mutual_information_nats": d.coupling.noise_mutual_information_nats,
+            # JSON keys must be strings: the member pair becomes a list entry.
+            "noise_pairwise_mutual_information_nats": [
+                [a, b, value]
+                for (a, b), value in d.coupling.noise_pairwise_mutual_information_nats.items()
+            ],
+        },
+        "granger_null_upper": d.granger_null_upper,
+        "noise_mi_null_upper": d.noise_mi_null_upper,
+        "coupling_significant": d.coupling_significant,
+        "noise_coupling_significant": d.noise_coupling_significant,
+    }
+
+
+def _diagnostics_from_record(record: dict[str, Any], lim: LIMFit) -> GroupDiagnostics:
+    """Inverse of `_diagnostics_record`, given the group's LIM."""
+    tau = record["tau"]
+    coupling = record["coupling"]
+    return GroupDiagnostics(
+        members=tuple(record["members"]),
+        explained_variance=dict(record["explained_variance"]),
+        lim=lim,
+        tau=TauTestResult(
+            training_lag=int(tau["training_lag"]),
+            lags=np.array(tau["lags"], dtype=np.int64),
+            operator_drift=np.array(tau["operator_drift"], dtype=np.float64),
+            propagator_error=np.array(tau["propagator_error"], dtype=np.float64),
+            error_variance_ratio=np.array(tau["error_variance_ratio"], dtype=np.float64),
+        ),
+        drift_upper=np.array(record["drift_upper"], dtype=np.float64),
+        ratio_band=np.array(record["ratio_band"], dtype=np.float64),
+        tau_consistent=np.array(record["tau_consistent"], dtype=bool),
+        coupling=GroupCouplingReport(
+            lag=int(coupling["lag"]),
+            r2_joint=dict(coupling["r2_joint"]),
+            r2_independent=dict(coupling["r2_independent"]),
+            granger_nats=dict(coupling["granger_nats"]),
+            noise_mutual_information_nats=float(coupling["noise_mutual_information_nats"]),
+            noise_pairwise_mutual_information_nats={
+                (a, b): float(value)
+                for a, b, value in coupling["noise_pairwise_mutual_information_nats"]
+            },
+        ),
+        granger_null_upper=dict(record["granger_null_upper"]),
+        noise_mi_null_upper=float(record["noise_mi_null_upper"]),
+        coupling_significant=dict(record["coupling_significant"]),
+        noise_coupling_significant=bool(record["noise_coupling_significant"]),
+    )
+
+
+def _fidelity_record(d: FidelityDiagnostics) -> dict[str, Any]:
+    """`FidelityDiagnostics` as JSON-ready values (§5.6.3, §7)."""
+    return {
+        "members": list(d.members),
+        "n_replicates": d.n_replicates,
+        "dt": d.dt,
+        "variance": {
+            m: {
+                "training_energy": c.training_energy,
+                "replicate_energy": c.replicate_energy.tolist(),
+                "span_fraction": c.span_fraction,
+                "rms_quantiles": c.rms_quantiles.tolist(),
+                "saturated_training": c.saturated_training,
+                "saturated_sampled": c.saturated_sampled,
+                "consistent": c.consistent,
+            }
+            for m, c in d.variance.items()
+        },
+        "memory": {
+            m: {
+                "lags": c.lags.tolist(),
+                "training": c.training.tolist(),
+                "band": c.band.tolist(),
+                "replicate_mean": c.replicate_mean.tolist(),
+                "consistent": c.consistent.tolist(),
+            }
+            for m, c in d.memory.items()
+        },
+        "time_of_day": {
+            m: {
+                "share": c.share,
+                "null_mean": c.null_mean,
+                "null_max": c.null_max,
+                "consistent": c.consistent,
+            }
+            for m, c in d.time_of_day.items()
+        },
+    }
+
+
+def _fidelity_from_record(record: dict[str, Any]) -> FidelityDiagnostics:
+    """Inverse of `_fidelity_record`."""
+    return FidelityDiagnostics(
+        members=tuple(record["members"]),
+        n_replicates=int(record["n_replicates"]),
+        dt=float(record["dt"]),
+        variance={
+            m: VarianceCheck(
+                training_energy=float(c["training_energy"]),
+                replicate_energy=np.array(c["replicate_energy"], dtype=np.float64),
+                span_fraction=float(c["span_fraction"]),
+                rms_quantiles=np.array(c["rms_quantiles"], dtype=np.float64),
+                saturated_training=float(c["saturated_training"]),
+                saturated_sampled=float(c["saturated_sampled"]),
+                consistent=bool(c["consistent"]),
+            )
+            for m, c in record["variance"].items()
+        },
+        memory={
+            m: MemoryCheck(
+                lags=np.array(c["lags"], dtype=np.int64),
+                training=np.array(c["training"], dtype=np.float64),
+                band=np.array(c["band"], dtype=np.float64),
+                replicate_mean=np.array(c["replicate_mean"], dtype=np.float64),
+                consistent=np.array(c["consistent"], dtype=bool),
+            )
+            for m, c in record["memory"].items()
+        },
+        time_of_day={
+            m: TimeOfDayCheck(
+                share=float(c["share"]),
+                null_mean=float(c["null_mean"]),
+                null_max=float(c["null_max"]),
+                consistent=bool(c["consistent"]),
+            )
+            for m, c in record["time_of_day"].items()
+        },
+    )

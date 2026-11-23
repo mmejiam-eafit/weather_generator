@@ -20,6 +20,16 @@ variability alias into an apparent trend a longer window would average
 away). Point (c) is the one directly testable against real data without
 new infrastructure.
 
+**Update (task 07, 2026-09-29):** task 07 §6's "climatology removal
+confirmed correct" (2026-09-18) is topically adjacent but answers a
+different question — whether removing climatology at all (vs. leaving it
+in) helps DMD rank selection, using a single climatology fit over the
+whole window, projected once through Tucker. It never refits
+`ClimatologyRemover` over two sub-windows or compares `c_lin_` trend
+maps, so it provides no evidence on this task's actual
+window-sensitivity question. This task remains fully open, with its own
+notebook's scaffold unexecuted.
+
 ## 2. Steps to answer it
 
 1. Load one variable with a genuine seasonal *and* diurnal cycle over a

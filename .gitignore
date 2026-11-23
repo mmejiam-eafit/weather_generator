@@ -3,6 +3,7 @@ data
 models/
 reports/
 cache/
+results/
 
 # Python
 __pycache__/
@@ -25,6 +26,9 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Rendered animations (50-90 MB each) — regenerate via notebooks/07_*_gif.py; copies live in results/
+notebooks/*.gif
 
 # Editors / OS
 .vscode/

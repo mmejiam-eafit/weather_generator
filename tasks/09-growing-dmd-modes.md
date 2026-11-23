@@ -36,11 +36,37 @@ place.
    review" thresholds `dynamic_mode_decomposition.md` §6 proposes but
    doesn't quantify.
 
+**Update (task 07, 2026-09-29):** step 2's rank sweep already has real
+data, incidentally produced by task 07's own DMD rank selection —
+`notebooks/07_dmd_rank_sweep.py` recorded `n_growing` and `max_lambda` at
+`r_dmd ∈ {5,10,20,40,50,80,100,150,200}` (a superset of the sweep
+proposed above), saved in
+`results/task07/gaussianize/dmd_rank_sweep_wsh_r124x288_202401-202410.csv`.
+Result: **`n_growing=0` at every single rank tested**, `max_lambda`
+consistently in 0.977–0.981 — no genuinely growing mode found anywhere in
+that range.
+
+**Redefined 2026-09-29** to reuse task 07's artifacts fully, per the
+user's explicit choice: step 2 now reads that CSV directly (no
+recomputation) instead of fitting its own core; step 3 (sliding
+sub-window sweep) now runs against the actual production 40% Gaussianized
+core (`wsh_r248x576_gaussianized_core.npy`) at `r_dmd=100` (the decided
+production rank), replacing the from-scratch era-3/4-month Tucker fit and
+the originally-planned `r_dmd=20`. No Tucker fit happens in this notebook
+at all anymore — both steps consume already-computed artifacts. Flagged
+caveat, documented in the notebook itself: since era-2 already shows zero
+growing modes at every tested rank, the production-core sliding-window
+sweep may also find nothing to calibrate the clip/flag threshold
+against — an honest null result, not a bug, and (per the explicit choice
+made when redefining this) no era-3 fallback window was kept as a
+backup source of a genuine growing-mode example.
+
 ## 3. Notebook(s) needed
 
-- `notebooks/09_growing_dmd_modes.ipynb` — loads `wsh` over a 4-month
-  era-3 window, fits a Tucker core, and runs both the rank sweep and the
-  sliding-sub-window sweep.
+- `notebooks/09_growing_dmd_modes.ipynb` — reads task 07's existing
+  rank-sweep CSV for step 2, and slides sub-windows over the production
+  40% Gaussianized core at `r_dmd=100` for step 3. No longer fits its own
+  Tucker core.
 
 ## 4. Conclusion
 

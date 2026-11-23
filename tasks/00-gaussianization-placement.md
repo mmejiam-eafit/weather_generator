@@ -3,8 +3,9 @@
 **Depends on:** 07 (soft — only for re-validating i-vs-ii at a defensible
 rank; does not block the decision already taken, see §4 Conclusion) ·
 **Blocks:** 03, 07 (soft — see their own "Depends on")
-**Open question:** `docs/open_questions.md` §4.1 — DECIDED (placement i,
-before Tucker — design choice, not proven over ii)
+**Open question:** `docs/open_questions.md` §4.1 — DECIDED (placement ii,
+Tucker on log-energy anomalies then Gaussianize the core, before DMD —
+supersedes the 2026-08-19 placement-i decision; see 2026-09-13 update below)
 **Primary source docs:** `docs/gaussian_copula_and_marginals.md` §6.1
 
 ## 1. What question this will try to answer
@@ -117,3 +118,15 @@ literature search instead. The condition-number diagnostic itself
 (`np.linalg.cond(dmd.Phi)`, cheap, no held-out data needed) is a candidate
 starting point for task 07. Implementation work proceeds with (i) in the
 meantime.
+
+**Decision (2026-09-13): superseded — placement (ii) is now canonical.**
+This is exactly the follow-on comparison called for above, run by task 07
+against real era-2 data (`tasks/07-tucker-dmd-rank-selection.md` §5): (i)
+and (ii) at the same Tucker rank (31,72) gave statistically
+indistinguishable error (50.81% vs. 53.04%). The empirical near-tie doesn't
+favor either placement — the switch to (ii) is an architectural decision
+(Tucker stays in physically-grounded log-energy anomaly space;
+Gaussianization moves to sit immediately before DMD, the stage that
+actually needs Gaussian innovations), not a result of this task's own
+QQ-plot/extreme-statistic comparison, which was never re-run under (ii).
+Full reasoning in `docs/open_questions.md` §4.1's 2026-09-13 update.

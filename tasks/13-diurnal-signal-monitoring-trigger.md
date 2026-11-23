@@ -39,6 +39,16 @@ steps whenever the archive's data source changes, not just once:
    current conditions — the number itself isn't the finding, it's the
    reference point for whenever this task is re-run.
 
+**Update (task 07, 2026-09-29):** re-checked step 2 incidentally while
+auditing task 07's overlap with other open tasks —
+`_DEFAULT_DIURNAL_VARIABLES` in `src/train/climatology.py` is unchanged
+(`("sst", "u_wind", "v_wind")`) and still excludes all wave-grid
+variables, consistent with this task's assumption. This is only a
+same-state confirmation, not new work: step 1 (re-reading the ETL docs
+for the wave source) wasn't re-verified today, and steps 4–5 (the actual
+diurnal/annual amplitude baseline) still haven't been run — this task
+remains open per its own re-runnable-trigger design.
+
 ## 3. Notebook(s) needed
 
 - `notebooks/13_diurnal_signal_monitoring_trigger.ipynb` — loads `wsh`,

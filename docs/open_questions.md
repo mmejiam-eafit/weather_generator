@@ -50,6 +50,29 @@ still specification-level documents, not implementations.
 
 ---
 
+## Priorities (2026-11-22)
+
+On 2026-11-22, probing the production `wsh` core showed that the sampler
+does not reproduce its training data (`model_design.md` §5.6.1, "Known
+defect"). A new training stage now measures that and refuses to build a
+failing model (§5.6.3). Until the items below are done, no model can be
+trained and the 36 tests that need a fitted model fail. Work in this order:
+
+| # | Work | Questions | Why at this position | Done when |
+|---|---|---|---|---|
+| 1 | Make the measurement trustworthy | §5.9 | Everything after it is judged by the fidelity stage, which has no unit tests yet and raises false alarms on short windows. | `train/fidelity.py` has unit tests: no false alarm on a known model, and each defect caught. The short-window tolerance is decided. |
+| 2 | Choose the space the dynamics are fit in | §4.3 | Cheap analysis on the cached core, and the redesign in item 3 works in whatever space this picks. | The raw and Gaussianized cores' energy coverage are compared and the space is chosen. |
+| 3 | Redesign the sampler | §5.7 (and §5.2) | The blocker: no model can be built. | The cached `wsh` core passes the §5.6.3 variance and memory checks. |
+| 4 | Remove wind sea's daily cycle | §7.2 | A configuration change (diurnal terms for `logE_wsh`), independent of item 3. The `wsh` time-of-day check fails until it is done. | The `wsh` time-of-day check passes. |
+| 5 | Land the gate | §5.9 | Needs items 1, 3 and 4. | The test fixture is regenerated so a correct model passes, and the suite is green with the gate enforced. |
+| 6 | Revalidate task 07's sampling-based decisions | §5.8 | They were judged by checks that could not see the defect, and they need the new sampler. | `r_dmd` is re-derived and passes §5.6.3. |
+
+Everything else keeps its own status and is not reprioritized. That
+includes §9.1, training-time memory, which waits on the training
+infrastructure.
+
+---
+
 ## 1. Data and convention-level questions
 
 ### 1.1 Is the ocean grid's row-0 latitude/orientation south-first, like the wave and wind grids? — **ANSWERED** (yes, confirmed by direct geo-referenced lookup)
@@ -551,7 +574,20 @@ choice to be made empirically (e.g. by checking, per §5 of
 actually shows non-negligible off-diagonal coupling terms; if it doesn't,
 the group was drawn too widely for no benefit).
 
-### 3.3 Is the wind-direction/wind-sea-direction alignment equilibrium a stable node, as the scalar energy case is? — **ANSWERED HERE**
+**Update (2026-11-21): tooling for that check now exists.**
+`correlated_variables.md` §4.4 recasts the joint-group regression as a
+Linear Inverse Model and specifies the measurements:
+
+- a tau test of the linear-Markov assumption;
+- correlated within-group noise;
+- information lost by independent fits, measured in nats: Granger/transfer
+  entropy into each member, and the mutual information of the joint
+  innovations.
+
+These are implemented in `src/train/linear_inverse.py`. A candidate group
+whose coupling information is indistinguishable from a bootstrap baseline
+gains nothing from a joint fit. The question itself stays open until
+per-variable cores exist for a candidate group (only `wsh` has one so far)./wind-sea-direction alignment equilibrium a stable node, as the scalar energy case is? — **ANSWERED HERE**
 
 Raised in: `correlated_variables.md` §3.2 and §6 ("§3.2's directional-alignment
 ODE is illustrative, not fully stability-analyzed... left open").
@@ -686,7 +722,7 @@ present), rather than `{u,v,E,T}` with no baseline — see
 
 ## 4. Gaussianization placement
 
-### 4.1 Where, along each variable's independent processing chain, should Gaussianization happen? — **DECIDED** (placement i, before Tucker — design choice, not proven over ii; see 2026-08-19 update)
+### 4.1 Where, along each variable's independent processing chain, should Gaussianization happen? — **DECIDED** (placement ii, Tucker on log-energy anomalies then Gaussianize the core, before DMD — supersedes the 2026-08-19 placement-i decision; see 2026-09-13 update)
 
 Raised in: `gaussian_copula_and_marginals.md` §6.1 (the deepest treatment),
 echoed as a dependency in `tucker_decomposition.md`, `dynamic_mode_decomposition.md`,
@@ -781,6 +817,49 @@ task-07-derived rank) or via a more targeted literature search than the
 one summarized above — whichever comes first. It does not need to resolve
 before implementation proceeds with (i) as the default.
 
+**Update (2026-09-13): superseded — placement (ii) adopted as canonical.**
+Task 07's era-2 cloud rank sweep (see `tasks/07-tucker-dmd-rank-selection.md`
+§5) ran the exact task-07-derived comparison this section called for:
+Tucker at rank (31,72) — 5% of era 2's (621,1440) wave grid — on the
+`ClimatologyRemover` + `PerCellStandardizer` output, once with `GaussianCopula`
+applied before Tucker (placement i) and once with Tucker applied directly to
+the un-Gaussianized standardized anomalies (placement ii). Result:
+`err_pct` 50.81% (i) vs. 53.04% (ii) — **statistically indistinguishable**,
+not the large gap a linear-rank-inflation hypothesis (per-cell Gaussianization
+preserves rank/copula dependence exactly, by Sklar's theorem in §2.2, but not
+the linear/Pearson covariance structure Tucker actually optimizes against —
+see `gaussian_copula_and_marginals.md` §2.4) predicted going in. That
+hypothesis is not supported by this data; the high error at low rank on this
+window is evidently about rank sufficiency, not Gaussianization placement.
+
+Despite the near-tie, **placement (ii) is adopted as canonical** on
+architectural grounds, not empirical superiority:
+
+1. Tucker operates on the physically-grounded, climatology-removed
+   log-energy anomaly field rather than copula(Z)-space — keeping the
+   compression step in the same units/interpretation as the rest of the
+   physical pipeline.
+2. Gaussianization moves to immediately before DMD (on the much smaller
+   Tucker-core coefficients), i.e. applied exactly at the one stage
+   (`mode-OU`'s innovation-Gaussianity requirement) that actually needs it,
+   rather than broadly upstream of a stage (Tucker) that doesn't benefit
+   from it.
+3. This placement was also the one that surfaced (and let the team fix) a
+   real latent gap in `PerCellStandardizer` — a handful of near-zero-variance
+   cells (intermittently ice-covered) had no floor on the division, producing
+   `~1e15`-magnitude values; previously silently absorbed by `GaussianCopula`'s
+   clipping under placement (i), never visible until placement (ii) fed
+   raw standardized anomalies straight to Tucker. Fixed in `src/train/
+   standardize.py` (`_floored_divisor`, floors the divisor only, never
+   `sigma_cell_` itself — see that file's module docstring for why).
+
+**The specific Tucker rank is not yet decided** — see
+`tasks/07-tucker-dmd-rank-selection.md` §5 for the era-2 sweep's rank-vs-error
+numbers and the practical (cost, not memory) ceiling found around 20-30% rank
+on the current VM. 20% is the current working baseline; finalizing a
+production rank is deferred pending either more compute budget or a cheaper
+Tucker fitting path.
+
 ### 4.2 What copula family should be used — Gaussian, or one with tail dependence? — **OPEN** (distinct axis from 4.1)
 
 Raised in: `gaussian_copula_and_marginals.md` §6.2, `physical_consistency_constraints.md`
@@ -800,6 +879,42 @@ rejection sampling.** A $t$-copula/GPD-tail construction could in principle
 be placed at any of the three §4.1 locations, so resolving §4.1 does not
 resolve this, and vice versa — they are genuinely independent axes of the
 same design space, and both remain open.
+
+### 4.3 Does giving every Tucker-core coefficient unit variance undermine the dynamics fit? — **OPEN** (2026-11-22, hypothesis; priority 2)
+
+Raised in: the 2026-11-22 sampler findings (`model_design.md` §5.6.1,
+"Known defect").
+
+The copula (`model_design.md` §5.5.1) maps each core coefficient to a
+standard normal. That is 142,848 coefficients for the 40% era-2 core. Every
+coefficient then has unit variance, whatever its share of the anomaly's
+energy. Tucker's basis orders energy: on the 20% raw core, the first 10
+latitude modes carry 37.7% of the energy and the last 10 carry 0.9%; for
+longitude modes it is 24.5% against 0.3% (`tasks/07-tucker-dmd-rank-selection.md`).
+Gaussianization erases that order. DMD (SVD-truncated at `r_dmd = 100`)
+and the LIM's principal components are then fit in a space where small-scale,
+noise-like coefficients weigh as much as large-scale ones.
+
+Consistent with this, but not proven by it: on the 40% Gaussianized core,
+the 100-mode DMD span carries 11.4% of the energy, and the leading 20 and
+100 principal components carry 3.3% and 11.4% (`correlated_variables.md`
+§4.4). The same numbers in anomaly space have not been measured.
+
+**Cheap test, on the cached task-07 files.** Compare the principal-component
+energy spectrum and the DMD span coverage of the raw core (the cached
+Tucker `.npz`) with those of the Gaussianized core. Also measure how much of
+the anomaly-space energy the Gaussianized-space DMD span reproduces.
+
+**If the raw core concentrates its energy and the Gaussianized core does
+not,** two candidates:
+
+- fit the dynamics on the raw core and apply the copula only to the
+  marginals at sampling;
+- fit them on Gaussianized coefficients rescaled by their raw standard
+  deviations (an energy-weighted space), and undo the weights at sampling.
+
+§4.1 decided *where* Gaussianization happens, not which space the dynamics
+are fit in, so this can likely be answered without reopening §4.1.
 
 ---
 
@@ -826,7 +941,7 @@ variant only once a concrete deficiency is observed) rather than a reason
 to default to the more complex option up front. **Recommendation, not a
 closed empirical fact** — flagged as such.
 
-### 5.2 Should conjugate-paired DMD/OU modes be sampled independently, or forced to satisfy the exact conjugate relationship at every simulated step? — **ANSWERED IN PRINCIPLE**, procedure still open
+### 5.2 Should conjugate-paired DMD/OU modes be sampled independently, or forced to satisfy the exact conjugate relationship at every simulated step? — **REOPENED** (2026-11-22): conjugacy solved, but the procedure inflates the sampled variance; see §5.7
 
 Raised in: `dynamic_mode_decomposition.md` §2.4/§6, `ornstein_uhlenbeck_processes.md`
 §6.
@@ -846,7 +961,44 @@ parameterized and sampled such that conjugation is exact rather than
 approximate) — that implementation detail is left to whatever code
 performs sampling.
 
-### 5.3 How should Tucker ranks $(r_{\text{lat}}, r_{\text{lon}}, r_{\text{time}})$ and DMD rank $r_{\text{dmd}}$ be chosen? — **OPEN** (condition-number diagnostic found; memory, not the error curve, is the binding constraint for `wsh`/`wsp`)
+**Update (2026-09-24), task 07's DMD+OU generative fidelity check
+(`tasks/07-tucker-dmd-rank-selection.md` §8):** the missing procedure is
+now concretely worked out and empirically validated, in an experimental
+script — not yet ported to the production sampler
+(`weather/simulate.py`), which remains task 9's job. For a conjugate pair
+$(k,k')$, $|\eta_k(t)| = |\eta_{k'}(t)|$ exactly, always — so only the
+*magnitude* needs a stochastic model at all; phase is purely
+deterministic, advancing at the mode's own frequency $\arg(\lambda_k)$,
+continued from the true measured phase at the end of training. One
+shared magnitude draw per pair, phase negated for the partner, makes the
+two exact conjugates by construction, with no explicit forcing step.
+Magnitude itself is fit in **log** space (de-meaned, mean restored at
+generation) since it is non-negative with a nonzero mean, unlike the
+zero-mean-reverting residual `fit_mode_ou`'s existing math assumes —
+consistent with this project's log-space convention for
+physically-positive quantities. Validated empirically
+(`notebooks/07_dmd_ou_generative_check.py`): the naive independent-
+sampling approach this section originally warned against produced
+`imag_real_ratio_mean` ≈0.93-1.04 at every DMD rank tested (comparably
+imaginary as real — not safely-discardable noise); the fix brought it to
+≈3×10⁻¹⁷-6×10⁻¹⁷ (machine precision) at every rank 5-200 on the real
+35,712-dimensional core.
+
+**Reopened (2026-11-22).** The procedure was ported to production in v3
+(`model_design.md` §5.6.1). Exact conjugacy holds, but it is necessary,
+not sufficient. Each pair's phase is deterministic and independent of every
+other pair's. On the production `wsh` core (40% Tucker, `r_dmd = 100`) the
+DMD modes are far from orthogonal: the condition number of `Φᴴ Φ` is
+4.6e3, and near-duplicate pairs have |cos| = 0.965. The training amplitudes
+of different modes cancel, and independent phases destroy that
+cancellation. The sampled energy in the DMD span is 31–34 times the
+training value. The 2026-09-24 check measured the imaginary part, the
+spectrum and a pooled KS statistic on the 20% core. Its KS fidelity got
+worse from `r_dmd = 100` upward, and it attributed that, unverified, to
+cond(Φ). That was this effect. The question now is how to sample without
+losing cross-mode coherence: §5.7.
+
+### 5.3 How should Tucker ranks $(r_{\text{lat}}, r_{\text{lon}}, r_{\text{time}})$ and DMD rank $r_{\text{dmd}}$ be chosen? — **DECIDED**: `r_dmd=100` (2026-09-25); Tucker rank 40% `(248, 576)` (2026-09-29, pragmatic/budget-bound, no elbow found)
 
 Raised in: `tucker_decomposition.md` §6, `dynamic_mode_decomposition.md` §6
 (the same underlying issue, applied to two different decompositions).
@@ -909,6 +1061,237 @@ largest rank this machine (31GB total / ~18GB available) can fit at all.
 Recommendation: `(r_lat=80, r_lon=160)` as a hardware-bounded default for
 `wsh`/`wsp`, re-evaluate on any machine with materially more available
 memory rather than trusting it as a long-term ceiling.
+
+**Update (2026-09-18, task 07): DMD half run against a real era-2 core
+under the now-canonical placement (ii); no elbow found, but a settled,
+important side question — climatology removal is not the cause and
+should not be reversed.** Full writeup and raw results:
+`tasks/07-tucker-dmd-rank-selection.md` §6.
+
+Swept `r_dmd \in \{5,10,20,40,50,80,100,150,200\}`
+(`notebooks/07_dmd_rank_sweep.py`) against the one Tucker core currently
+trusted (era 2, 9-month window, `(r_lat=124, r_lon=288)`, 20% rank —
+§4.1's placement decision), fitting both the copula and DMD on an 80/20
+train/holdout split of that core (never on the whole window before
+splitting, to avoid a second leakage channel beyond the Tucker factors'
+own mild one). **No growing modes anywhere in the tested range**,
+`cond(\Phi)` climbing smoothly from 2.2 to 227 with no sharp knee (unlike
+the 10x jump between `r_dmd=10` and `20` in the 2026-08-16 finding above).
+A one-step-ahead prediction error stayed at 98.5-99.7% across the *entire*
+range, essentially flat despite `cond(\Phi)` spanning two orders of
+magnitude — **the 2026-08-16 finding that `cond(\Phi)` tracks held-out
+quality does not clearly hold here**, at least not within this range; that
+finding was established with DMD fit on a raw, non-Gaussianized core
+(testing placement iii), and this is the first time it's been checked
+against a Gaussianized-input (placement ii) DMD fit.
+
+Root-caused the flat ~99% error to rank capacity, not prediction quality:
+a POD/SVD of the same Gaussianized core shows only 31.32% of its variance
+captured by the leading 200 (of 1754 possible) modes — 50% needs ~411,
+90% needs ~1287. (Getting a trustworthy number here took two failed
+metric attempts, both left in `07_dmd_rank_sweep.py`'s history as a
+caution for whoever revisits this: the first evaluated the deterministic
+trajectory $b_0\lambda^t$ from the training window's absolute $t=0$, which
+underflows to numerical zero by $t\approx n_{\text{train}}$ regardless of
+`r_dmd` since every $|\lambda|<1$; the fix re-anchors the amplitude at the
+*measured* state at the end of training and propagates it forward by
+$\lambda^{\text{lead}}$ for small lead times — the standard DMD state-
+propagation evaluation, not a replay of the deterministic trajectory from
+the fit's own origin.)
+
+**Follow-up test of a real hypothesis this raised**: does removing
+climatology (§3.9) starve DMD of the one genuinely low-rank, oscillatory
+signal it would otherwise be good at, and should climatology be left in
+the anomaly DMD actually sees instead? Tested directly
+(`notebooks/07_dmd_climatology_only_check.py`): projected
+`ClimatologyRemover`'s fitted signal *alone* (its 6-term-per-cell
+harmonic+trend prediction — `wsh` is not diurnal — zero anomaly, zero
+noise) through the same Tucker factors and checked its own POD spectrum
+and DMD fit. Result: needs only **3 modes for 90% of its variance, 5-6 for
+~100%** — in sharp contrast to the real anomaly core above. At `r_dmd=6`,
+DMD reconstructs it to 0.07% error and recovers the *exact* physical
+periods baked into it (365.3 days annual, 182.6 days semi-annual, plus a
+static/trend mode); under-parameterizing at `r_dmd=4` (below the true
+~6-dimensional rank) destabilizes the fit (2 growing modes, nonphysical
+233-day/3467-day "periods") — a clean confirmation that under-choosing
+`r_dmd` for even a purely deterministic low-rank signal breaks DMD, not
+just a theoretical concern.
+
+**Conclusion: the mechanism is real, but it argues against reversing
+climatology removal, not for it.** Climatology genuinely is the
+low-rank, DMD-friendly part of the signal, and removing it does leave DMD
+facing only the high-rank part. But that low-rank structure is already
+captured *exactly and cheaply* by `ClimatologyRemover`'s 6 coefficients
+per cell — asking DMD to re-derive it from noisy data would spend modes
+re-learning something already known exactly, for no benefit, since
+climatology and the anomaly are separable, near-orthogonal problems: the
+anomaly's own rank requirement doesn't shrink just because a few "free"
+easy modes are added alongside it, and a low-rank climatology component
+sitting in the same fit could actively mislead rank selection (masking
+the hard part's error at low `r_dmd` for the wrong reason). **Decision:
+climatology removal stays exactly where it is (before Tucker, before
+DMD).** The anomaly's high effective rank is treated as an intrinsic
+property of weather-scale variability once the predictable seasonal part
+is gone — consistent with the architecture's own split between DMD
+(whatever *is* low-rank/oscillatory) and mode-OU (everything else, as
+stochastic noise) — not a pipeline defect.
+
+**`r_dmd` itself remains undecided.** Unlike Tucker, this sweep was not
+memory- or cost-bound (every fit costs the same ~30s regardless of
+`r_dmd`, confirmed empirically, and runs entirely locally, no VM needed)
+— extending the candidate list past 200 to look for an actual elbow is
+cheap and a natural next step, just not yet done. The old crop-based
+`r_dmd\approx20` vs. `r_dmd=10` contradiction (`tasks/07-tucker-dmd-rank-
+selection.md` §4) is superseded by this sweep at a completely different
+scale (35,712-dimensional core vs. 800) and should be treated as moot,
+not resolved in either direction.
+
+**Update (2026-09-19): physical-forecasting context for interpreting the
+"no elbow found" result above.** Prompted by a natural follow-on question
+— how much of the post-climatology anomaly is genuinely learnable
+structure a higher-rank DMD could still capture, versus irreducibly
+random/OU-appropriate — this researched what real physics-based
+ocean/atmosphere forecasting models actually do. Full source list in
+`tasks/07-tucker-dmd-rank-selection.md` §7.
+
+*Operational wave models do not solve Navier-Stokes.* WAVEWATCH III,
+SWAN, and WAM solve the **phase-averaged spectral wave action balance
+equation** — a statistical energy-transport description across
+wavenumber-direction space, with parameterized source terms for wind
+input, nonlinear resonant interactions, whitecapping/dissipation, and
+bottom friction — not a phase-resolving fluid simulation. True
+Navier-Stokes/Boussinesq/RANS ("phase-resolving") models exist, but a
+recent review (arXiv:2511.21856) puts them at 10-200x the computational
+cost of phase-averaged models and restricted to local/regional domains
+(10⁻²-10² km², minutes-to-days), versus phase-averaged models' basin/
+global scale (10²-10⁷ km², days-to-decades). Basin-scale, multi-day
+forecasting has never been an NS problem operationally, for cost reasons
+that don't go away with more compute — this project's own Tucker/DMD
+approach (a coarse, statistical/spectral-style compression, not a
+phase-resolving simulation) is in the same family as the operational
+approach, not a simplification of a "more correct" NS-based method.
+
+*Forecast horizons give a concrete number for "how much is actually
+learnable."* Operational global wave models run hourly forecasts to 120h
+(5 days), 3-hourly to 180h (7.5 days). Atmospheric predictability has a
+hard, chaos-imposed ceiling around two weeks (Lorenz's classical result),
+with current models reliably skillful to ~9-10 days and large-scale
+phase/position retaining some skill to ~15 days. Past that horizon, poor
+skill is not a model-quality problem — it is provably unpredictable from
+initial conditions, no matter the model or compute budget. This reframes
+the DMD sweep's ~1287-mode requirement for 90% variance (above): plausibly
+a mix of (a) genuinely deterministic structure a smarter or higher-rank
+fit could still capture, up to some horizon, and (b) an irreducibly
+chaotic component beyond that horizon where more modes fit noise rather
+than generalizing — not evidence that the sweep or the pipeline is wrong.
+
+*Swell vs. wind-sea — a flagged, not-yet-pursued idea.* Swell (waves that
+have propagated away from their generation region) is far more
+predictable at long range than local wind-sea, because swell reduces to
+near-linear dispersive propagation while wind-sea stays tightly coupled to
+the chaotic local wind field (arXiv:2510.06484, Navy ESPC v2 long-range
+wave spectra skill). Separating swell from wind-sea before Tucker/DMD —
+analogous in spirit to climatology removal — could plausibly concentrate
+more of the genuinely learnable structure into DMD's domain, leaving a
+cleaner, more honestly-stochastic residual for OU. **Not actioned this
+round** — recorded as a candidate follow-on, not a decision.
+
+*The DMD+OU architecture is independently validated by operational
+practice, not just internally consistent.* NWP already uses the same
+deterministic-dynamics-plus-stochastic-residual pattern operationally
+(SPPT, SKEB — stochastic perturbations representing unresolved sub-grid
+physics), and Ornstein-Uhlenbeck processes specifically are used to model
+the temporal autocorrelation of dominant EOF/mode amplitudes in stochastic
+climate models (arXiv:2603.26693) — the same technique as this project's
+own mode-OU stage, not a bespoke choice.
+
+**Update (2026-09-24): two experiments testing whether "no elbow" means
+real missing structure or intrinsic noise — decisive on the first count,
+suggestive of a second consideration on the practical-generation side.**
+Full method and results: `tasks/07-tucker-dmd-rank-selection.md` §8.
+
+*Phase-randomized surrogate test — decisive.* Built 20 independent
+Prichard-Theiler multivariate FFT surrogates of the Gaussianized core
+(stationary Gaussian processes sharing the real data's exact second-order/
+covariance statistics, nothing beyond) and ran the identical DMD rank
+sweep on each. At *every* `r_dmd` from 5 to 200, for both the 1-step and
+48-step held-out lead, real error sits inside the 20-surrogate band (e.g.
+`r_dmd=200`: real 98.49% vs. surrogate mean 98.65% [98.08, 99.33]). A
+linear predictor is Bayes-optimal for a Gaussian/linear process, so the
+surrogate band traces the covariance-implied error floor for any rank —
+real data never beats it. **This is the decisive version of the point
+this section's 2026-09-19 update raised speculatively**: the ~69% of
+variance DMD can't reach by `r_dmd=200` is statistically indistinguishable
+from correlated noise with the anomaly's own second-order statistics, not
+recoverable structure a higher or different rank could capture. Extending
+the sweep past 200 (previously flagged as cheap and open) is no longer
+expected to find anything — the ceiling isn't a search artifact.
+
+*Full DMD+OU generative fidelity check — consistent, plus one new lead.*
+Using §5.2's now-validated conjugate-pair-coherent OU sampling procedure,
+generated 10 independent synthetic holdout realizations per rank and
+compared their statistics against the real held-out data. Spectral match
+(`log_psd_distance`) improves steadily from `r_dmd=5` (46.6) to `r_dmd=150`
+(1.82), then is flat-to-slightly-worse at `r_dmd=200` (2.17) — consistent
+with the surrogate test's ceiling. The marginal-distribution match
+(`ks_d_statistic`) is **not** monotonic: it improves to a minimum around
+`r_dmd=50-80` (≈0.06) and then gets *worse* from `r_dmd=100` to `200`
+(0.066 → 0.180) — plausibly `cond(Φ)`'s well-established rise across this
+range (2.2→227, §6) degrading the numerical stability of the per-mode
+magnitude/phase estimates used for generation, though this specific
+mechanism is a hypothesis here, not separately verified. If it holds up
+under further scrutiny, it's a *second*, independent reason (distinct
+from "no missing structure") to prefer a more modest `r_dmd`: not just
+"higher doesn't help," but "past roughly `r_dmd=100`, generative fidelity
+may actively degrade." Combined, both experiments point away from
+chasing `r_dmd` toward 200 and toward a more modest working value
+(tentatively somewhere in the 50-100 range per the KS minimum), though a
+final production `r_dmd` is still not picked — see
+[[project_climatology_removal_confirmed_correct]].
+
+**Update (2026-09-25): real-data (no surrogate) 8-fold walk-forward CV
+confirms the above is not a single-split artifact.** Full method/results:
+`tasks/07-tucker-dmd-rank-selection.md` §9. Re-ran the held-out-error
+comparison using only real data — 8 genuinely different real test
+windows (`TimeSeriesSplit`, expanding training window) instead of the one
+80/20 split every prior check used, with a rolling anchor through each
+~190-step real test block (142 anchors/fold) rather than a single
+boundary anchor. Result: one-step predictive accuracy barely moves across
+the *entire* `r_dmd=5-200` range — under 0.3 percentage points from worst
+to best, roughly 4x smaller than the original single-split test's ~1.2-
+point spread — and this near-flatness **replicates almost identically
+across all 8 independent real windows** (fold-to-fold std at any given
+rank: 0.07-0.13 points, small relative to the already-small overall
+spread). This is the real-data confirmation the surrogate test's
+synthetic-noise-band argument implied but couldn't directly demonstrate:
+rank truly doesn't matter much for predictive accuracy, checked directly
+against real held-out weather, not just against a statistical null model.
+Recommendation unchanged, now on firmer footing: **`r_dmd` in 50-100**.
+
+**Decided (2026-09-25): `r_dmd = 100`.** Full justification:
+`tasks/07-tucker-dmd-rank-selection.md` §10 (plots:
+`notebooks/dmd_rank_fidelity_tradeoff.png`,
+`notebooks/dmd_rank_cv_predictive_error.png`). The generative check's
+two fidelity metrics disagree on where "best" is — spectral
+(`log_psd_distance`) at `r_dmd=150`, marginal (`ks_d_statistic`) at
+`r_dmd=80` — and `r_dmd=100` is the point between them where that
+disagreement stops being worth chasing in either direction: moving to 80
+would buy an 11.9% better `ks_d` at the cost of a 121% worse
+`log_psd_distance`; moving to 150 would buy a 25.7% better
+`log_psd_distance` at the cost of a 49.8% worse `ks_d`. The real-data CV
+result is flat across all three candidates regardless (99.60-99.64%,
+inside the fold-to-fold noise band), so it imposes no penalty on this
+choice. This closes the DMD half of §5.3 — Tucker's own rank remains
+open.
+
+**Decided (2026-09-29): Tucker rank = 40% `(248, 576)`.** Full record:
+`tasks/07-tucker-dmd-rank-selection.md` §12. The final VM run hit its 11h
+cap at iteration 170/300 with 23.30% reconstruction error, one checkpoint
+short of its own early-stop threshold — better than 30% (27.47%, 8h cap)
+and 20%'s fully converged 32.90%. Unlike `r_dmd`, this is a pragmatic
+choice made when the Azure credit ran out, not a swept optimum: no elbow
+was found, and a higher rank was never tested to convergence. Production
+copula and DMD (`r_dmd=100`) were fit on the full 40% core.
 
 ### 5.4 Is masked-HOOI's imputation of land cells guaranteed to converge well? — **OPEN** (mitigation available)
 
@@ -998,6 +1381,109 @@ reconstruction error now **decreases** with rank (was increasing).
 **Still open:** whether/how this gets wired into production, and the
 `wsd`-vs-`wad` provenance question above.
 
+### 5.7 How should the sampler preserve the training cores' variance and multi-day memory? — **OPEN** (2026-11-22; priority 3)
+
+Raised in: probing the production `wsh` core (`model_design.md` §5.6.1,
+"Known defect"). The generative fidelity stage (`model_design.md` §5.6.3)
+now measures these errors and refuses to build a model that has them.
+
+Three errors, each measured on task 07's production `wsh` core:
+
+1. **Cross-mode cancellation lost** (§5.2). The sampled variance in the
+   DMD span is 31–34 times the training value. The sampled per-coefficient
+   RMS has a median of 1.73, against 1.0 in training.
+2. **Unmodeled variance.** The 100-mode DMD span carries about 10% of the
+   Gaussianized core's variance. Nothing generates the other 90%; the local
+   residual is deferred (§6.2).
+3. **Multi-day memory lost.** The mode-OU channels decorrelate in about
+   6 h (median φ = 0.605 at 3 h). The core's leading principal components
+   keep 0.49 autocorrelation at 4 days. Neither a 6 h or 12 h training lag
+   nor AR(2)/AR(3) passes the tau test (`model_design.md` §5.6).
+
+Candidates, none tested yet:
+
+- **Joint PC-space sampling.** Sample each member's leading principal
+  components with a linear model and their full innovation covariance, as
+  `correlated_variables.md` §4.4 specifies and `simulate_lim` implements.
+  Cross-mode correlation is estimated rather than assumed away, and
+  conjugacy is automatic. This addresses error 1.
+- **Per-coefficient residual noise** for the core variance outside the
+  sampled subspace, matched to each coefficient's variance and lag-1
+  autocorrelation. This addresses error 2, and is the core-space
+  counterpart of the deferred local residual.
+- **A multi-timescale linear model**, for example one with daily- and
+  weekly-aggregated lags, or a slow subspace modeled at a longer step. This
+  addresses error 3. The tau test and §5.6.3's memory check out to 16 days
+  are the acceptance criteria.
+
+### 5.8 Do task 07's sampling-based decisions still hold? — **OPEN** (2026-11-22; priority 6, after §5.7)
+
+Raised in: the 2026-11-22 sampler findings.
+
+- **`r_dmd = 100`** (§5.3) was chosen at the knee between spectral and
+  marginal generative fidelity, measured on the pair procedure. Its pooled
+  KS statistic worsened from `r_dmd = 100` upward, and task 07 attributed
+  that, unverified, to cond(Φ). That was the cross-mode cancellation defect
+  (§5.2). The rank should be re-derived with the redesigned sampler and
+  judged by `model_design.md` §5.6.3.
+- **The pair procedure's validation** (§5.2) measured only the imaginary
+  part of the reconstruction, which says nothing about its variance.
+- **Tucker rank 40%** (§5.3) rests on reconstruction error, which the
+  defect does not affect. It interacts with §4.3, though: a larger core in
+  a unit-variance space adds noise-like coefficients the dynamics must
+  carry.
+
+### 5.9 How does the generative fidelity gate land, and how should it judge short windows? — **OPEN** (2026-11-22; priorities 1 and 5)
+
+Raised in: implementing `model_design.md` §5.6.3.
+
+**Decided (2026-11-22):** the stage fails the fit, with no bypass. A model
+whose samples fail it is never built, by `fit` or by `from_components`.
+
+**Consequence.** With the current sampler no model can be built. The
+60-snapshot tier-1 test fixture fails in every group and every seed. Both a
+white-noise version and one driven by a latent AR(1) process fail, with
+variance ratios of 1.5–10 and a spurious oscillation in the sampled
+autocorrelation from the fixed pair phases. The 36 tests that need a fitted
+model fail. The stage was committed in that state, deliberately, so the
+work is not lost.
+
+**Open points:**
+
+1. **Unit tests for `train/fidelity.py`, not yet written** (priority 1).
+   Planned:
+   - a state generated from a known model passes;
+   - near-collinear conjugate pairs with cancelling amplitudes fail the
+     variance check;
+   - a two-timescale process fit with an AR(1) fails the memory check;
+   - the span fraction matches a known signal share;
+   - an injected daily cycle fails the time-of-day check and white noise
+     passes;
+   - the same seed gives identical diagnostics;
+   - a lag of `T / 2` or more raises.
+
+   Also tests for `train.dmd.channel_path` and `measured_amplitudes`.
+2. **Short windows** (priority 1). The tolerances (0.1 autocorrelation,
+   0.05 time-of-day share) are about the size of the sampling noise at
+   T = 60: an autocorrelation standard error of about 0.075 with 3 PCs, and
+   a spread of about 0.04 in the time-of-day null. Across 7 groups and 6
+   checks each, even a correct model would likely fail something. At
+   T = 2920 the same tolerances are 2–5σ. Proposal, not adopted: fail only
+   beyond max(tolerance, 3σ of the replicates or permutations). Production
+   behaviour would be unchanged, and short windows would stop raising false
+   alarms.
+3. **A fixture artifact** (priority 5). The fixture's absent wind-sea cell
+   (`TIER1_ABSENT_CELL`) is absent every 4th step, so always at 00 and 12
+   UTC. That is a real time-of-day cycle in `logE_wsh`, `T_wsp`, `u_wsea`
+   and `v_wsea`, and the gate sees it: a white-noise fixture failed the
+   time-of-day check on `logE_wsh`. The regenerated fixture should make the
+   absent pattern independent of the time of day.
+4. **How it lands** (priority 5). Candidates:
+   - together with the sampler redesign (§5.7), once the suite is green;
+   - record-only (log a warning) until then;
+   - rebuild the model tests on `from_components`, using a synthetic model
+     that passes.
+
 ---
 
 ## 6. Ornstein–Uhlenbeck-specific questions
@@ -1013,6 +1499,33 @@ introduces has not been validated end to end — that validation depends on
 simulation and hurricane-season-style checks that are not yet in place
 anywhere in this repo. **Remains open**; treat any specific numeric
 threshold as provisional until such a validation exists.
+
+### 6.2 Where does the local residual live under placement (ii)? — **DEFERRED** (2026-11-22: not part of the first era-3 model)
+
+Raised in: `model_design.md` v3 §3.10 and §5.7, while bringing the handoff
+in line with placement (ii) (§4.1).
+
+The local residual is fit after the mode-level OU, as $R = Z - Z_{\text{coherent}}$,
+with one independent OU per grid cell (`ornstein_uhlenbeck_processes.md`
+§4.1). Its $Z$ was v2's per-cell Gaussianized field. Placement (ii) moved
+the copula onto the Tucker core, so that field no longer exists, and the
+local residual has never been fit on real data (task 07 validated only the
+mode-level OU; task 10 is open). Three candidates:
+
+1. **Standardized-anomaly space.** $Z$ is the standardized log-energy
+   anomaly that Tucker consumes; $Z_{\text{coherent}}$ is DMD's
+   deterministic core, copula-inverted, then Tucker-inverted. The residual
+   is not Gaussian, which the OU fit assumes.
+2. **A per-cell copula on the residual**, then the OU. Gaussian innovations
+   again, at the cost of a second set of per-cell lookup tables (several GB)
+   and an extra inverse step at sampling.
+3. **Leave it out.**
+
+**Decision (2026-11-22): option 3 for the first era-3 model**
+(`include_local_residual=False`). Revisit once validation shows whether the
+missing small-scale variance matters. At 40% Tucker rank, about 23% of the
+standardized anomaly's norm lies outside the coherent layer (task 07 §12).
+Choosing between options 1 and 2 stays open until then.
 
 ---
 
@@ -1048,7 +1561,7 @@ together with the specific window it was estimated over, not treated as a
 window-independent physical constant, until that broader training-window
 decision is made.
 
-### 7.2 Is the "waves have no diurnal signal" reasoning resolution-dependent? — **OPEN**, conditionally
+### 7.2 Is the "waves have no diurnal signal" reasoning resolution-dependent? — **OPEN**, and now active: wind sea has a measurable daily cycle at the archive's resolution (2026-11-22; priority 4)
 
 Raised in: `harmonic_climatology.md` §6.
 
@@ -1060,6 +1573,26 @@ short-fetch seas forced by diurnal sea/land-breeze cycles could carry a
 weak but real diurnal signature. **Not an active concern at the current
 archive's resolution** — listed here for completeness, not because it
 needs attention now.
+
+**Update (2026-11-22): the premise fails for wind sea at this archive's
+resolution.** The production `wsh` core (task 07, era 2, no diurnal terms)
+keeps a daily cycle:
+
+- **Per cell it is small:** median amplitude 0.037 of a cell's standard
+  deviation, up to about 0.18 near coasts.
+- **It is the core's most coherent structure:** it explains 86% and 71% of
+  the first two principal components' variance, and 15% of the top-20 PCs'
+  variance, against 0.2% under a within-day permutation null.
+- **It follows the sun.** Its phase is more coherent in local solar time
+  than in UTC (coastal concentration 0.21 against 0.02). The open-ocean
+  12 h harmonic peaks near 09 local solar time, like the atmospheric
+  semidiurnal tide.
+
+It is therefore physical, not an artifact of the GFS forecast cycle.
+`model_design.md` §5.6.3 measures the residual daily cycle at every fit and
+fails the fit on it. Enabling diurnal terms for `logE_wsh` is the
+configuration change it calls for. Whether other partition tensors need
+them is open.
 
 ---
 
@@ -1146,7 +1679,69 @@ integration* of that fix is still to be done by whoever next edits
 
 ---
 
-## 9. Explicitly out of scope (not open questions — scope boundaries stated by design)
+## 9. Training infrastructure
+
+### 9.1 How does the era-3 training run fit in memory? — **OPEN** (decide together with the training infrastructure)
+
+Raised in: scoping the `model_design.md` §8.6 training notebook for a
+global era-3 fit (2026-11-22).
+
+The training path runs in memory from start to finish. `load_training_window`
+loads the whole window, the preprocessing Pipeline transforms it as one
+Dataset, and each Tucker fit holds its full tensor. At era-3 scale no machine
+available today fits that: the workstation has 31 GB, and the deleted task-07
+VM (`Standard_E8s_v7`) had 64 GB.
+
+Sizes, for era 3 (721 × 1440 = 1.04 M cells) over a 12-month window (2,920
+3-hourly snapshots), tier 1:
+
+| Quantity | Size |
+|---|---|
+| One field, float64 | 24.3 GB |
+| One field, float32 | 12.1 GB |
+| Raw input: 6 fields (`sigwh`, `wsh`, `wsp`, `wsd`, `was`, `wad_come_from`), float64 | ~146 GB |
+| Preprocessing peak: input plus the 7 output tensors, float64 | ≥ ~300 GB |
+| One masked-Tucker fit: float32 tensor, mask and imputation temporaries | ~45–50 GB |
+| One 40%-rank core `(288, 576)` over the window, float64 | 3.9 GB |
+| A joint group of all 7 cores, before the DMD SVD's workspace | ~27 GB |
+
+The preprocessing peak is a lower bound, since each Pipeline step briefly
+holds its input and output together. The Tucker figure scales task 07's
+measurement (peak ~30 GB for a 7.84 GB tensor after the memory fix,
+`tasks/07-tucker-dmd-rank-selection.md`) to the 12.1 GB era-3 tensor. Time
+matters as well as memory: task 07's 40% fit reached iteration 170 of 300 in
+11 h on a smaller tensor. Seven era-3 tensors run one after another on an
+8-core VM would plausibly take days for Tucker alone.
+
+**What does not depend on the answer: the fitted model.** The land mask,
+climatology and standardization are per cell. Tucker is per tensor, the
+copula is per core, and DMD and the mode OU are per group. Splitting the
+preprocessing by cells or tensors, and Tucker by tensors, therefore gives
+the same fitted model up to float rounding. The served artifact and the
+query path (§5.8) stay the same. One limit: Tucker cannot be split
+spatially, because it needs the whole `(T, H, W)` tensor. Its ~45–50 GB per
+tensor is the floor for any machine that runs it in memory.
+
+**What does depend on it: how the fit is computed.** Three families:
+
+1. **One large-memory machine** (~512 GB). Runs the in-memory §8.6 flow
+   unchanged.
+2. **Split the work** by tensor and/or latitude band. The pieces run as
+   parallel jobs (e.g. Azure ML) or one after another on a ~64 GB machine,
+   with intermediate tensors written to disk. This needs code changes in
+   the fit path: `WeatherModel.fit` takes one whole Dataset today.
+3. **Out-of-core arrays.** Try chunking with `numpy.memmap` first; a new
+   dependency such as `dask` needs approval (AGENTS.md *Dependency
+   Management*).
+
+The choice is also how retraining would run in production, so it is decided
+together with the training and production infrastructure, not ahead of it.
+Until then, the §8.6 notebook targets the current in-memory API: it runs
+unchanged on a large machine and on small windows locally.
+
+---
+
+## 10. Explicitly out of scope (not open questions — scope boundaries stated by design)
 
 These are not unresolved questions so much as places where a sibling
 document deliberately drew a boundary. Listed here only to avoid them being
@@ -1186,18 +1781,24 @@ mistaken for open items that need chasing:
 | 3.3 | Directional-alignment equilibrium stability | ANSWERED HERE |
 | 3.4 | Joint multi-channel Tucker vs. downstream joint model for within-group coupling | OPEN (experiment updated to `{E,F}`, see 3.5) |
 | 3.5 | Is `E − 2T ≈ const` clean evidence, or a shared-moment artifact? | ANSWERED (artifact risk confirmed; `{E,F}` fix proposed, unverified) |
-| 4.1 | Gaussianization placement | DECIDED (i, before Tucker — design choice; i-vs-ii comparison left open) |
+| 4.1 | Gaussianization placement | DECIDED (ii, Tucker on log-energy anomalies then Gaussianize the core, before DMD — supersedes the earlier placement-i default; 2026-09-13) |
 | 4.2 | Copula family (Gaussian vs. t/GPD) | OPEN |
+| 4.3 | Unit-variance core coefficients vs. the dynamics fit | OPEN (hypothesis, 2026-11-22; priority 2) |
 | 5.1 | DMD state-vectorization | ANSWERED (recommendation) |
-| 5.2 | Conjugate-pair sampling | ANSWERED IN PRINCIPLE, procedure open |
-| 5.3 | Tucker/DMD rank selection | OPEN (condition-number diagnostic found; memory-bounded default found for `wsh`/`wsp`) |
+| 5.2 | Conjugate-pair sampling | REOPENED 2026-11-22 (conjugacy solved; independent pair phases inflate variance, see 5.7) |
+| 5.3 | Tucker/DMD rank selection | DECIDED — DMD: **r_dmd=100** (2026-09-25, knee point between spectral- and marginal-fidelity optima); Tucker: **40% (248, 576)** (2026-09-29, pragmatic/budget-bound, not a swept optimum) |
 | 5.4 | Masked-HOOI convergence | OPEN (mitigation proposed) |
 | 5.5 | Growing DMD modes | OPEN (mitigation proposed) |
 | 5.6 | Partition-absence NaN vs. land/ice NaN | DECIDED (policy validated empirically, task 17) |
+| 5.7 | Sampler preserving core variance and multi-day memory | OPEN (2026-11-22; priority 3; measured by the fidelity gate, model_design §5.6.3) |
+| 5.8 | Task 07's sampling-based decisions (r_dmd, pair procedure) | OPEN (2026-11-22; priority 6, after 5.7) |
+| 5.9 | Landing the fidelity gate; short-window tolerances | OPEN (2026-11-22; priorities 1 and 5) |
 | 6.1 | OU variance-ratio floor | OPEN |
+| 6.2 | Local residual under placement (ii) | DEFERRED (not in the first era-3 model, 2026-11-22; space still open) |
 | 7.1 | Climatology quasi-stationarity | OPEN |
-| 7.2 | Diurnal reasoning resolution-dependence | OPEN (conditional, inactive) |
+| 7.2 | Diurnal reasoning resolution-dependence | OPEN, active (wind sea has a daily cycle, 2026-11-22; priority 4) |
 | 8.1 | Direction-blind physical constraints | PARTIALLY ANSWERED |
 | 8.2 | Cross-cell/cross-time blindness | OPEN (structural) |
 | 8.3 | Rejection vs. copula fix | OPEN (= 4.2) |
 | 8.4 | Static PM check vs. young-sea transients | ANSWERED (not yet integrated) |
+| 9.1 | Fitting era-3 training in memory | OPEN (decide together with the training and production infrastructure, 2026-11-22; not reprioritized) |

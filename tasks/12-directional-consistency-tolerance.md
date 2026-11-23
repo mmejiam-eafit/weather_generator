@@ -18,6 +18,17 @@ state is young/duration-limited — mirroring the existing energy-budget
 constraint's young-sea exception. The missing mechanism is now specified;
 the missing calibration is not — this task supplies it.
 
+**Update (task 07, 2026-09-29):** two recent commits
+(`752d6d6` canonical `(time, lat, lon)` dim order, `c97641c` relaxing the
+`wad`/`wad_come_from` consistency check for quantization noise) touch
+`_check_wad_wad_come_from_consistency` in `src/train/ingest.py` — but that
+is an *internal* redundancy check confirming two encodings of the *same*
+wind-direction field agree (tolerating ~0.1% of cells for compass-code
+quantization rounding), not this task's physical `wsd`-vs-`wad_come_from`
+alignment question. No wave-age proxy, percentile calibration, or
+$\delta_{dir}$ logic exists anywhere in `src/`. This task remains fully
+open, unrelated to that fix.
+
 ## 2. Steps to answer it
 
 1. Load `wad_come_from`, `wsd`, `was`, `wsh` over a multi-month window.

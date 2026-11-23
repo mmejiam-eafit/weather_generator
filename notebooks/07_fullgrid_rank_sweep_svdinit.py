@@ -20,6 +20,7 @@ next step: rerun the crop at T=96 to isolate it). Run directly:
 """
 
 import argparse
+import csv
 import resource
 import sys
 import time
@@ -31,21 +32,49 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
 import tensorly as tl
 from tensorly.decomposition import partial_tucker
+from tensorly.tenalg import multi_mode_dot
 
+from core.config import canonical_dims
 from train.ingest import load_training_window
 from train.masking import apply_partition_sentinel_policy, height_log_energy, land_mask_from_sigwh
 
 tl.set_backend("numpy")
 
 SEED = 42
+SPATIAL_MODES = [1, 2]  # (time, lat, lon) -- time (mode 0) stays full-rank
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 T_START = datetime(2025, 11, 1, tzinfo=timezone.utc)
 T_END = datetime(2025, 11, 13, tzinfo=timezone.utc)
+CSV_FIELDS = [
+    "timestamp", "tag", "config", "r_lat", "r_lon", "init", "n_iter_max",
+    "elapsed_s", "peak_rss_gb", "n_iters", "final_err",
+]
+
+
+def log_result(out_dir, tag, config, r_lat, r_lon, init, n_iter_max, elapsed, peak_rss_gb, rec_errors, final_err):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if rec_errors is not None:
+        np.save(out_dir / f"{tag}_rec_errors.npy", np.asarray(rec_errors))
+    csv_path = out_dir / "log.csv"
+    is_new = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tag": tag, "config": config, "r_lat": r_lat, "r_lon": r_lon,
+            "init": init, "n_iter_max": n_iter_max, "elapsed_s": f"{elapsed:.1f}",
+            "peak_rss_gb": f"{peak_rss_gb:.2f}",
+            "n_iters": len(rec_errors) if rec_errors is not None else -1,
+            "final_err": f"{final_err:.4f}",
+        })
 
 
 def load_var(name):
     ds = load_training_window(DATA_DIR, T_START, T_END, [name])
-    arr = ds[name].transpose("wave_lat", "wave_lon", "time").values.astype(np.float32)
+    arr = ds[name].transpose(*canonical_dims("wave")).values.astype(np.float32)
     del ds
     return arr
 
@@ -56,6 +85,7 @@ def main():
     p.add_argument("--r_lon", type=int, required=True)
     p.add_argument("--mem_cap_gb", type=float, default=26.0)
     p.add_argument("--n_iter_max", type=int, default=300)
+    p.add_argument("--out_dir", type=str, default=str(Path(__file__).resolve().parents[1] / "results" / "task07"))
     args = p.parse_args()
 
     cap_bytes = int(args.mem_cap_gb * (1024 ** 3))
@@ -73,17 +103,23 @@ def main():
 
     t0 = time.time()
     (core, factors), rec_errors = partial_tucker(
-        x, modes=[0, 1, 2], rank=[args.r_lat, args.r_lon, x.shape[-1]],
+        x, modes=SPATIAL_MODES, rank=[args.r_lat, args.r_lon],
         init="svd", tol=1e-5, n_iter_max=args.n_iter_max, random_state=SEED, mask=mask,
     )
     elapsed = time.time() - t0
-    recon = tl.tucker_to_tensor((core, factors))
+    recon = multi_mode_dot(core, factors, modes=SPATIAL_MODES)
     err = np.linalg.norm((recon - x) * mask) / np.linalg.norm(x * mask)
 
     peak_rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
     n_iters = len(rec_errors) if rec_errors is not None else -1
     print(f"RESULT fullgrid-svdinit wsh rank=({args.r_lat},{args.r_lon}) err={err:.4f} "
           f"peak_rss_gb={peak_rss_gb:.2f} elapsed_s={elapsed:.1f} n_iters={n_iters}")
+
+    tag = f"fullgrid_r{args.r_lat}x{args.r_lon}_iter{args.n_iter_max}"
+    log_result(
+        args.out_dir, tag, "fullgrid-svdinit-wsh", args.r_lat, args.r_lon,
+        "svd", args.n_iter_max, elapsed, peak_rss_gb, rec_errors, err,
+    )
 
 
 if __name__ == "__main__":

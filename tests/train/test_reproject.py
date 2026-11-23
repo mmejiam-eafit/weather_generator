@@ -117,6 +117,37 @@ def test_reprojector_reprojects_non_target_grid_variable() -> None:
     assert_allclose(result["wave_lon"].values, [45.0, 135.0])
 
 
+def test_reprojector_passes_through_a_variable_on_identical_coordinates() -> None:
+    """Wind on the wave grid's own lines is relabelled, not interpolated (§2.2, §5.2).
+
+    Interpolating identical grids is not a no-op: a land NaN would spread to
+    the ocean cells south and west of it through the zero-weight corner of
+    the bilinear stencil.
+    """
+    lats = [-75.0, -74.75, -74.5]
+    lons = [0.0, 0.25, 0.5, 0.75]
+    wind = np.arange(24.0).reshape(2, 3, 4)
+    wind[:, 2, 2] = np.nan  # one land cell
+    ds = xr.Dataset(
+        {
+            "sigwh": (("time", "wave_lat", "wave_lon"), np.ones((2, 3, 4))),
+            "u_wind": (("time", "wind_lat", "wind_lon"), wind),
+        },
+        coords={
+            "time": [0, 1],
+            "wave_lat": lats,
+            "wave_lon": lons,
+            "wind_lat": lats,
+            "wind_lon": lons,
+        },
+    )
+
+    result = Reprojector().fit_transform(ds)
+
+    assert result["u_wind"].dims == ("time", "wave_lat", "wave_lon")
+    assert_allclose(result["u_wind"].values, wind)
+
+
 def test_reprojector_inverse_transform_is_identity() -> None:
     """inverse_transform is a no-op: reprojection is lossy and has no true inverse."""
     ds = xr.Dataset(

@@ -624,6 +624,19 @@ live design decision requiring empirical validation (e.g. comparing
 physical-space QQ-plots and reconstructed extreme statistics under each
 placement) that has not been done.
 
+**Update (2026-09-13): (i) vs. (ii) decided — see `open_questions.md` §4.1.**
+Task 07's era-2 rank sweep ran (i) and (ii) at the same Tucker rank and found
+them statistically indistinguishable (50.81% vs. 53.04% error at 5% rank) —
+the linear-rank-inflation concern this section raised about per-cell
+Gaussianization ahead of a linear compression stage (§2.4's point that
+copula-invariance under monotone transforms says nothing about invariance of
+the linear/Pearson structure Tucker actually uses) turned out not to be the
+dominant effect on this data. Placement (ii) was still adopted as canonical,
+on the architectural grounds in `open_questions.md` §4.1's update rather than
+this empirical near-tie: it keeps Tucker in physically-grounded log-energy
+anomaly space and moves Gaussianization to sit immediately before DMD, the
+one stage that actually requires Gaussian innovations.
+
 ### 6.2 Relation to the tail-dependence fix path
 
 The zero-tail-dependence result of §2.5 is a property of the *Gaussian*

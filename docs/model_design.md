@@ -1,24 +1,39 @@
-git # Stochastic Weather Generator — Design Handoff (v2)
+# Stochastic Weather Generator — Design Handoff (v3)
 
 **Package:** `weather-generator` (Python, three sibling packages under `src/`: `core`, `train`, `weather`).
 
 **Audience:** coding agent bootstrapping the repo from scratch, or picking up work in progress. This document is self-contained — every convention, formula, and restriction the agent needs is stated here, not by reference.
 
-**One-line summary:** train a stochastic model on the raw 3-hourly `.npy` archive produced by the [`noaa_etl`](./noaa_etl/) pipeline — NOAA GFS-Wave GRIB2 (wave *and* wind fields together, one product) plus RTOFS/HYCOM (sea surface temperature and ocean currents) (2022–2025) — and provide plausible synthetic samples of any variable at any continuous `(lat, lon, datetime)` when real data isn't available. Validate on 2026. **`docs/noaa_etl/` is the unequivocal source of truth for this archive's origin and transformations** (see `docs/noaa_etl/pipeline.md`); every data fact in §2 below is stated to be consistent with it.
+**One-line summary:** train a stochastic model on the raw 3-hourly `.npy` archive produced by the [`noaa_etl`](./noaa_etl/) pipeline — NOAA GFS-Wave GRIB2 (wave *and* wind fields together, one product) plus RTOFS/HYCOM (sea surface temperature and ocean currents) — and provide plausible synthetic samples of any variable at any continuous `(lat, lon, datetime)` when real data isn't available. v3 trains on 12 months of archive era 3 and validates on the real data that follows. **`docs/noaa_etl/` is the unequivocal source of truth for this archive's origin and transformations** (see `docs/noaa_etl/pipeline.md`); every data fact in §2 below is stated to be consistent with it.
 
-**Approach chosen:** hierarchical decomposition — **linear-trend + harmonic climatology** → **coherent large-scale modes** via Tucker compression + DMD + OU on mode amplitudes → **per-cell local residuals** via independent OU fields. Per-cell Gaussian-copula marginals wrap the whole thing. Orchestrated by a scikit-learn `BaseEstimator + TransformerMixin` wrapper. See §3 for rationale and rejected alternatives.
+**Approach chosen:** hierarchical decomposition, one independent chain per modeled field — **linear-trend + harmonic climatology** on log-energy / log-period / `(u, v)` fields → **per-variable masked Tucker** compression of the standardized anomaly → **Gaussian copula on each Tucker core** → **DMD + OU on mode amplitudes** per variable group. A training-time diagnostics stage (linear inverse model, tau test, coupling information) is recorded with the model, and a generative fidelity stage simulates the fitted dynamics against the training cores and refuses to build a model that fails it (§5.6.3). The per-cell local-residual layer is deferred in v3 (§3.10, §5.7). Orchestrated by a scikit-learn `BaseEstimator + TransformerMixin` wrapper. See §3 for rationale and rejected alternatives.
 
 **Language:** Python 3.14 only. Batched-first API design (§1, §8). If a downstream consumer eventually shows sub-millisecond point queries are needed and cannot be batched, a C++ query library can be added; do not build one preemptively.
 
 **Training entry point:** a Jupyter notebook (`notebooks/test_pipeline.ipynb`), not a CLI. Training is a one-shot exploratory activity that benefits from cell-level iteration on Tucker/DMD/OU hyperparameters against a cached preprocessing output.
 
-**Training data:** the archive spans 2022-01-01 to 2026-07-20T00:00Z, but is **not one uniform grid/cadence throughout** — it has undergone two confirmed, clean, one-time shape/cadence transitions (see §2.2.1 and `core.archive_eras.ARCHIVE_ERAS`, the authoritative source). A previous version of this doc claimed a flat "2022-2025, 4 years, ~11,700 snapshots at 3h cadence" — that is wrong (it spans three distinct archive eras, the earliest of which is 6-hourly, not 3-hourly) and is corrected here. `train.ingest.load_training_window` now rejects any requested window spanning more than one era. **Which single era (or subset of the archive) to actually train the production model on is a separate, still-open decision** — not resolved by this correction; see `tasks/16-archive-grid-resolution-drift.md`.
-**Validation (numerical metrics):** 2026-01-01T00:00Z to 2026-07-19T21:00Z (~200 days, ~1,600 snapshots) — entirely within era 3 (see §2.2.1). Held-out real data used to compute the validation battery in §6. Note: the archive's last ~7 snapshots (2026-07-19T03:00Z–2026-07-20T00:00Z) are missing all 3 ocean variables (`sst`/`ocs`/`ocd`) — currently inconsequential since ocean-grid loading is unsupported regardless (§2.7), but relevant once it is supported.
-**Extrapolation window:** 2026-07-20T00:00Z onward — the archive currently ends here (confirmed, matches this line). The model must produce plausible synthetic weather for these dates without real data available for comparison. Assessed by consistency and stability checks rather than pointwise metrics; see §6.13.
+**Training data (v3):** `2025-10-27T00:00Z` to `2026-10-27T00:00Z` (exclusive): 12 months of archive era 3 (721 × 1440, 3-hourly, §2.2.1), `T = 2920` snapshots. A full annual cycle, so the climatology's annual and semi-annual harmonics are constrained (§3.9). The archive spans three grid/cadence eras and `train.ingest.load_training_window` rejects any window crossing an era boundary. Era 3 is the canonical grid; training on a longer era-3 window is to be revisited once era 3 reaches about 18 months of history (around 2027-04-27).
+**Validation (numerical metrics):** `2026-10-27T00:00Z` onward: the real data after the training window, about 25 days when v3 was written (archive downloaded through 2026-11-21) and growing as data arrives. Held-out real data used to compute the validation battery in §6. Earlier versions validated on 2026-01-01 → 2026-07-19, which now falls inside the training window.
+**Extrapolation window:** past the last real snapshot. The model must produce plausible synthetic weather there without real data to compare against, assessed by consistency and stability checks rather than pointwise metrics (§6.B).
 
 ---
 
-## What changed vs. v1
+## What changed in v3
+
+Read this section if you know v2. v3 brings the handoff in line with the decisions recorded since v2 in `docs/open_questions.md`, the `docs/` topic series and the task files.
+
+1. **One independent tensor per modeled field** (`variable_taxonomy.md` §4–§5). Heights become log energy (`logE_* = log(max(H, 1 cm)²)`), periods become `log T` (`T_*`), directions become speed- or height-weighted `(u, v)`. No variable axis exists anywhere: 17 tensors in total (§10). §3.8, §5.3.
+2. **Per-variable masked Tucker** on each `(T, lat, lon)` tensor, compressing only the spatial modes, through the vendored `train/masked_tucker.partial_tucker_lowmem` (task 07 §5 fixed two tensorly bugs). Replaces v2's joint ocean-cell × variable Tucker and its `r_ocean`/`r_var` ranks. Rank: 40% of each spatial dimension (task 07). §5.5.
+3. **Gaussianization after Tucker** (placement ii, DECIDED in `open_questions.md` §4.1). The copula is fit on each Tucker core's coefficients, not on grid cells, and leaves the preprocessing Pipeline. §3.5, §5.5.1.
+4. **Land mask from `sigwh`, sentinel fill for absent partitions** (task 17, `open_questions.md` §5.6). §5.1, §5.3.1.
+5. **DMD and mode-level OU per variable group**: one group per tensor by default; joint groups are a Linear Inverse Model (`correlated_variables.md` §4). `r_dmd = 100` (task 07). The mode OU drives one real channel per real mode and per conjugate pair (task 07's pair procedure), with one joint innovation covariance per group. Its samples inflate the variance on the production core (§5.6.1, "Known defect"). §5.6, §5.6.1.
+6. **Group dynamics diagnostics stage** (tau test, coupling information). §5.6.2.
+7. **Generative fidelity gate.** Training simulates each group's fitted dynamics and compares the samples with the training cores: variance, multi-day memory, residual time-of-day cycle. A model that fails cannot be built. The current sampler fails it on the production `wsh` core (§5.6.1, "Known defect"). §5.6.3.
+8. **Local residual deferred.** Not part of the first era-3 model (`include_local_residual=False`). §3.10, §5.7.
+9. **Sampling interpolates in linear-safe space.** Per-cell inverses on grid cells, then bilinear interpolation of `(u, v)`, `logE` and `T`, then pointwise `exp` / `hypot` / `atan2`. v2 interpolated physical values, direction angles included. §5.8.
+10. **Training and validation windows** moved to era 3 (above).
+
+## What changed in v2 (vs. v1)
 
 Read this section if you're already familiar with v1. Otherwise skip to §1.
 
@@ -171,7 +186,7 @@ The table above's wave-grid row, and `core.config`'s wave-grid constants (`WAVE_
 |---|---|---|---|---|---|
 | **era1** | 2022-01-01 → 2023-10-01T18:00Z | (181,360) | (181,360) | `sst`=(180,360) **≠** `ocs`/`ocd`=(1265,2880) — internally inconsistent | 6-hourly (00/06/12/18Z only; 03/09/15/21Z structurally empty, confirmed across the whole era) |
 | **era2** | 2023-10-02T00:00Z → 2025-10-26T21:00Z | (621,1440) — the table above | (721,1440) — the table above | (1121,2880), consistent — the table above | 3-hourly — §5.1's documented default |
-| **era3** | 2025-10-27T00:00Z → archive end (2026-07-20T00:00Z) | (721,1440) — see below | (721,1440) | (1121,2880) | 3-hourly |
+| **era3** | 2025-10-27T00:00Z → open-ended (downloaded through 2026-11-21) | (721,1440) — see below | (721,1440) | (1121,2880) | 3-hourly |
 
 All three transitions are confirmed clean, synchronized, one-time cutovers (no patchy/interleaved periods).
 
@@ -391,18 +406,18 @@ Real-valued EOFs represent traveling waves as pairs of standing modes in quadrat
 
 For the *coherent* layer of the hierarchical decomposition (§3.10):
 
-- **Tucker (HOSVD)** compresses spatial and variable modes.
-- **DMD** on the compressed core extracts the linear deterministic skeleton. Each mode carries its own complex eigenvalue encoding growth rate and frequency.
+- **Tucker** compresses each modeled tensor's own spatial modes (lat, lon), leaving time at full rank so DMD sees one state per snapshot (`tucker_decomposition.md` §4.3). One independent masked fit per tensor; there is no variable mode (§3.8, §5.5).
+- **DMD** on the Gaussianized core(s) of a variable group extracts the linear deterministic skeleton. Each mode carries its own complex eigenvalue encoding growth rate and frequency. By default every tensor is its own group; a joint group concatenates its members' cores (`correlated_variables.md` §4).
 - **OU on residual mode amplitudes** models stochastic wobble around the deterministic skeleton. Closed-form fit and simulation.
 
-### 3.5 Non-Gaussian marginals via Gaussian copula
+### 3.5 Non-Gaussian marginals via Gaussian copula — on the Tucker core (placement ii)
 
-DMD and OU are linear-Gaussian; weather variables are skewed and bounded. Interpose an empirical-CDF Gaussian copula per cell:
+DMD and OU are linear-Gaussian; weather variables are skewed and bounded. Interpose an empirical-CDF Gaussian copula, per coefficient of each tensor's Tucker core:
 
-- **Forward** (training): rank per cell → uniform → `Φ⁻¹` → standard normal.
-- **Inverse** (sampling): standard normal → `Φ` → uniform → empirical CDF lookup → original units.
+- **Forward** (training): rank each core coefficient over time → uniform → `Φ⁻¹` → standard normal.
+- **Inverse** (sampling): standard normal → `Φ` → uniform → empirical CDF lookup → core coefficient.
 
-Handles positivity/boundedness implicitly. Known limitation: zero joint tail dependence. Fix later per §3.13 escalation.
+**Placement (ii) is DECIDED** (`open_questions.md` §4.1, task 00, task 07 §5); it supersedes v2's per-grid-cell copula before Tucker. The two placements gave statistically indistinguishable Tucker error at equal rank, so the choice is architectural: Tucker, a linear tool, works in physically grounded log-energy anomaly space, and Gaussianization sits exactly where it is needed, right before DMD's Gaussian-innovation assumption. Known limitation unchanged: zero joint tail dependence (`open_questions.md` §4.2). Fix later per §3.13 escalation.
 
 ### 3.6 Cross-grid handling: reproject the ocean grid onto the wave grid
 
@@ -417,7 +432,7 @@ The archive stores directions in **mixed conventions** (§2.4): most fields are 
 - `ComingFromToUV` — for `(speed, θ_from)` pairs (`wsd`, `pwd`, `pswd`, `wad_come_from`).
 - `GoingToToUV` — for `(speed, θ_to)` pairs (`ocd`; `wad` is unused).
 
-Both run before `Reprojector` (§5.2). They act on disjoint variable sets and can be composed in either order. Each has its own `inverse_transform` that reconstructs the variable in its original archive convention.
+Both run before `Reprojector` (§5.2). They act on disjoint variable sets and can be composed in either order. Each has its own `inverse_transform` that reconstructs the variable in its original archive convention. For the wind-sea and primary-swell triplets (class C) the height is also kept as its own `logE` tensor, so the transformer must not drop it (§5.3).
 
 **Why two transformers instead of one decoder that normalizes to a canonical internal convention:**
 
@@ -430,13 +445,13 @@ Both run before `Reprojector` (§5.2). They act on disjoint variable sets and ca
 
 ### 3.8 Which variables to model — tiered
 
-**Tier 1 (v0.1.0):** `sigwh`, `wsh`, `wsp`, `was`; `(u_wind, v_wind)`, `(u_wsea, v_wsea)`. Six modeled fields after (u, v) expansion.
+v3 models the tensors of `variable_taxonomy.md` §5, one independent tensor each (full list with source fields in §10). The tiers keep v2's raw-field grouping:
 
-**Tier 2 (v0.2.0):** peak wave `(pwh, pwp, pwd)` — adds `(u_peak, v_peak)`; `sst`. Requires `notebooks/verify_ocean_grid_orientation.ipynb` (§2.7) to exist and pass before `sst` is wired into the pipeline.
+- **Tier 1 (v0.1.0)**, 7 tensors: `logE_sigwh`; `u_wind`, `v_wind` (from `was`, `wad_come_from`); `logE_wsh`, `T_wsp`, `u_wsea`, `v_wsea` (wind-sea triplet).
+- **Tier 2 (v0.2.0)**, 4 tensors: `T_pwp`, `u_pwave`, `v_pwave` (peak wave; `pwh` ≡ `sigwh`, so no `logE` tensor of its own); `sst`, blocked until per-cell ocean-grid coordinates exist (task 16).
+- **Tier 3 (v0.3.0+)**, 6 tensors: `logE_pswh`, `T_pswp`, `u_pswell`, `v_pswell` (primary swell); `u_current`, `v_current`, blocked like `sst`.
 
-**Tier 3 (v0.3.0+):** primary swell; ocean currents. `ocd`/`ocs` likewise require `notebooks/verify_ocean_grid_orientation.ipynb` (§2.7) to have passed — do not enable `GoingToToUV`'s `ocd` pair before it does.
-
-`wad` ignored throughout — `wad_come_from` is the source of truth for wind direction (§2.4, §3.7).
+`wad` ignored throughout — `wad_come_from` is the source of truth for wind direction (§2.4, §3.7). `sigwh` is always loaded, even when not modeled, because it defines the land mask (§5.1).
 
 ### 3.9 Climatology is quasi-stationary — linear trend term
 
@@ -459,9 +474,13 @@ where `Δτ(t) = (t − t_ref) / (1 year)` and `t_ref` is the **midpoint** of th
 
 **Diagnostic:** the fit emits a per-cell `|c_lin| / σ_std` ratio. Cells where this exceeds ~0.1 have meaningful trend; if fewer than ~5% of cells exceed it, the trend term is essentially fitting noise and `include_trend=False` is cleaner. Report the fraction as a training log line.
 
+**v3 caveat.** On v3's 12-month window the linear trend is only weakly separable from the annual harmonic and from interannual variability, so `trend_significance_ratio_` decides whether to keep it; the default stays `include_trend=True` pending task 11 (climatology quasi-stationarity).
+
 **Escalation** to interannual index regressors (ENSO, NAO) or rolling climatology deferred to §3.13.
 
 ### 3.10 Hierarchical decomposition — the coherent/local split
+
+**Deferred in v3.** The first era-3 model is coherent layer only (`include_local_residual=False`). The local layer has never been fit on real data (task 07 validated only the mode-level OU; task 10 is open), and its definition below assumes v2's per-cell Gaussianized field, which placement (ii) no longer produces. Where it would live under placement (ii) is recorded as open in `open_questions.md` §6.2. The design below is kept for when validation shows the missing small-scale variance matters; at 40% Tucker rank about 23% of the standardized anomaly's norm is outside the coherent layer (task 07 §12).
 
 **Change from v1.** v1 modeled the Gaussianized anomaly `Z(s, t)` with Tucker + DMD + OU on ~100 mode amplitudes. At sample time, the value at any `(s, t)` was a deterministic function of those 100 amplitudes. Consequence: samples were too spatially smooth — realistic at basin scale, unrealistically clean at cell scale. Real weather has fine-grained texture the coherent modes can't represent.
 
@@ -493,19 +512,19 @@ At fit time, `Z_local` is estimated as the residual `Z − Z_coherent`, and per-
 - Both libraries are maintained by the primary research groups in their respective areas (TensorLy's Kolda-Bader lineage; PyDMD's Brunton-Kutz group).
 - Both are well-tested against edge cases we would otherwise have to discover ourselves.
 - **PyDMD unlocks the escalation paths for free.** Hankel-DMD is a one-line class swap (`pydmd.HankelDMD`); Bagging Optimized DMD with automatic uncertainty quantification is `pydmd.BOPDMD` with `eig_constraints={"conjugate_pairs"}` — which also removes the manual complex-conjugate-pair handling that was gotcha #8 in v1.
-- **TensorLy's `partial_tucker`** natively handles the "compress modes 1 and 2, keep mode 0 (time) full-rank" pattern we need. Its HOOI initialization is slightly better than pure HOSVD for the same rank.
+- **TensorLy's `partial_tucker`** natively handles the "compress modes 1 and 2, keep mode 0 (time) full-rank" pattern we need. Its HOOI initialization is slightly better than pure HOSVD for the same rank. **v3 calls a vendored copy**, `train/masked_tucker.partial_tucker_lowmem`: tensorly 0.9.0's masked ALS materializes several full-size temporaries per iteration and silently ignores `svd="randomized_svd"` after initialization. The fix gave about 1.7× per iteration and half the memory (task 07 §5).
 
 The wrappers still add value:
 
 - We return frozen `TuckerFit`/`DMDFit` dataclasses containing only numpy arrays, not tensorly/pydmd class instances. Artifacts serialize cleanly to `.npz` and don't break when tensorly/pydmd versions drift.
-- We handle ocean-cell masking, dtype coercion, and NaN guards around the calls.
+- We handle land masking (passed to the masked ALS), dtype coercion, and NaN guards around the calls.
 - We keep the algorithmic knobs surfaceable at the `WeatherModel` level (rank choices, DMD variant, etc.).
 
 See §5.5 and §5.6 for implementation sketches.
 
 ### 3.12 sklearn hybrid: transformers where they fit, pure functions where they don't
 
-Unchanged from v1. Preprocessing chain (directional → reproject → climatology → standardize → Gaussianize) are sklearn `BaseEstimator + TransformerMixin` classes; decomposition + stochastic models (Tucker, DMD, mode-OU, local-OU) are pure functions returning frozen dataclasses. `WeatherModel` glues both kinds together with the sklearn transformer surface at the top level.
+The preprocessing chain (partition sentinel fill → directional → log transform → reproject → climatology → standardize) is sklearn `BaseEstimator + TransformerMixin` classes in one `Pipeline`. Decomposition and stochastic models (Tucker, DMD, mode-OU, diagnostics) are pure functions returning frozen dataclasses. The core copula is still the `GaussianCopula` transformer class, but applied per Tucker core outside the Pipeline (§5.5.1). `WeatherModel` glues them together with the sklearn transformer surface at the top level.
 
 ### 3.13 Documented escalation paths
 
@@ -513,12 +532,13 @@ If validation (§6) shows the base model is insufficient:
 
 - **High-frequency variance under-represented in per-cell spectra** → swap `pydmd.DMD` for `pydmd.HankelDMD`. One-line change in `train/dmd.py`.
 - **Extremes and joint tail dependence too weak** → replace Gaussian copula with t-copula (single extra df parameter) or splice GPD tails per cell (Coles 2001).
-- **Cross-variable coupling too weak** → raise `r_var` Tucker rank, or add explicit Linear Model of Coregionalization.
+- **Cross-variable coupling too weak** → form a joint variable group (`correlated_variables.md` §4) and check that its coupling information clears the independence null (§5.6.2); an explicit Linear Model of Coregionalization remains a further option.
+- **Tau test fails** (§5.6.2; the production `wsh` core already does from 6 h) → longer DMD training lag, `pydmd.HankelDMD` (time-delay embedding), or modeling the fast 3 h component explicitly as noise. None tested yet.
 - **Short-lag spatial correlation in residuals missing** → replace independent per-cell OU with SPDE-GMRF local layer (Lindgren–Rue–Lindström 2011). Real research-level change; do only if validation forces it.
 - **Interannual climate variability biases the climatology** → add index regressors (ENSO NINO3.4, NAO) to the climatology model, or switch to rolling-window climatology re-fit annually.
 - **DMD modes miss slow (multi-year) structure** → try `pydmd.BOPDMD` with `eig_constraints={"imag"}` to constrain modes to be purely oscillatory, forcing slow structure into the climatology where it belongs.
 - **Uncertainty quantification on modes needed** → use `pydmd.BOPDMD` regardless. Bagged fit gives per-mode confidence intervals.
-- **In-sample hurricane-season reproduction check (§6.A.18) looks weak** → escalate to a true leave-one-year-out retrain: fit on 3 of the 4 training years, hold out the fourth's Aug-Oct entirely, repeat the same storm-signature detection purely out-of-sample. 4× the fit cost (one retrain per held-out year), so only do this if the cheaper in-sample check raises a real concern — don't run it by default for v0.1.0.
+- **In-sample hurricane-season reproduction check (§6.A.18) looks weak** → escalate to a true leave-one-year-out retrain: fit on 3 of the 4 training years, hold out the fourth's Aug-Oct entirely, repeat the same storm-signature detection purely out-of-sample. 4× the fit cost (one retrain per held-out year), so only do this if the cheaper in-sample check raises a real concern — don't run it by default for v0.1.0. Needs several training years; impossible on v3's 12-month era-3 window.
 
 ### 3.14 Three-package split: `core`, `train`, `weather`
 
@@ -528,47 +548,45 @@ Unchanged from v1. `core/` — shared primitives; `train/` — training pipeline
 
 ## 4. Architecture overview
 
-Three deterministic layers plus two stochastic layers.
+Deterministic preprocessing per field, per-tensor compression, per-group stochastic dynamics.
 
 ```
                           TRAINING (offline, notebook-driven)
    ┌────────────────────────────────────────────────────────────────────┐
    │                                                                    │
-   │   ./data/YYYY/MM/DD/HH/*.npy      (2022–2025 for training)          │
+   │   ./data/YYYY/MM/DD/HH/*.npy   (v3: 12 months of era 3)            │
    │              │                                                     │
    │              ▼                                                     │
    │   [ingest]   load_training_window(data_dir, t_start, t_end)        │
    │              │                                                     │
    │              ▼                                                     │
-   │   ┌────────── sklearn Pipeline (preprocessing) ──────────┐        │
-   │   │  ComingFromToUV, GoingToToUV      (train/directional.py) │     │
-   │   │  Reprojector               (train/reproject.py)       │        │
-   │   │  ClimatologyRemover        (train/climatology.py)     │        │
-   │   │      — includes linear trend term (§3.9)              │        │
-   │   │  PerCellStandardizer       (train/standardize.py)     │        │
-   │   │  GaussianCopula            (train/copula.py)          │        │
-   │   └───────────┬───────────────────────────────────────────┘        │
-   │               │  Gaussianized anomalies Z (T × N_ocean × V)         │
-   │               ▼                                                    │
-   │   ┌────────── Coherent decomposition (§5.5–5.6) ──────────┐       │
-   │   │  tucker_fit   → TuckerFit                              │       │
-   │   │      via tensorly.decomposition.partial_tucker         │       │
-   │   │  dmd_fit      → DMDFit                                 │       │
-   │   │      via pydmd.DMD (or BOPDMD variant)                 │       │
-   │   │  fit_mode_ou  → ModeOUFit  (per-mode θ, σ, φ)          │       │
-   │   └───────────┬────────────────────────────────────────────┘       │
-   │               │  Z_coherent(s, t)                                  │
-   │               ▼                                                    │
-   │   ┌────────── Local residual (§5.7, new in v2) ───────────┐       │
-   │   │  R(s, t) = Z(s, t) − Z_coherent(s, t)                  │       │
-   │   │  fit_local_residual  → LocalResidualFit                │       │
-   │   │      per-cell (θ_local, σ_local, φ_local) field        │       │
-   │   └───────────┬────────────────────────────────────────────┘       │
-   │               │                                                    │
-   │               ▼                                                    │
-   │   WeatherModel.from_components(pipeline, tucker, dmd,              │
-   │                                mode_ou, local_residual, ...)      │
-   │       .save(model_dir)                                             │
+   │   ┌── sklearn Pipeline (preprocessing, §5.2–5.4) ────────────┐     │
+   │   │ PartitionSentinelFiller  land mask from sigwh; fills     │     │
+   │   │                  absent wind-sea / swell partitions      │     │
+   │   │ ComingFromToUV, GoingToToUV  (u, v); keeps class-C       │     │
+   │   │                              height                      │     │
+   │   │ LogTransform             logE_* heights, T_* periods     │     │
+   │   │ Reprojector, ClimatologyRemover, PerCellStandardizer     │     │
+   │   └──────────┬───────────────────────────────────────────────┘     │
+   │              │  standardized anomaly, one (T, lat, lon) per tensor │
+   │              ▼                                                     │
+   │   ┌── Per-tensor compression (§5.5) ─────────────────────────┐     │
+   │   │ tucker_fit (masked, partial_tucker_lowmem) → TuckerFit   │     │
+   │   │ GaussianCopula on the core → Gaussianized core           │     │
+   │   │     (T, r_lat, r_lon), N(0, 1) marginals                 │     │
+   │   └──────────┬───────────────────────────────────────────────┘     │
+   │              │  cores concatenated per variable group              │
+   │              ▼                                                     │
+   │   ┌── Per-group dynamics (§5.6) ─────────────────────────────┐     │
+   │   │ dmd_fit → DMDFit;  fit_mode_ou → ModeOUFit               │     │
+   │   │ diagnose_group → GroupDiagnostics (§5.6.2), recorded     │     │
+   │   │     only; never alters or gates the fit                  │     │
+   │   └──────────┬───────────────────────────────────────────────┘     │
+   │              │                                                     │
+   │              ▼                                                     │
+   │   WeatherModel.from_components(preprocess, tucker, core_copula,    │
+   │                                dmd, mode_ou, group_diagnostics,    │
+   │                                ocean_mask, metadata).save(dir)     │
    └────────────────────────────────────────────────────────────────────┘
 
                          QUERY (online, batched preferred)
@@ -577,23 +595,26 @@ Three deterministic layers plus two stochastic layers.
    │   weather.simulate.sample_batch(model, lats, lons, times, vars)    │
    │              │                                                     │
    │              ▼                                                     │
-   │   Evolve mode OU + DMD to requested times (closed-form)            │
+   │   Evolve each group's DMD + mode OU to the query times             │
+   │   (closed form; conjugate pairs exact; correlated noise within     │
+   │   joint groups)                                                    │
    │              │                                                     │
    │              ▼                                                     │
-   │   Reconstruct compressed state → Tucker inverse → Z_coherent(s, t) │
+   │   Split the joint state into per-tensor Gaussianized cores         │
    │              │                                                     │
    │              ▼                                                     │
-   │   Draw Z_local(s, t) from per-cell OU (independent, closed-form)   │
+   │   Copula inverse → core;  Tucker inverse on the cells needed       │
    │              │                                                     │
    │              ▼                                                     │
-   │   Z(s, t) = Z_coherent(s, t) + Z_local(s, t)                       │
+   │   Per-cell inverses: standardization, climatology, reprojection    │
    │              │                                                     │
    │              ▼                                                     │
-   │   Bilinear interpolate at (lat, lon) [padded for lon wraparound]   │
+   │   Bilinear interpolate (u, v), logE, T at (lat, lon)               │
+   │   [padded for lon wraparound]                                      │
    │              │                                                     │
    │              ▼                                                     │
-   │   preprocess.inverse_transform  → invert copula, standardization,  │
-   │                                    add climatology, recombine u/v  │
+   │   Pointwise: H = exp(logE / 2), period = exp(T),                   │
+   │              (u, v) → speed, direction in native convention        │
    │              │                                                     │
    │              ▼                                                     │
    │   values[]                                                         │
@@ -602,27 +623,31 @@ Three deterministic layers plus two stochastic layers.
 
 **Key architectural properties:**
 
-- The preprocessing chain is one sklearn `Pipeline`. Its `inverse_transform` is the same object as its `transform` — no duplicated inverse logic.
-- Sampling is composed of two independent stochastic contributions: coherent (via ~100 mode-OU) and local (via `N_ocean × V` cell-OU). Both use closed-form OU transitions — no discrete stepping needed for point queries.
-- `WeatherModel.transform(X)` runs *only* the preprocessing Pipeline and returns Gaussianized anomalies at native grid resolution. Not `Z_coherent`, not `Z_local`. Consumers who want those get them from the fitted attributes directly.
+- The preprocessing chain is one sklearn `Pipeline`. Its `inverse_transform` is the same object as its `transform` — no duplicated inverse logic. It ends at the standardized anomaly; the core copula is applied per tensor after Tucker (§5.5.1).
+- Every modeled field is its own `(T, lat, lon)` tensor from preprocessing through Tucker and the copula. The only place fields meet is a variable group's joint DMD state, built from already-compressed core coefficients (`correlated_variables.md` §4).
+- Sampling in v3 is the coherent layer only: mode-level OU per group, closed-form transitions, no discrete stepping needed for point queries. The local residual is deferred (§3.10).
+- Per-cell statistics (climatology, standardization) are inverted on grid cells before interpolation, and interpolation happens on linear-safe fields only (§5.8).
+- `WeatherModel.transform(X)` runs *only* the preprocessing Pipeline and returns standardized anomalies per tensor at native grid resolution. Not cores, not Gaussianized values.
+- Group dynamics diagnostics (§5.6.2) are a training stage whose results are stored on the model and logged, but never feed sampling. A failed tau test or significant coupling is input to the next modeling decision, not an error.
 
 ---
 
 ## 5. Algorithm, step by step
 
-Notation used throughout (naming disambiguated in v2):
+Notation used throughout (v3):
 
-- `T` — training snapshots (~11,700 for 2022–2025 at 3h cadence).
+- `T` — training snapshots (2920 for v3's 12-month era-3 window at 3 h).
 - `H, W = 721, 1440` — wave grid dimensions (era 3, current/production).
-- `N_ocean` — ocean cells after masking; expect ~60% of `H·W` ≈ 6.2 × 10⁵.
-- `V` — jointly modeled variables. Tier 1: ~6 after (u, v) expansion.
-- `r_ocean`, `r_var`, `r_dmd` — truncation ranks.
+- `v` — one modeled tensor (`logE_wsh`, `u_wind`, …; §10). Every tensor has the same grid shape `(T, H, W)`.
+- `M` — the `(H, W)` ocean mask from `sigwh` (§5.1); land cells are `False`.
+- `r_lat, r_lon` — a tensor's Tucker ranks; default 40% of `H, W`, i.e. `(288, 576)`.
+- `G` — a variable group (a set of tensors fit by one DMD); `n_G` its joint state size (the sum of its members' `r_lat · r_lon`).
+- `r_dmd` — DMD truncation rank per group.
 - `Δt = 10800 s` (3 hours).
 - `t_ref` — climatology reference epoch (midpoint of training window).
 - `σ_std(s, v)` — per-cell standardization scale.
-- `σ_climatology(s, v)` = `σ_std(s, v)` (alias for clarity).
 - `θ_mode(k)`, `σ_mode(k)`, `φ_mode(k)` — OU parameters per DMD mode.
-- `θ_local(s, v)`, `σ_local(s, v)`, `φ_local(s, v)` — OU parameters per ocean cell per variable.
+- `θ_local`, `σ_local`, `φ_local` — local-residual OU parameters (deferred in v3, §5.7).
 
 ### 5.1 Ingest
 
@@ -673,9 +698,9 @@ Log the max deviation on success. Rerun on the last snapshot too — if the arch
 
 **Gap handling:** missing file → log to stderr, mark NaN. Gap of 24 h+ → abort. Gap 6–24 h → warn.
 
-**Memory:** 4 years × 6 vars at `float64` at global 0.25° is ~240 GB. Use `np.memmap` or chunk time-blocks (30 days at a time).
+**Memory:** one tensor over v3's window is 2920 × 721 × 1440 values: about 12 GB at `float32`, 24 GB at `float64`. Tier 1's seven tensors do not fit in memory together on a 31 GB workstation. Process one tensor at a time through Tucker (§5.5), and use `np.memmap` or 30-day time blocks for the preprocessing pass.
 
-**Ocean mask construction:** for each grid, intersection of `not isnan` across all training snapshots and modeled variables on that grid. Wind grid needs external Natural Earth land polygon rasterized to `(721, 1440)`. Store as `.ocean_mask_` on `WeatherModel` — bool `(721, 1440)`.
+**Ocean mask construction (v3, task 17):** derived from `sigwh`'s own NaN pattern alone: a cell is ocean only if `sigwh` is non-NaN at every training snapshot (`train.masking.land_mask_from_sigwh`, `valid_frac=1.0`). `sigwh` is an aggregate with no partition-absence NaN, so its NaN means land or ice. The partition fields (`wsh`, `pswh` and their periods and directions) are also NaN at genuine ocean cells where that partition is absent, so their own NaN must never define the mask (§5.3.1, `variable_taxonomy.md` §3.3.1). Wind shares the wave grid (§2.2) and the same mask. Stored as `ocean_mask_` on `WeatherModel`: bool `(721, 1440)`.
 
 ### 5.2 Reprojection (`Reprojector` transformer)
 
@@ -755,48 +780,71 @@ class GoingToToUV(BaseEstimator, TransformerMixin):
         ...
 ```
 
-**Canonical pair assignment for v0.1.0 (tier 1) and beyond:**
+**Canonical pair assignment (v3 tensor names, `variable_taxonomy.md` §5):**
 
 `ComingFromToUV`:
-- `(wsh, wsd, u_wsea, v_wsea)` — tier 1
+- `(wsh, wsd, u_wsea, v_wsea)` — tier 1. Height kept (class C, below).
 - `(was, wad_come_from, u_wind, v_wind)` — tier 1. Source of truth for wind; `wad` is not used.
-- `(pwh, pwd, u_peak, v_peak)` — tier 2. `pwd`'s `coming_from` convention is confirmed (NCEP/NDBC, §2.3), no longer pending expert verification.
-- `(pswh, pswd, u_pswell, v_pswell)` — tier 3. `pswd`'s `coming_from` convention is confirmed (NCEP/NDBC, §2.3), no longer pending expert verification.
+- `(pwh, pwd, u_pwave, v_pwave)` — tier 2. `pwh` is not kept: it is `sigwh` itself (`open_questions.md` §1.4), whose `logE_sigwh` is the authoritative height. `pwd`'s `coming_from` convention is confirmed (NCEP/NDBC, §2.3).
+- `(pswh, pswd, u_pswell, v_pswell)` — tier 3. Height kept. `pswd`'s `coming_from` convention is confirmed (NCEP/NDBC, §2.3).
 
 `GoingToToUV`:
-- `(ocs, ocd, u_current, v_current)` — tier 3.
+- `(ocs, ocd, u_current, v_current)` — tier 3, blocked by task 16.
 
-Non-directional variables (`sigwh`, `wsp`, `pwp`, `pswp`, `sst`) pass through both transformers unchanged.
+`u = magnitude · sin θ_to`, `v = magnitude · cos θ_to`, with the pair's own magnitude (`was`, or the partition height). Non-directional variables (`sigwh`, `wsp`, `pwp`, `pswp`, `sst`) pass through both transformers unchanged.
 
-**Both transformers preserve non-modified variables in the output Dataset** — they only add `(u, v)` columns and remove the paired `(speed, direction)` columns for pairs they own. Untouched variables (both non-directional ones and pairs owned by the other transformer) pass through as-is. This makes composition in either order commutative for disjoint pair sets.
+**Class C keeps its height (v3).** For `wsh` and `pswh`, the height must stay in the Dataset as well as producing `(u, v)`, because it becomes its own `logE` tensor (§5.3.1). Both transformers take a `keep_speed: tuple[str, ...] = ()` parameter naming the magnitudes to retain; the inverse then takes the magnitude from the kept variable and only the direction from `(u, v)`, avoiding the `hypot` reconstruction bias (`open_questions.md` §2.3). Otherwise the transformers add `(u, v)` and remove the `(speed, direction)` pair, and leave every other variable as-is, so composition in either order is commutative for disjoint pair sets.
 
-**`inverse_transform` reconstructs each variable in its native archive convention.** `ComingFromToUV` produces `wad_come_from` back on inversion (not `wad`); `GoingToToUV` produces `wad`-style angles for `ocd`. Downstream consumers get outputs matching the input archive convention.
+**`inverse_transform` reconstructs each variable in its native archive convention.** `ComingFromToUV` produces `wad_come_from` back on inversion (not `wad`); `GoingToToUV` produces `ocd` as going-to. Downstream consumers get outputs matching the input archive convention.
 
-**Pipeline placement** (from §5, notebook Cell 3):
+**Pipeline placement** (tier 1; §8.6 Cell 3):
 
 ```python
 preprocess = Pipeline([
-    ("coming_from_to_uv", ComingFromToUV(pairs=[
-        ("wsh", "wsd", "u_wsea", "v_wsea"),
-        ("was", "wad_come_from", "u_wind", "v_wind"),
-    ])),
-    ("going_to_to_uv", GoingToToUV(pairs=[
-        # empty for tier 1; populated when tier 3 (ocean currents) enabled
-    ])),
+    ("sentinel", PartitionSentinelFiller(partitions={"wsh": ("wsp", "wsd")})),
+    ("coming_from_to_uv", ComingFromToUV(
+        pairs=[
+            ("wsh", "wsd", "u_wsea", "v_wsea"),
+            ("was", "wad_come_from", "u_wind", "v_wind"),
+        ],
+        keep_speed=("wsh",),
+    )),
+    ("going_to_to_uv", GoingToToUV(pairs=[])),   # tier 3 adds ("ocs", "ocd", ...)
+    ("log", LogTransform(
+        heights={"sigwh": "logE_sigwh", "wsh": "logE_wsh"},
+        periods={"wsp": "T_wsp"},
+        floor_m=0.01,
+    )),
     ("reproject",   Reprojector(target_grid="wave")),
-    ("climatology", ClimatologyRemover(diurnal_variables=["sst"], include_trend=True)),
+    ("climatology", ClimatologyRemover(diurnal_variables=None, include_trend=True)),
     ("standardize", PerCellStandardizer()),
-    ("gaussianize", GaussianCopula(n_bins=500)),
 ])
 ```
 
-Even when `GoingToToUV` has an empty pair list (tier 1), the transformer is present in the Pipeline as a scaffold. This makes it obvious to any reader that going-to variables *would* live there, and enabling tier 3 is a matter of adding entries — not adding a new pipeline step.
+Even when `GoingToToUV` has an empty pair list (tiers 1–2), the transformer is present in the Pipeline as a scaffold. This makes it obvious to any reader that going-to variables *would* live there, and enabling tier 3 is a matter of adding entries — not adding a new pipeline step.
 
-### 5.4 Climatology and Gaussianization
+#### 5.3.1 Partition sentinel fill and log transforms
 
-Three transformers, run consecutively in the Pipeline.
+Two transformers, both new in v3. They implement `variable_taxonomy.md` §3.3.1 and §3.4 and task 17's validated policy (`open_questions.md` §5.6). Both live in `train/masking.py`, next to the array-level helpers they wrap (`land_mask_from_sigwh`, `apply_partition_sentinel_policy`, `height_log_energy`, `period_sentinel_from_archive`); that module stops being helper-only.
 
-**`ClimatologyRemover`** fits per ocean cell per variable:
+**`PartitionSentinelFiller(partitions: dict[str, tuple[str, str]])`** maps each sometimes-absent partition's height to its `(period, direction)` fields: `{"wsh": ("wsp", "wsd"), "pswh": ("pswp", "pswd")}`. It runs first, so later stages never see partition-absence NaN.
+
+- `fit`: the ocean mask from `sigwh` (§5.1), and one period sentinel per partition from `train.masking.period_sentinel_from_archive` on the window's real, paired faint-partition observations. Stored, with its two estimators and their agreement, as fitted attributes.
+- `transform`: at ocean cells only, a NaN height becomes `0.0` (the physically correct limit, `H = 4√m₀ → 0`), a NaN period becomes the partition's sentinel, and a NaN direction becomes `0°`. The direction is a placeholder: with zero height, `(u, v)` is `(0, 0)` whatever the angle. Land NaN is left as NaN.
+- `inverse_transform`: a reconstructed height below `floor_m` becomes `0.0` (partition absent). Periods and directions pass through; see the open point in §5.8.
+
+**`LogTransform(heights: dict[str, str], periods: dict[str, str], floor_m: float = 0.01)`** maps source variable → tensor name.
+
+- `transform`: `logE = log(max(H, floor_m)²)` (`train.masking.height_log_energy`); `T = log(period)`. The 1 cm floor applies everywhere, not only at sentinel cells, so a real dead-calm `H = 0` stays finite too.
+- `inverse_transform`: `H = exp(logE / 2)`, `period = exp(T)`.
+
+Directional `(u, v)` come before the log step because they use the raw height as magnitude. Land cells stay NaN through climatology and standardization (NaN-aware), and are zero-filled and masked only at the Tucker boundary (§5.5).
+
+### 5.4 Climatology and standardization
+
+Two transformers, the last stages of the Pipeline. v2's third stage, the per-cell `GaussianCopula`, moved after Tucker (§3.5, §5.5.1).
+
+**`ClimatologyRemover`** fits per ocean cell per tensor:
 
 ```
 μ(s, t) = c₀(s) + c_lin(s) · Δτ(t)
@@ -809,133 +857,104 @@ where:
 
 - `Δτ(t) = (t − t_ref) / 1_year`, with `t_ref = (t_train_start + t_train_end) / 2`. Normalizing by 1 year gives `c_lin` interpretable units of "change per year." Centering at `t_ref` makes `c_lin` uncorrelated with `c₀`.
 - `ω_y = 2π / 365.25 days`, `ω_d = 2π / 1 day`.
-- Diurnal terms (`c₅, c₆`) included only for `sst`, `u_wind`, `v_wind`. Waves don't have a diurnal cycle at 0.25° global resolution.
+- Diurnal terms (`c₅, c₆`) only for the tensors named in `diurnal_variables` (`sst`, `u_wind`, `v_wind` are the candidates). The default is none. "Waves have no diurnal cycle" (`open_questions.md` §7.2) does not hold for wind sea. The production `wsh` core (task 07, era 2) keeps a daily cycle locked to local solar time. It is small per cell (median amplitude 0.037 of a cell's standard deviation, up to about 0.18 near coasts), but it makes up most of the core's two leading principal components: 15% of the top-20 PCs' variance, against 0.2% under a within-day permutation null. The open-ocean 12 h harmonic peaks near 09 local solar time, as the atmospheric semidiurnal tide does. §5.6.3 measures the residual cycle and fails the fit on it, so a `wsh` fit fails until `logE_wsh` gets diurnal terms.
 
-Fit by vectorized OLS. Fitted attributes:
-
-- `self.coeffs_` : `(n_terms, N_ocean, V)` float64
-- `self.t_ref_` : datetime (UTC)
-- `self.trend_significance_ratio_` : `(N_ocean, V)` float32 — per-cell `|c_lin| / σ_std`. Diagnostic.
+Fit by vectorized OLS, NaN-aware so land cells stay NaN. Fitted attributes, per tensor: the coefficient fields `(n_terms, H, W)`, `t_ref_`, and `c_lin_` for the trend diagnostic.
 
 `__init__` parameters:
 
 ```python
 def __init__(
     self,
-    diurnal_variables: list[str] | None = None,   # default: ["sst", "u_wind", "v_wind"]
+    diurnal_variables: list[str] | None = None,
     include_trend: bool = True,
     trend_significance_threshold: float = 0.1,
 ) -> None: ...
 ```
 
-If `include_trend=False`, the design matrix drops the `Δτ` column. Log the fraction of cells where `trend_significance_ratio > trend_significance_threshold`; if it's under ~1%, consider dropping the trend term for a cleaner model.
+If `include_trend=False`, the design matrix drops the `Δτ` column. Log the fraction of cells where `|c_lin| / σ_std > trend_significance_threshold`; if it's under ~1%, consider dropping the trend term (and see §3.9's v3 caveat).
 
-**`PerCellStandardizer`** divides anomaly by per-cell temporal std:
+**`PerCellStandardizer`** divides the anomaly by its per-cell temporal standard deviation:
 
 ```
 A(s, t) = Ỹ(s, t) − μ(s, t)          # anomaly
 A_std(s, t) = A(s, t) / σ_std(s)      # standardized anomaly
 ```
 
-Fitted attribute: `self.sigma_std_` : `(N_ocean, V)` float32.
+Fitted attribute `sigma_cell_`: one `(H, W)` field per tensor. Near-zero-variance cells floor the *divisor* only, never `sigma_cell_` itself, which the trend diagnostic needs unmodified. Placement (ii) exposed this: v2's copula used to absorb the blow-up silently (task 00).
 
-**`GaussianCopula`** learns per-cell empirical CDFs:
+`A_std` per tensor is what Tucker consumes (§5.5) and what `WeatherModel.transform` returns.
 
-```
-Z(s, t) = Φ⁻¹(F_s(A_std(s, t)))
-```
+### 5.5 Per-tensor masked Tucker
 
-where `F_s` is the per-cell empirical CDF, stored as a quantile-binned lookup table.
+Lives in `train/tucker.py`, a fit wrapper over `train/masked_tucker.partial_tucker_lowmem` (§3.11). Not a transformer. Specified by `tucker_decomposition.md` §2.8 and §4.
 
-```python
-class GaussianCopula(BaseEstimator, TransformerMixin):
-    def __init__(self, n_bins: int = 500) -> None: ...
-    def fit(self, X: xr.Dataset, y: None = None) -> Self:
-        self.sorted_anomalies_binned_ = ...    # (n_bins, N_ocean, V) float32
-        return self
-    def transform(self, X: xr.Dataset) -> xr.Dataset: ...
-    def inverse_transform(self, X: xr.Dataset) -> xr.Dataset: ...
-```
-
-**LUT storage:** full sorted values are `T × N_ocean × V × 8 bytes`. For 4 years × 5.4 × 10⁵ ocean cells × 6 vars ≈ 350 GB — infeasible. Downsample to `n_bins=500` quantile bins per cell → ~6 GB, marginal-fidelity loss negligible.
-
-### 5.5 Tucker (HOSVD) — TensorLy wrapper
-
-Lives in `train/tucker.py`. Not a transformer.
+**Input, per tensor `v`:** the standardized anomaly `A_std` as a `(T, H, W)` float32 array with land cells filled `0.0` (a neutral placeholder, never NaN and never a large sentinel), plus the mask `M` broadcast over time as an int8 `(T, H, W)` array: 1 = ocean, 0 = land. The masked ALS imputes land from the current reconstruction each iteration, so the placeholder's value never enters the fit.
 
 ```python
-import tensorly as tl
-from tensorly.decomposition import partial_tucker
-from tensorly.tenalg import multi_mode_dot
-
-tl.set_backend("numpy")   # explicit — TensorLy supports jax/torch backends
-
-
 @dataclass(frozen=True, slots=True)
 class TuckerFit:
-    U_ocean: np.ndarray    # (N_ocean, r_ocean) float64
-    U_var:   np.ndarray    # (V, r_var)         float64
-    r_ocean: int
-    r_var:   int
-    reconstruction_error: float   # relative Frobenius error, diagnostic
+    factor_lat: np.ndarray        # (H, r_lat) float64
+    factor_lon: np.ndarray        # (W, r_lon) float64
+    reconstruction_error: float   # relative Frobenius error over ocean cells
+    n_iter: int                   # ALS iterations run
 
 
 def tucker_fit(
-    Z: np.ndarray,                     # (T, N_ocean, V) Gaussianized anomalies
-    r_ocean: int,
-    r_var: int,
+    x: np.ndarray,                 # (T, H, W) float32, land filled 0.0
+    ocean_mask: np.ndarray,        # (H, W) bool
+    rank: tuple[int, int],         # (r_lat, r_lon)
     rng: np.random.Generator,
-    n_iter_max: int = 100,             # 0 → pure HOSVD, >0 → HOOI refinement
-    tol: float = 1e-4,
-) -> TuckerFit:
-    """Tucker-2 compression via partial_tucker (§3.11, §5.5).
-
-    Compresses modes 1 (ocean cells) and 2 (variables), keeps mode 0 (time) full-rank.
-    """
-    (_core, [U_ocean, U_var]), _errors = partial_tucker(
-        Z,
-        rank=[r_ocean, r_var],
-        modes=[1, 2],
-        init="svd",
-        n_iter_max=n_iter_max,
-        tol=tol,
-        random_state=rng,
-    )
-    # Reconstruction error diagnostic
-    Z_recon = multi_mode_dot(
-        multi_mode_dot(Z, [U_ocean.T, U_var.T], modes=[1, 2]),
-        [U_ocean, U_var],
-        modes=[1, 2],
-    )
-    err = float(np.linalg.norm(Z_recon - Z) / np.linalg.norm(Z))
-    return TuckerFit(
-        U_ocean=U_ocean.astype(np.float64),
-        U_var=U_var.astype(np.float64),
-        r_ocean=r_ocean,
-        r_var=r_var,
-        reconstruction_error=err,
-    )
+    n_iter_max: int = 300,
+    tol: float = 1e-5,
+    checkpoint_every: int = 12,
+    early_stop_tol: float = 1e-5,
+) -> tuple[TuckerFit, np.ndarray]:
+    """Masked Tucker on the spatial modes; returns the fit and its (T, r_lat, r_lon) core."""
 
 
-def tucker_transform(Z: np.ndarray, fit: TuckerFit) -> np.ndarray:
-    """Compress Z → core, shape (T, r_ocean, r_var)."""
-    return multi_mode_dot(Z, [fit.U_ocean.T, fit.U_var.T], modes=[1, 2])
+def fill_land(field: np.ndarray, ocean_mask: np.ndarray) -> np.ndarray:
+    """(T, H, W) with land NaN → float32, land 0.0; raises if an ocean cell is NaN."""
 
 
-def tucker_inverse(core: np.ndarray, fit: TuckerFit) -> np.ndarray:
-    """Uncompress core → Z, shape (T, N_ocean, V)."""
-    return multi_mode_dot(core, [fit.U_ocean, fit.U_var], modes=[1, 2])
+def tucker_transform(x: np.ndarray, fit: TuckerFit) -> np.ndarray:
+    """x ×_lat factor_latᵀ ×_lon factor_lonᵀ → (T, r_lat, r_lon); x from fill_land."""
+
+
+def tucker_inverse(
+    core: np.ndarray,
+    fit: TuckerFit,
+    rows: np.ndarray | None = None,       # factor_lat rows to evaluate; None = all
+    cols: np.ndarray | None = None,       # factor_lon rows to evaluate; None = all
+) -> np.ndarray:
+    """core ×_lat factor_lat[rows] ×_lon factor_lon[cols] → (T, len(rows), len(cols))."""
 ```
 
-**Rank selection:**
-- `r_ocean`: start 200. Increase until `reconstruction_error < 0.05`. Expect 300–500 for global 0.25°.
-- `r_var`: start `min(V, 6)`. Cross-variable structure is low-dimensional.
+`fill_land` is the Tucker boundary of §9 gotcha 24, for training and held-out data alike. A NaN at an ocean cell means an upstream stage failed to fill something (the partition sentinel, or a reprojection stencil touching land), so it raises rather than letting the masked ALS impute an ocean value silently. `tucker_inverse` with `rows`/`cols` evaluates a sub-grid for the sampler (§5.8) at a cost proportional to its size.
 
-Verify the exact tuple-unpacking pattern for `partial_tucker` in the installed tensorly version — the docstring above shows the current expected return shape but tensorly has changed its return signature in the past. First cell of the notebook should print `partial_tucker.__doc__` to confirm.
+**Algorithm.** Masked HOOI with time left at full rank (`modes=[1, 2]`): randomized-SVD initialization, then ALS in chunks of `checkpoint_every` iterations, each chunk resuming from the previous `(core, factors)`. Stop at `n_iter_max`, or when the reconstruction error improves by less than `early_stop_tol` from one chunk to the next. These are the settings of task 07's production run (`svd="randomized_svd"`, `svd_mask_repeats=0`). `tucker_fit` returns the ALS's own core, which is consistent with the imputed land values, and that core is what the copula and DMD consume. `tucker_transform` is for held-out data.
+
+**Rank.** `(r_lat, r_lon) = round(tucker_rank_fraction · (H, W))`, default 0.4 → `(288, 576)`. Task 07 decided 40% for `wsh` on era 2 (23.30% reconstruction error, against 27.47% at 30% and 32.90% at 20%). That was a pragmatic, budget-bound choice, not a swept optimum (`open_questions.md` §5.3). v3 applies the same fraction to every tensor until per-tensor evidence exists; ranks need not match across tensors (`tucker_decomposition.md` §4.1).
+
+**Cost — plan compute before training.** Task 07's 40% run on era 2 (a 7.8 GB tensor) took about 300 s per iteration and reached effective convergence at iteration 170 in 11 h, on an 8-vCPU, 64 GB VM. Its 30% run peaked near 30 GB. v3's tensor is 12.1 GB (`2920 × 721 × 1440` at float32), so expect roughly 1.5× the per-iteration time and memory: about 15–20 h and 45–50 GB per tensor. That is beyond a 31 GB workstation, so Tucker runs on a VM with checkpointing (the `notebooks/07_placement2_tucker_on_anomalies.py` pattern). Tier 1's seven tensors are about a week of serial VM time, or parallel across VMs.
+
+#### 5.5.1 Gaussian copula on the Tucker core
+
+Per tensor, a `GaussianCopula(n_bins=copula_lut_bins)` (§3.5; default 500 bins) is fit on that tensor's core. Each `(r_lat, r_lon)` coefficient gets its own empirical CDF over time, and the transform maps every coefficient to a standard normal:
+
+```python
+core_ds = xr.Dataset({v: (("time", "core_lat", "core_lon"), core)})   # passes check_canonical
+copula = GaussianCopula(n_bins=500).fit(core_ds)
+gaussianized_core = copula.transform(core_ds)[v].values               # (T, r_lat, r_lon)
+```
+
+The copula is not a Pipeline stage. `WeatherModel` keeps one per tensor (`core_copula_`) and inverts it at sampling before the Tucker inverse. Lookup-table size: `500 × 288 × 576 × 4 B ≈ 330 MB` per tensor. Task 07 fit the production `wsh` copula on the full 40% core in 110 s.
 
 ### 5.6 DMD — PyDMD wrapper
 
 Lives in `train/dmd.py`. Not a transformer.
+
+**Input: a variable group's joint state.** For group `G`, flatten each member's Gaussianized core to `(T, r_lat · r_lon)` and concatenate the members along the feature axis (`correlated_variables.md` §4.2): `(T, n_G)`. A single-member group is one tensor's core, `n_G = 288 · 576 = 165,888` at default rank. Snapshot pairs never cross an era boundary, which a single-era training window guarantees. `train.dmd.group_state(cores, members)` builds this state and `split_group_state` inverts it at sampling. `dmd_fit` flattens any trailing shape, so a single `(T, r_lat, r_lon)` core is also accepted.
 
 ```python
 from pydmd import DMD, BOPDMD, HankelDMD
@@ -953,7 +972,7 @@ class DMDFit:
 
 
 def dmd_fit(
-    core: np.ndarray,                  # (T, r_ocean, r_var) from tucker_transform
+    state: np.ndarray,                 # (T, n_G) — a group's joint state (above)
     r_dmd: int,
     dt: float,
     rng: np.random.Generator,
@@ -970,9 +989,8 @@ def dmd_fit(
     variant="hankel"— time-delay embedded DMD (Brunton et al. 2017).
                       Use if per-cell temporal spectra undershoot at high freq.
     """
-    T, r_o, r_v = core.shape
-    N_state = r_o * r_v
-    snapshots = core.reshape(T, N_state).T    # PyDMD expects (n_features, n_snapshots)
+    T = state.shape[0]
+    snapshots = state.T                       # PyDMD expects (n_features, n_snapshots)
 
     if variant == "exact":
         model = DMD(svd_rank=r_dmd)
@@ -1007,50 +1025,300 @@ def dmd_fit(
     )
 ```
 
-**Rank `r_dmd`:** start 50, extend to 100–200 for a global model. Diagnostic: plot `Lambda` on the complex plane. Retain modes on or near the unit circle plus the leading decaying continuum.
+**Rank `r_dmd = 100`** for a single-member group: DECIDED in task 07 (`open_questions.md` §5.3), at the knee between the spectral and marginal generative-fidelity optima. A surrogate test and 8-fold walk-forward CV both showed predictive accuracy is almost rank-insensitive between 5 and 200. A joint group's `r_dmd^G ≤ min(n_G, T − 1)` is chosen per group. Diagnostic: plot `Lambda` on the complex plane.
 
-**Complex-conjugate pair handling.** With `variant="bop"`, the `eig_constraints={"conjugate_pairs"}` option enforces this at fit time — no manual handling needed. With `variant="exact"` or `"hankel"`, the pairs are still present in the fit but the sampler must force `η_{k'}(t) = conj(η_k(t))` at every step (see §5.6.1 below and §9 gotcha #8). **Default to `variant="exact"` during notebook iteration** (§8.6 Cells 5-8 re-fit DMD on every Tucker/DMD rank sweep; BOP-DMD's ~100-model bagging makes that 100× slower per sweep, which is painful across a rank grid). **Switch to `variant="bop"` only for the final production fit**, once ranks are settled — the conjugate-pair constraint and bagged UQ are worth the one-time 100× cost there, but not during exploration.
+**Multi-step behaviour is wrong on the production core.** At 3 h, the production `wsh` core fails the tau test from 6 h onward (§5.6.2): it stays predictable longer than a 3 h linear-Markov fit implies. The cause is slow variability. 74% of the variance of the core's top-20 principal components lies at periods over 10 days, and 45% over 30 days. The autocorrelation at 4 days is 0.40, against 0.11 for the 3 h first-order fit. Removing the variability slower than 10 days makes the 20-PC tau test pass at 6 h and 12 h. Neither remedy that was tested passes:
+
+- **A longer training lag.** At 6 h or 12 h, only the 48 h lag clears its envelope, and only at 20 PCs.
+- **Delay embedding.** AR(2) and AR(3) at 3 h are the discrete analogue of `variant="hankel"`. They still fail at 6–24 h.
+
+In production the loss is larger. The mode-OU channels have a median φ of 0.605 at 3 h, an e-folding time of about 6 h. Sampled trajectories keep almost no correlation at 4–8 days, where the data keep 0.49 and 0.33 (§5.6.1, "Known defect"). §5.6.3 measures this at every fit.
+
+**Complex-conjugate pair handling.** With `variant="bop"`, the `eig_constraints={"conjugate_pairs"}` option enforces this at fit time — no manual handling needed. With `variant="exact"` or `"hankel"`, the pairs are still present in the fit but the sampler must force `η_{k'}(t) = conj(η_k(t))` at every step (see §5.6.1 below and §9 gotcha #8). **Default to `variant="exact"` during notebook iteration** (§8.6 Cell 7 re-fits DMD on every rank sweep; BOP-DMD's ~100-model bagging makes that 100× slower per sweep, which is painful across a rank grid). **Switch to `variant="bop"` only for the final production fit**, once ranks are settled — the conjugate-pair constraint and bagged UQ are worth the one-time 100× cost there, but not during exploration.
 
 #### 5.6.1 Mode-level OU on residual amplitudes
 
-For each DMD mode `k`:
+Fit per group on the same joint state DMD used (`fit_mode_ou(state, dmd)`). For each DMD mode `k`:
 
 ```
 a_k(t) = k-th component of (Φ⁺ · x_t)           # measured complex amplitude
-â_k(t) = b0_k · exp(lam_cont_k · t)              # deterministic prediction
+â_k(t) = b0_k · Λ_k^t                            # deterministic prediction
 η_k(t) = a_k(t) − â_k(t)                         # residual
 ```
 
-Fit AR(1) → OU:
+**One real stochastic channel per real mode and per conjugate pair (v3).** Exact DMD on real data returns modes that are real or come in exact complex-conjugate pairs, and a real field needs `η_k'(t) = conj(η_k(t))` exactly, not merely in distribution (`open_questions.md` §5.2). A pair is therefore one stochastic driver. v3 ports the procedure task 07 validated (`notebooks/07_dmd_ou_generative_check.py`), which took the reconstruction's imaginary-to-real ratio from about 1 to machine precision:
+
+- **Real mode `k`:** channel `c(t) = Re η_k(t)`.
+- **Conjugate pair `(k, k')`:** channel `c(t) = log|η_k(t)| − mean_t log|η_k(t)|`. Only the magnitude is stochastic, in log space because it is positive with a nonzero mean. The phase is deterministic, `arg η_k(t) = phase_offset_k + t · arg Λ_k`, anchored at the measured phase of the last training step. The partner is the conjugate, so the pair is exactly conjugate by construction.
+- **Pairing:** `k'` is a pair partner when `|Λ_k' − conj(Λ_k)| < 1e-6`. An oscillatory mode whose partner the truncation dropped is treated as a real mode, and the imaginary part it contributes to the reconstruction is discarded.
+
+**AR(1) per channel, one joint innovation covariance per group.** Channels are real, so:
 
 ```
-φ_mode(k) = Σ_t conj(η_k(t)) · η_k(t+Δt)  /  Σ_t |η_k(t)|²
-θ_mode(k) = −log(clip(Re(φ_mode(k)), 1e-4, 0.9999)) / Δt
-σ_mode(k)² = Var(η_k) · 2·θ_mode(k) / (1 − |φ_mode(k)|²)     # continuous-time diffusion
+φ_c = clip( Σ_t c(t) c(t+1) / Σ_t c(t)²,  1e-4, 0.9999 )
+θ_c = −log(φ_c) / Δt
+ε_c(t) = c(t+1) − φ_c · c(t)                     # one-step innovation
+Q = Cov(ε)                                       # (n_c, n_c), all channels of the group
+σ_c² = Q_cc · 2θ_c / (1 − φ_c²)                  # continuous-time diffusion, as in v2
 ```
 
-**`θ_mode(k)` clips `Re(φ_mode(k))`, not `|φ_mode(k)|`.** These are not
-interchangeable: a negative real part means the mode's residual alternates
-sign step-to-step (anti-correlation), which is physically distinct from slow
-mean-reversion even if `|φ|` happens to be large in that case. Clipping the
-*real part* pushes negative-real-part modes to the fast-decorrelation end of
-the range (`θ` large) rather than assigning them whatever slow decay `|φ|`
-alone would imply — deliberately treating alternation as noise-like, not
-as a real slow oscillation. Using `|φ|` here would recover the wrong `θ` for
-any mode with `Re(φ) < 0`.
+`Q`'s off-diagonal is the correlated within-group noise of §5.6.2 and `correlated_variables.md` §4.4. In a joint group it carries the cross-member coupling of the innovations. In a single-member group it carries the correlation between that tensor's own modes, which independent per-mode draws discarded.
 
-Lives in `train/dmd.py` alongside `dmd_fit`. Returns a `ModeOUFit` frozen dataclass:
+**Clip `φ` itself, not `|φ|`.** A negative AR(1) coefficient means the channel alternates sign step to step, which is physically distinct from slow mean reversion. Clipping pushes it to the fast-decorrelation floor (`θ` large), deliberately treating alternation as noise-like. The clipped `φ` is also the one the sampler uses, so fractional powers `φ^Δn` stay defined.
+
+**Transitions** (used by the sampler, §5.8). Elementwise over channel pairs `(a, b)`, for any real `n ≥ 0`:
+
+```
+c(t + nΔt) = φ^n ⊙ c(t) + w,   w ~ N(0, C(n)),   C(n)_ab = Q_ab · (1 − (φ_a φ_b)^n) / (1 − φ_a φ_b)
+P_ab = Q_ab / (1 − φ_a φ_b)                      # stationary covariance
+```
+
+`C(n)` and `P` are positive semidefinite (Schur product of `Q` with a positive semidefinite kernel), and `P` is invariant under the transition.
+
+**Real channels draw real noise at the full innovation variance.** Task 07's script drew complex noise for real modes and kept the real part, which halves their innovation variance. v3 does not copy that.
+
+Lives in `train/dmd.py` alongside `dmd_fit`, with `ou_transition`, `ou_stationary_cov` and `mode_amplitudes` (channels → complex mode amplitudes, §5.8 step 1). Returns a `ModeOUFit` frozen dataclass:
 
 ```python
 @dataclass(frozen=True, slots=True)
 class ModeOUFit:
-    theta: np.ndarray       # (r_dmd,) float64
-    sigma: np.ndarray       # (r_dmd,) float64
-    phi:   np.ndarray       # (r_dmd,) complex128
-    dt:    float
+    mode: np.ndarray                # (n_c,) int64 — the DMD mode each channel drives
+    partner: np.ndarray             # (n_c,) int64 — that mode's conjugate partner; -1 = real channel
+    phi: np.ndarray                 # (n_c,) float64 — clipped AR(1) coefficient at dt
+    innovation_cov: np.ndarray      # (n_c, n_c) float64 — Q
+    log_magnitude_mean: np.ndarray  # (n_c,) float64 — 0 for real channels
+    phase_offset: np.ndarray        # (n_c,) float64 — 0 for real channels
+    dt: float
+    # theta and sigma are derived properties (formulas above)
 ```
 
-### 5.7 Local residual OU field (new in v2)
+v2's `ModeOUFit(theta, sigma, phi, dt)` held one complex OU per mode with independent noise; `phi` was complex.
+
+**Known defect (2026-11-22): the samples do not reproduce the training cores.** Simulating this section's model with the cached task-07 DMD on the production `wsh` core (40% Tucker, `r_dmd = 100`, era 2) shows three errors. Task 07 never checked this configuration generatively, and no training stage measured them until §5.6.3:
+
+1. **Variance inflation from lost cross-mode cancellation.** The DMD modes are far from orthogonal: the condition number of `Φᴴ Φ` is 4.6e3, and near-duplicate pairs (periods of 174 h and 176 h) have |cos| = 0.965. In the training data the measured amplitudes of different modes largely cancel. Their reconstruction energy is 15 times smaller than the sum of the per-mode energies. Each pair's phase here is deterministic and independent of every other pair's, so the cancellation is lost. Per mode the sampled amplitudes match the training ones: median pair `E|η|²` ratio 1.08, real channels 1.000. Summed, the sampled energy in the DMD span is 31–34 times the training value, about 3.8 times the energy of the whole core. Rotating each pair of the true training amplitudes by one random constant phase already gives 27 times. The sampled per-coefficient RMS has a median of 1.73, against 1.0 for the Gaussianized core. 2.5% of sampled values fall beyond the copula's ±4.75 saturation, against 0.12% in training.
+2. **Most of the core variance is unmodeled.** The DMD span carries about 10% of the Gaussianized core's variance (span RMS median 0.32 per coefficient). Nothing models the rest: the local residual is deferred (§5.7). With the phases fixed, samples would be too weak by about the same factor.
+3. **Multi-day memory is lost.** See §5.6. The pair channels are `log|η|`, with a skewness of about −6, because near-zero magnitudes produce large negative spikes. That depresses their lag-1 coefficient further.
+
+The sampler is therefore not production-ready, and §5.6.3 refuses to build a model that shows these errors. The redesign is open (`open_questions.md` §5.7). The first candidate is the specification in `correlated_variables.md` §4.4: sample a member's leading principal components jointly, with their full innovation covariance, so the cross-mode correlation is estimated rather than assumed away.
+
+#### 5.6.2 Group dynamics diagnostics: linear inverse model, tau test, coupling information
+
+Lives in `train/linear_inverse.py`. The math, interpretation and literature
+are in `correlated_variables.md` §4.4 and §7; this section fixes where the
+stage sits and what it records.
+
+**What it answers.** DMD plus mode-level OU (§5.6, §5.6.1) is a linear
+regression of each Δt step on the previous one, with Gaussian noise. Read
+that way it is a Linear Inverse Model (LIM), which comes with checks this
+pipeline lacked. The stage runs once per variable group and records two
+answers on the model:
+
+1. **Goodness of fit.** Does a first-order linear model with Gaussian noise
+   hold at Δt? This is the tau test: the operator fitted at 3 h must
+   predict the 6–48 h behaviour.
+2. **Information lost.** What would fitting the group's members
+   independently throw away? This is Granger information (transfer entropy)
+   into each member and the mutual information of the joint innovations,
+   in nats per step.
+
+**Where.** Immediately after the cores DMD will consume exist, on the same
+Gaussianized cores: after each tensor's own Tucker fit (§5.5) and the copula
+on its core (§5.5.1).
+
+**Groups.** The `groups` hyperparameter maps a group name to its member
+variables. `None` means one single-member group per modeled variable,
+which gives a tau test only, since coupling is zero by construction.
+Candidate multi-member groups are in `correlated_variables.md` §4.1.
+
+```python
+for name, members in groups.items():
+    group_diagnostics[name] = diagnose_group(
+        cores={v: gaussianized_core[v] for v in members},  # (T, r_lat, r_lon) each
+        ranks={v: lim_rank for v in members},
+        dt=window_era.cadence_seconds,
+        test_lags=list(tau_test_lags),
+        n_bootstrap=n_bootstrap,
+        rng=rng,
+    )
+```
+
+**Defaults.**
+
+| Parameter | Default | Reason |
+|---|---|---|
+| `lim_rank` | 20 PCs per member | A full-covariance fit needs T ≥ 10 n, where n is the total PCs in the group; the stage warns when that fails. |
+| `tau_test_lags` | `(1, 2, 4, 8, 16)` | 3 h to 48 h. |
+| `n_bootstrap` | 100 | Sets the envelope's coverage, below. |
+| training lag | 1 step | The lag DMD itself uses. |
+
+**Output.** A `GroupDiagnostics` per group with these fields:
+
+- `explained_variance`: core variance retained by each member's PCs (truncation loss)
+- `lim`: the `LIMFit` (operator, noise covariance, consistency flags)
+- `tau`, `drift_upper`, `ratio_band`, `tau_consistent`: the tau test, its bands and per-lag verdicts
+- `coupling`, `granger_null_upper`, `noise_mi_null_upper`, `coupling_significant`, `noise_coupling_significant`: coupling information against an independence null
+
+`diagnostics_summary` renders one group as text for the log and the
+notebook.
+
+**Bands.** Each band is the envelope (minimum to maximum) of `n_bootstrap`
+parametric-bootstrap replicates as long as the training window:
+
+- **Tau test**: replicates simulated from the fitted LIM, the null "the
+  linear-Markov model is right".
+- **Coupling**: replicates from a block-diagonal LIM fit member by member,
+  the null "members are independent".
+
+Under exchangeability, a correct model lands outside a two-sided envelope
+with probability 2/(n+1), about 3% per lag at n = 100, combining the
+two-sided ratio check with the one-sided drift check. Interpolated
+5th/95th percentiles were rejected: they are noisy at this replicate count,
+and their nominal 10% false-alarm rate compounds across lags. One flagged
+lag is weak evidence. Flags across consecutive lags, or values far outside
+the band, are the signal. The training lag itself is the fit, not a test,
+and always reads as consistent.
+
+**Never gates or alters the fit.** The production `wsh` core already fails
+the tau test from 6 h onward (`correlated_variables.md` §4.4, "First
+application"). The diagnostics are evidence for the decisions they inform:
+the training lag, `variant="hankel"` (§5.6), and group membership
+(`open_questions.md` §3.2). They also complement the held-out checks of §6.
+They are in-sample, and they measure the regression's assumptions rather
+than the samples. §5.6.3 measures the samples, and that stage does gate the
+fit. The tau test stays record-only: a failure is evidence about an
+assumption, while §5.6.3's memory check measures what that failure does to
+the samples.
+
+**Correlated noise.** Within a group, stochastic forcing is one joint
+Gaussian draw with the group's innovation covariance
+(`correlated_variables.md` §4.4). The sampler draws it in DMD channel
+coordinates, from the covariance `fit_mode_ou` estimates (§5.6.1). The pair
+phases stay deterministic and mutually independent, which is the variance
+defect in §5.6.1;
+`simulate_lim` is the reference implementation of the same idea in PC
+coordinates. This stage estimates the LIM's own covariance and measures
+what independent draws would lose; it does not feed the sampler.
+
+**Cost.** Dominated by one principal-component decomposition per member:
+the T × T Gram matrix, under a minute at production scale. The bootstrap
+adds two times `n_bootstrap` simulations in the small PC space.
+
+#### 5.6.3 Generative fidelity diagnostics (gates the fit)
+
+Lives in `train/fidelity.py`. Pure functions returning a frozen
+`FidelityDiagnostics` per group.
+
+**What it answers.** Do samples from the fitted dynamics look like the
+training data they were fit on? §5.6.2 checks the regression's assumptions,
+and no other stage looked at the sampler's output. The production `wsh` core
+had three errors that only such a check sees (§5.6.1, "Known defect"):
+
+- sampled variance 3.8 times the core's;
+- multi-day memory lost;
+- a residual daily cycle (§5.4).
+
+The stage simulates each group's fitted DMD and mode OU exactly as the
+sampler does (`train.dmd.channel_path`, then `mode_amplitudes`; §5.8 step 1).
+It runs `fidelity_replicates` replicates as long as the training window and compares
+them with the group's Gaussianized cores, member by member, in core space.
+The copula and Tucker inverses are not involved.
+
+**Where.** After DMD and the mode OU (§5.6, §5.6.1) and the §5.6.2
+diagnostics, on the same group state.
+
+**Checks, per member.**
+
+| Check | Training statistic | Compared with | Fails when |
+|---|---|---|---|
+| Variance | mean per-snapshot core energy `‖x_t‖²` | the replicates' energies | outside the replicates' envelope **and** the sampled/training ratio is outside [1/1.5, 1.5] |
+| Memory | energy-weighted ACF of the member's leading `lim_rank` PCs at each of `fidelity_lags` | the replicates projected onto the same EOFs | at any lag: outside the replicates' envelope **and** more than 0.1 from their mean |
+| Time of day | share of those PCs' variance explained by their mean at each time of day | the same share with time-of-day labels permuted within each day, `fidelity_replicates` times | above the permutations' maximum **and** more than 0.05 above their mean |
+
+Also recorded, without gating:
+
+- **Span fraction**: the share of the training core's energy that the DMD
+  reconstruction with measured amplitudes `Φ⁺x` reproduces. This is the most
+  any sampler built on these modes could carry.
+- **Sampled per-coefficient RMS** at the 5th, 50th, 95th and 99.9th
+  percentiles, from the first replicate on about 300 snapshots.
+- **Saturated fractions**: the share of sampled and of training values
+  beyond `train.copula.SATURATION_Z` ≈ 4.753, where the copula inverse clips
+  (§5.5.1).
+
+**Why both an envelope and a tolerance.** An envelope alone fires on
+deviations that are statistically real but harmless, and with few
+replicates on noise (see §5.6.2's false-alarm reasoning). A tolerance
+alone ignores sampling noise, which over one year is about ±20% on the
+energy of slow, multi-day components. Requiring both makes the gate fire only
+on errors that are both real and large. The tolerances are judgement, not
+derived:
+
+- 1.5 times the variance, about 22% in standard deviation;
+- 0.1 of autocorrelation;
+- 5% of the leading PCs' variance for a daily cycle.
+
+The `wsh` errors exceed each by a wide margin (3.8 times; 0.49 against about
+0 at 4 days; 0.147). They are `Final` constants in `train/fidelity.py`.
+
+**Gates the fit, with no bypass.** `WeatherModel.fit` raises `ValueError`
+with `fidelity_summary`'s text when any member of any group fails, before any
+fitted attribute is set. `from_components` refuses failing diagnostics the
+same way, and so does `load`, which goes through it. A model whose samples do
+not resemble its training data cannot be built or saved. Until the sampler
+is redesigned (`open_questions.md` §5.7) and `logE_wsh` gets diurnal terms
+(§5.4), the production `wsh` fit fails.
+
+**Defaults.**
+
+| Parameter | Default | Reason |
+|---|---|---|
+| `fidelity_lags` | `(1, 2, 4, 8, 16, 32, 64, 128)` | 3 h to 16 days at 3 h, where the `wsh` memory loss shows. The largest must be below T / 2. |
+| `fidelity_replicates` | 100 | Replicates and time-of-day permutations: about 2% two-sided per check, as in §5.6.2. Separate from `n_bootstrap` because a replicate costs one r × T simulation, while a LIM bootstrap replicate refits the LIM. |
+| PCs per member | `lim_rank` (20), capped as in §5.6.2 | The same subspace the tau test reads. |
+
+**Output.** `FidelityDiagnostics` per group, with `members`, `n_replicates`,
+`dt` and, per member:
+
+- `variance` (`VarianceCheck`): training and replicate energies, span
+  fraction, RMS quantiles, saturated fractions, verdict;
+- `memory` (`MemoryCheck`): lags, training ACF, replicate envelope and mean,
+  per-lag verdicts;
+- `time_of_day` (`TimeOfDayCheck`): share, permutation mean and maximum,
+  verdict.
+
+The `passed` property combines the verdicts. `fidelity_summary` renders a
+group as text. Persisted as `fidelity_diagnostics.json` (§7).
+
+**Cost.** Each replicate is one channel path and its mode amplitudes
+(r × T). Member energies come from the r × r Gram matrices `Φ_mᴴΦ_m` and
+`Φ_mᵀΦ_m`, so the sampled state is never materialized, plus a k × r
+projection onto the EOFs. Per group there is also one principal-component
+decomposition per member (as in §5.6.2) and one `Φ⁺x` pass. The
+per-coefficient statistics materialize the first replicate on about 300
+snapshots, in chunks. At production size this is minutes per group.
+
+**First application (2026-11-22): production `wsh` core.** `notebooks/07_generative_fidelity_wsh_core.py` ran the stage on task 07's 40% Gaussianized core (era 2, 2024-01 to 2024-09, T = 2192), with its cached `r_dmd = 100` DMD and the mode OU refit by `fit_mode_ou`. It used 100 replicates and 20 PCs, and ran under an 8 GiB address-space cap with a 5.3 GiB peak. All three checks fail:
+
+| Check | Training | Replicates | Verdict |
+|---|---|---|---|
+| Variance: sampled / training energy | 1 | 3.84 (3.49–4.25) | fail |
+| ACF at 3 h / 6 h | 0.896 / 0.746 | [0.862, 0.883] / [0.776, 0.812] | pass (within 0.1) |
+| ACF at 12 h / 24 h / 48 h | 0.585 / 0.845 / 0.697 | [0.677, 0.728] / [0.582, 0.647] / [0.338, 0.423] | fail |
+| ACF at 4 d / 8 d / 16 d | 0.487 / 0.333 / 0.254 | [−0.069, 0.050] / [−0.022, 0.098] / [0.085, 0.173] | fail |
+| Time-of-day share | 0.148 | permutations: mean 0.001, max 0.002 | fail |
+
+Also recorded:
+
+- The DMD span carries 11.4% of the core energy.
+- The sampled per-coefficient RMS is 1.16 / 1.81 / 3.03 / 5.39 at the 5th / 50th / 95th / 99.9th percentiles.
+- 3.12% of sampled values lie beyond the copula's saturation, against 0.06% in training.
+
+The data's 24 h rebound (0.845, above its 12 h value) is the daily cycle. The samples have none.
+
+### 5.7 Local residual OU field (deferred in v3)
+
+**Not part of the first era-3 model** (`include_local_residual=False`, §3.10). The specification below is v2's, kept for reinstatement. Its shapes use v2's raveled `(N_ocean, V)` layout and its `Z` is v2's per-cell Gaussianized field. Before reinstating it: refit per tensor on native `(T, H, W)` arrays (`ornstein_uhlenbeck_processes.md` §4.1), decide which space it lives in under placement (ii) (`open_questions.md` §6.2), and settle its variance floor (task 10).
 
 Lives in `train/local_residual.py`. This is the field-valued analog of the mode-level OU — one independent OU process per ocean cell per variable, fit to the coherent-reconstruction residual.
 
@@ -1137,61 +1405,54 @@ def fit_local_residual(
 
 ### 5.8 Sampling and continuous-time query
 
-Free functions in `weather/simulate.py`. They read from the fitted `WeatherModel`.
+Free functions in `weather/simulate.py`. They read from the fitted `WeatherModel` and never mutate it.
 
-**Continuous-time point query — the `sample_batch` fast path.** For each query time `t_q`, use the OU closed-form transition rather than a full grid simulation:
+**Continuous-time point query — the `sample_batch` fast path.** The query times of one call are one realization. The closed-form OU transition carries each group's channels from one sorted unique query time to the next, so no grid simulation is needed between them.
 
-**Step 1: Evolve mode-level OU to query time.**
+**Step 1: Evolve each group's channels across the query times, then build its mode amplitudes** (§5.6.1).
 ```
-Δn = (t_q − t_train_start).total_seconds() / dt      # can be fractional
-For each DMD mode k:
-    â_k(t_q) = b0_k · exp(lam_cont_k · (t_q − t_train_start))
-    η_k(t_q) = φ_mode(k)^Δn · η_k(t_ref)
-             + N_ℂ(0, σ_mode(k)² · (1 − |φ_mode(k)|^(2·Δn)) / (2·θ_mode(k)))
-    a_k(t_q) = â_k(t_q) + η_k(t_q)
+Δn_q = (t_q − t_train_start).total_seconds() / dt            # sorted unique times; fractional allowed
+c(t_1) ~ N(0, P)                                              # stationary draw at the first query time
+c(t_q) = φ^g ⊙ c(t_{q−1}) + w_q,  g = Δn_q − Δn_{q−1},  w_q ~ N(0, C(g))   # one correlated draw per step
+real channel (mode k):    η_k = c
+pair channel (k, k'):     η_k = exp(c + log_magnitude_mean) · exp(i · (phase_offset + Δn · arg Λ_k)),  η_k' = conj(η_k)
+a_k(t_q) = b0_k · Λ_k^Δn + η_k
 ```
+The channels are Markov, so this is the exact joint law at every query time, regular or not: consecutive points along a route carry the model's temporal correlation. Each distinct gap is factorized once. The noise is one correlated draw per group (`Q` of §5.6.1), never independent per mode or per member (§5.6.2). `variant="bop"` already returns exact pairs; the same channel construction applies.
 
-For `variant="exact"` or `"hankel"` DMD, after drawing `η_k` for the first mode of each conjugate pair, force `η_{k'}(t_q) = conj(η_k(t_q))` for its partner. For `variant="bop"` this is automatic.
+*Rejected: jumping every query time from one reference draw at `t_train_start`* (v2's sampler, and this section until 2026-11-22). Each time then has the right marginal, but beyond a few decorrelation times `φ^Δn ≈ 0` and the points become independent draws. Measured on one channel with `φ = 0.9` at 3 h, a month past `t_train_start`, consecutive 3-hourly queries had lag-1 correlation −0.006 instead of 0.90; chaining gives 0.90.
 
-**Step 2: Reconstruct coherent field on the grid.**
-```
-x(t_q) = Re(Σ_k a_k(t_q) · Φ_k)                      # (N_state,)
-core(t_q) = x(t_q).reshape(r_ocean, r_var)           # (r_ocean, r_var)
-Z_coherent(·, ·, t_q) = tucker_inverse(core(t_q)[None, ...], model.tucker_)[0]
-                                                      # (N_ocean, V)
-```
+**Known defect.** The pair construction above gives every pair a deterministic phase, independent of every other pair's. On non-orthogonal DMD modes that loses the cancellation between modes and inflates the sampled variance (§5.6.1, "Known defect"). §5.6.3 refuses to build a model where this happens.
 
-**Step 3: Draw local residual at each query point.**
+**Step 2: Joint state → per-tensor Gaussianized cores.**
 ```
-For each query point (s_q, v_q):
-    s = nearest ocean cell to (lat_q, lon_q)
-    Z_local(s_q, v_q, t_q) = φ_local(s, v)^Δn · Z_local(s, v, t_ref)
-                           + N(0, σ_local(s, v)² · (1 − φ_local(s, v)^(2·Δn)) / (2·θ_local(s, v)))
+x_G(t_q) = Re(Φ_G · a(t_q))                            # (n_G,)
+split x_G by member blocks; reshape each to (r_lat, r_lon)
 ```
 
-If no previous state `Z_local(s, v, t_ref)` is available (isolated query, no trajectory), draw from equilibrium: `N(0, σ_local² / (2·θ_local))`.
+**Step 3: Copula inverse, then Tucker inverse on the cells needed.** `core_copula_[v].inverse_transform` maps the Gaussianized core back to the anomaly-space core. The Tucker inverse then gives the standardized anomaly. For point queries, evaluate only the rows and columns of the queries' 2 × 2 bilinear stencils: `A_std[rows, cols] = factor_lat[rows] · core · factor_lon[cols]ᵀ` (`tucker_inverse(core, fit, rows, cols)`). A full-grid inverse costs about 0.7 GFLOP per tensor per time; a single point's stencil costs about 0.3 MFLOP. Land cells are set to NaN here: the Tucker inverse also reconstructs the imputed land values, which are not data.
 
-**Step 4: Sum, interpolate, invert.**
-```
-Z(s_q, v_q, t_q) = Z_coherent(s_q, v_q, t_q) + Z_local(s_q, v_q, t_q)
-value(lat_q, lon_q, v_q, t_q) = bilinear_interp(Z, lat_q, lon_q)
-                                  # with lon-wraparound padding per §2.6
-result = model.preprocess_.inverse_transform(value)
-```
+**Step 4: Per-cell inverses on those cells.** Standardization, then climatology (evaluated at `t_q` against `t_ref`), then reprojection, which is the identity for wave-grid fields. These use per-cell statistics, so they must be inverted on grid cells, before any interpolation (§4). They are the fitted Pipeline's own steps from `reproject` onward (`preprocess_[reproject:]`), so the sampler duplicates no inverse logic. Those transformers hold full-grid fields and index positionally, so the sampler runs them on a full-grid array that is NaN outside the evaluated cells. That costs one elementwise pass over the grid per unique time, far less than a Tucker inverse; unique times are processed in small chunks to bound memory.
 
-Wrap in a small xarray Dataset containing just the queried points so `inverse_transform` handles Gaussianization inversion, standardization inversion, climatology addition, and `(u, v) → (speed, direction)` recombination.
+**Step 5: Bilinear interpolation in linear-safe space.** Interpolate the tensors (`u`, `v`, `logE`, `T`) at `(lat, lon)`, with longitude wraparound padding (§2.6). Query longitudes are taken modulo 360°. A stencil touching land gives NaN.
 
-**Compute cost:** step 1 is `O(N_queries · r_dmd)`, step 2 is `O(N_ocean · r_dmd)` per unique `t_q` (batchable), step 3 is `O(N_queries)`, step 4 is `O(N_queries)`. For `N_queries = 10⁴` and `r_dmd = 100`, total ~10 µs per query batched — matches criterion §1.5.
+**Step 6: Pointwise nonlinear inverses at the query point.** `H = exp(logE / 2)` (below the 1 cm floor → `0.0`, partition absent; §5.3.1), `period = exp(T)`, and `(u, v) → (speed, direction)` in the native convention, with the class-C magnitude from `logE`. These are the Pipeline's steps before `reproject` (`preprocess_[:reproject]`), applied to the interpolated values.
 
-**Full-field simulation on the 3h grid** (`simulate_field`) uses the same steps but with query times `t_q ∈ {t_start, t_start + Δt, ...}` on the full ocean-cell grid. The local residual is generated as `N_ocean` independent AR(1) trajectories, again vectorized.
+**Why this order.** Interpolating after the nonlinear inverses would interpolate direction angles across the 0°/360° seam and average heights in physical rather than log space. v2's sampler did both.
+
+**Open in v3.** Where the sampled height falls below the floor (partition absent), that partition's direction and period are physically undefined. They are returned as reconstructed, and `variable_taxonomy.md` §3.3.1 has no inverse rule yet.
+
+**Compute cost:** step 1 is `O(n_c³)` per group and distinct gap between query times (one factorization of `C(g)`, `n_c ≤ r_dmd`), plus `O(n_c²)` per query time. Steps 2–3 are `O(n_G · r_dmd)` plus the stencil evaluation. Step 4 is one elementwise grid pass per unique time. Steps 5–6 are `O(N_queries)`. Point queries never pay the full-grid Tucker inverse.
+
+**Full-field simulation on the 3h grid** (`simulate_field`) uses the same steps over the full grid at `t_q ∈ {t_start, t_start + Δt, ...}`: the same channel chain, with a single gap (`C(1) = Q`). Its steps 5–6 are grid-wise, with no interpolation: the whole fitted Pipeline's `inverse_transform`. With the same seed, `sample_batch` at a window's times and grid nodes returns `simulate_field`'s values there.
 
 ---
 
 ## 6. Validation
 
-**Training:** see §1/§2.2.1 — the archive spans three grid/cadence eras, so "2022-2025" is not one loadable window; the actual production training window is a separate, still-open decision (§1).
-**Held-out metrics window:** 2026-01-01T00:00Z → 2026-07-19T21:00Z (entirely within era 3, §2.2.1). Real archive data available; used for numerical validation with ground-truth comparison. Note the archive's last ~7 snapshots in this window are missing ocean variables (§1).
-**Extrapolation window:** 2026-07-20T00:00Z onward. Archive ends here; no ground-truth comparison possible. Assessed by internal-consistency and stability criteria only.
+**Training (v3):** 2025-10-27T00:00Z → 2026-10-27T00:00Z, 12 months of era 3 (§1).
+**Held-out metrics window:** 2026-10-27T00:00Z → the last real snapshot (2026-11-21 when v3 was written; it grows as data arrives). Real archive data, used for numerical validation with ground-truth comparison.
+**Extrapolation window:** past the last real snapshot. No ground-truth comparison possible. Assessed by internal-consistency and stability criteria only.
 
 The validation battery splits accordingly into two parts. `weather.validate.full_report` runs both and assembles them into a PDF:
 
@@ -1199,15 +1460,15 @@ The validation battery splits accordingly into two parts. `weather.validate.full
 full_report(
     model,
     data_dir=Path("./data"),
-    metrics_start="2026-01-01T00:00Z",
-    metrics_end="2026-07-19T21:00Z",       # last snapshot with real data
-    extrapolation_start="2026-07-20T00:00Z",
-    extrapolation_end="2026-12-31T21:00Z",  # or wherever the router needs to reach
+    metrics_start="2026-10-27T00:00Z",
+    metrics_end="2026-11-20T21:00Z",       # last snapshot with real data
+    extrapolation_start="2026-11-21T00:00Z",
+    extrapolation_end="2027-04-30T21:00Z",  # or wherever the router needs to reach
     output=Path("./reports/v0.1.0_validation.pdf"),
 )
 ```
 
-### 6.A Held-out metrics (2026-01-01 → 2026-07-19)
+### 6.A Held-out metrics (2026-10-27 onward)
 
 Real data available. All must pass to consider v0.1.0 ready to ship.
 
@@ -1217,12 +1478,12 @@ Real data available. All must pass to consider v0.1.0 ready to ship.
 4. **Short-lag variogram** at ranges `[25 km, 200 km]`. Direct test that the local residual layer (§3.10) is doing its job. Real weather has non-negligible variance at 25 km (one grid cell); model samples should too. If short-lag variance is systematically below real, lower `local_residual_variance_floor` or escalate to SPDE-GMRF (§3.13).
 5. **Joint density at a single cell.** `(sigwh, was)` and `(u_wind, v_wind)` scatter plots. Correct correlation structure in both magnitude and sign.
 6. **Extreme statistics.** 99th percentile of `sigwh` per cell for the metrics window, real vs. simulated. Systematic under-estimate → escalate copula per §3.13. **Note:** the metrics window covers only H1 (winter and spring — no Southern Hemisphere winter storms, no Northern Hemisphere hurricane season peak). This generic percentile check doesn't target hurricane season specifically — §6.D's checks 18-19 do that directly.
-7. **Held-out `.transform` residual distribution.** Apply `model.transform(metrics_window_data)` (runs only preprocessing) and KS-test per-cell values against `N(0, 1)`. Systematic non-normality on 2026-H1 → the copula or climatology overfit the 2022–2025 window.
+7. **Held-out Gaussianized-core distribution.** In v3 `model.transform` returns standardized anomalies, which are not expected to be `N(0, 1)`; the Gaussianized space is the Tucker core (§5.5.1). Apply `model.transform(metrics_window_data)`, project each tensor onto its Tucker factors (`tucker_transform`), apply its core copula, and KS-test each core coefficient against `N(0, 1)`. Systematic non-normality on the validation window → the copula or climatology overfit the training window.
 8. **Trend-term diagnostic.** Report `trend_significance_ratio` distribution across ocean cells per variable. Verify median above 0.02 (trend term doing real work) but under 0.5 (trend not overwhelming seasonal cycle). Spatial map for regions where the ratio is high (Mediterranean SST, Arctic SST).
 9. **Climatology extrapolation check.** Compare `μ_predicted(2026-04-15)` (from the fitted climatology, extrapolated 4 months past `t_train_end`) against `μ_estimated_from_2026-H1_data_alone`. If the trend term improved the extrapolation (lower RMSE than a no-trend fit), keep `include_trend=True`. If not, drop it.
 10. **Local residual variance ratio map.** Report `active_mask` fraction per variable and per basin. If a variable's active mask is < 30% globally, question whether the residual layer is worth its cost for that variable.
 
-### 6.B Extrapolation-only checks (2026-07-20 onward)
+### 6.B Extrapolation-only checks (past the last real snapshot)
 
 No ground truth available. These are internal-consistency and stability checks — the model is generating plausible samples for dates the archive doesn't cover, which is the actual use case. All must pass.
 
@@ -1259,25 +1520,34 @@ Directory layout — one dir per model version:
 
 ```
 ./models/<version>/
-├── metadata.json          # variable list, grid extents, cadence, training window,
-│                          # ranks, DMD variant, git commit hash,
-│                          # sklearn / numpy / scipy / tensorly / pydmd versions
-├── ocean_mask.npy         # (721, 1440) bool
-├── preprocess.pkl         # fitted sklearn Pipeline
-├── tucker.npz             # U_ocean, U_var, reconstruction_error
-├── dmd.npz                # Phi, Lambda, b0, lam_cont, dt, variant
-├── mode_ou.npz            # theta_mode, sigma_mode, phi_mode
-└── local_residual.npz     # theta_local, sigma_local, phi_local,
-                           # variance_ratio, active_mask
+├── metadata.json            # windows, raw variables, tensors, groups, Tucker ranks, r_dmd,
+│                            # DMD variant, git commit hash,
+│                            # sklearn / numpy / scipy / tensorly / pydmd versions
+├── ocean_mask.npy           # (721, 1440) bool, from sigwh (§5.1)
+├── preprocess.pkl           # fitted sklearn Pipeline (§5.3–§5.4), ends at the standardized anomaly
+├── tucker/<tensor>.npz      # factor_lat, factor_lon, reconstruction_error, n_iter
+├── core_copula/<tensor>.npz # bin_probs, sorted_core_binned (n_bins, r_lat, r_lon)
+├── dmd/<group>.npz          # Phi, Lambda, b0, lam_cont, dt, variant, members, member sizes
+├── mode_ou/<group>.npz      # mode, partner, phi, innovation_cov, log_magnitude_mean,
+│                            # phase_offset, dt (§5.6.1)
+├── group_diagnostics.json   # per group (§5.6.2): members, variance retained, tau-test
+│                            # lags / drift / ratio / bands / verdicts, coupling nats,
+│                            # null bands and significance flags
+├── fidelity_diagnostics.json # per group (§5.6.3): per member, variance (energies, span
+│                            # fraction, RMS quantiles, saturated fractions), memory (ACF,
+│                            # envelope, per-lag verdicts), time of day (share, null), verdicts
+└── lim/<group>.npz          # per group: G, L, Q, C0, innovation_cov, lag, dt
 ```
 
-**Why pickle for the preprocessing Pipeline.** sklearn transformers pickle cleanly; joblib.dump is the sklearn-native persistence path. The pipeline state (climatology coefficients + copula LUT) is a few GB, manageable.
+No `local_residual.npz` in v3 (§5.7).
 
-**Why `.npz` for the decomposition stages.** Pure array bundles, no class structure. Numpy-native, faster to load, cross-version-stable.
+**Why pickle for the preprocessing Pipeline.** sklearn transformers pickle cleanly; joblib.dump is the sklearn-native persistence path.
 
-Dtype policy: `float32` for large arrays (`Phi`, `U_ocean`, `theta_local`, `sigma_local`), `float64` for small ones (mode OU parameters, DMD eigenvalues). Complex: `complex64` for `Phi`, `complex128` for `Lambda`, `b0`, `lam_cont`, `phi_mode`.
+**Why `.npz` for everything after it.** Pure array bundles, no class structure. Numpy-native, faster to load, cross-version-stable. The core copulas are stored as their fitted arrays, not as pickled `GaussianCopula` objects, and rebuilt on load.
 
-Ballpark total size for a 2022–2025 tier-1 model: 6–8 GB, dominated by `preprocess.pkl`.
+Dtype policy: `float32` for large arrays (`Phi`, the copula lookup tables, the Tucker factors on disk), `float64` for small ones (mode OU parameters, DMD eigenvalues, LIM matrices). Complex: `complex64` for `Phi`, `complex128` for `Lambda`, `b0`, `lam_cont`, `phi_mode`.
+
+Ballpark total size for a tier-1 model (7 tensors): 3–4 GB. Per tensor that is about 330 MB of copula lookup table, about 130 MB of `Phi` (single-member groups), and about 100 MB of climatology and standardization fields in `preprocess.pkl`.
 
 ---
 
@@ -1443,9 +1713,10 @@ import xarray as xr
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 
-from train.tucker import TuckerFit
+from train.copula import GaussianCopula
 from train.dmd import DMDFit, ModeOUFit
-from train.local_residual import LocalResidualFit
+from train.linear_inverse import GroupDiagnostics
+from train.tucker import TuckerFit
 
 
 @dataclass(frozen=True, slots=True)
@@ -1454,9 +1725,10 @@ class ModelMetadata:
     t_train_start: datetime
     t_train_end: datetime
     t_ref: datetime                          # climatology reference epoch (mid-window)
-    variables: tuple[str, ...]
-    r_ocean: int
-    r_var: int
+    variables: tuple[str, ...]               # raw archive fields loaded
+    tensors: tuple[str, ...]                 # modeled tensors (§10)
+    groups: dict[str, tuple[str, ...]]       # group name -> member tensors
+    tucker_ranks: dict[str, tuple[int, int]] # tensor -> (r_lat, r_lon)
     r_dmd: int
     dmd_variant: str
     include_trend: bool
@@ -1471,8 +1743,9 @@ class ModelMetadata:
 class WeatherModel(BaseEstimator, TransformerMixin):
     """Hierarchical stochastic weather generator.
 
-    Architecture: climatology (linear + harmonic) + coherent modes (Tucker + DMD + OU)
-    + per-cell local residual OU field. sklearn-compatible transformer surface.
+    Architecture (v3): per-tensor climatology + standardization, per-tensor
+    masked Tucker, Gaussian copula on each core, DMD + mode OU per variable
+    group. sklearn-compatible transformer surface.
 
     Sampling is NOT a method on this class. Use free functions in weather.simulate:
         sample(model, ...)
@@ -1480,12 +1753,17 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         simulate_field(model, ...)
 
     Fitted attributes (trailing underscore per sklearn convention):
-        preprocess_       : sklearn.pipeline.Pipeline (directional → gaussian copula)
-        tucker_           : TuckerFit
-        dmd_              : DMDFit
-        mode_ou_          : ModeOUFit
-        local_residual_   : LocalResidualFit  (None if include_local_residual=False)
+        preprocess_       : sklearn.pipeline.Pipeline (sentinel fill → standardize)
         ocean_mask_       : np.ndarray, shape (721, 1440), bool
+        tensor_names_     : tuple[str, ...]
+        groups_           : dict[str, tuple[str, ...]]  (resolved from `groups`)
+        tucker_           : dict[str, TuckerFit]        (tensor -> fit)
+        core_copula_      : dict[str, GaussianCopula]   (tensor -> fitted copula)
+        dmd_              : dict[str, DMDFit]           (group -> fit)
+        mode_ou_          : dict[str, ModeOUFit]        (group -> fit)
+        group_diagnostics_: dict[str, GroupDiagnostics] (group -> §5.6.2 stage output)
+        fidelity_diagnostics_: dict[str, FidelityDiagnostics] (group -> §5.6.3, all passed)
+        local_residual_   : None in v3 (§5.7)
         metadata_         : ModelMetadata
     """
 
@@ -1493,39 +1771,34 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         self,
         t_start: datetime,
         t_end: datetime,
-        variables: list[str],
-        r_ocean: int = 300,
-        r_var: int = 6,
+        variables: list[str],                        # raw archive fields (§10)
+        tucker_rank_fraction: float = 0.4,           # of (H, W), per tensor (§5.5)
+        tucker_max_iter: int = 300,
+        tucker_tol: float = 1e-5,
         r_dmd: int = 100,
         dmd_variant: Literal["exact", "bop", "hankel"] = "exact",
         copula_lut_bins: int = 500,
         diurnal_variables: list[str] | None = None,
         include_trend: bool = True,
         trend_significance_threshold: float = 0.1,
-        include_local_residual: bool = True,
+        include_local_residual: bool = False,        # deferred in v3 (§5.7)
         local_residual_variance_floor: float = 0.02,
+        groups: dict[str, list[str]] | None = None,  # None: one group per tensor (§5.6.2)
+        lim_rank: int = 20,
+        tau_test_lags: tuple[int, ...] = (1, 2, 4, 8, 16),
+        fidelity_lags: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128),  # §5.6.3
+        fidelity_replicates: int = 100,                                  # §5.6.3
+        n_bootstrap: int = 100,
         random_state: int | None = None,
     ) -> None:
         # sklearn convention: __init__ only stores parameters, no validation.
-        self.t_start = t_start
-        self.t_end = t_end
-        self.variables = variables
-        self.r_ocean = r_ocean
-        self.r_var = r_var
-        self.r_dmd = r_dmd
-        self.dmd_variant = dmd_variant
-        self.copula_lut_bins = copula_lut_bins
-        self.diurnal_variables = diurnal_variables
-        self.include_trend = include_trend
-        self.trend_significance_threshold = trend_significance_threshold
-        self.include_local_residual = include_local_residual
-        self.local_residual_variance_floor = local_residual_variance_floor
-        self.random_state = random_state
+        ...  # one `self.<name> = <name>` per parameter, verbatim
 
     # --- sklearn transformer surface ---------------------------------------
-    def fit(self, X: Path, y: None = None) -> Self: ...
+    def fit(self, X: Path, y: None = None) -> Self:
+        """Raises ValueError when the §5.6.3 generative fidelity checks fail."""
     def transform(self, X: Path) -> xr.Dataset:
-        """Apply preprocessing chain only. Returns Gaussianized anomalies."""
+        """Apply preprocessing chain only. Returns standardized anomalies per tensor."""
     def fit_transform(self, X: Path, y: None = None) -> xr.Dataset: ...
 
     # --- Alternate constructor for notebook assembly -----------------------
@@ -1534,10 +1807,12 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         cls,
         *,
         preprocess: Pipeline,
-        tucker: TuckerFit,
-        dmd: DMDFit,
-        mode_ou: ModeOUFit,
-        local_residual: LocalResidualFit | None,
+        tucker: dict[str, TuckerFit],
+        core_copula: dict[str, GaussianCopula],
+        dmd: dict[str, DMDFit],
+        mode_ou: dict[str, ModeOUFit],
+        group_diagnostics: dict[str, GroupDiagnostics],
+        fidelity_diagnostics: dict[str, FidelityDiagnostics],  # raises unless all passed
         ocean_mask: np.ndarray,
         metadata: ModelMetadata,
     ) -> Self: ...
@@ -1552,120 +1827,116 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         return self.ocean_mask_
 ```
 
-Default `dmd_variant="exact"` — fast enough for repeated Tucker/DMD rank sweeps during notebook iteration (§8.6). Switch to `dmd_variant="bop"` only for the final production fit, once ranks are settled: `eig_constraints={"conjugate_pairs"}` then handles the complex-conjugate pair problem automatically and adds bagged uncertainty quantification, at ~100× the fit cost of `"exact"` — worth paying once, not on every sweep.
+`variables` names raw archive fields. The Pipeline derives the tensors from them (§5.3), and `groups` refers to tensor names. Including `local_residual_variance_floor` keeps the parameter surface stable for when the local residual returns; it is unused in v3.
+
+**`fit` versus the notebook.** `fit(X)` runs the whole chain in-process and is the path for small windows and tests. A production era-3 window needs about 15–20 h of VM time per tensor for Tucker alone (§5.5). Production therefore uses the notebook workflow, with checkpointed Tucker per tensor on a VM, then `from_components` (§8.6).
+
+Default `dmd_variant="exact"` — fast enough for repeated rank sweeps during notebook iteration (§8.6). Switch to `dmd_variant="bop"` only for the final production fit, once ranks are settled: `eig_constraints={"conjugate_pairs"}` then handles the complex-conjugate pair problem automatically and adds bagged uncertainty quantification, at ~100× the fit cost of `"exact"` — worth paying once, not on every sweep.
 
 ### 8.6 Notebook workflow (`notebooks/test_pipeline.ipynb`)
 
-Training is a notebook activity. Structure so that expensive stages run once and cheap stages iterate.
-
-**Stale example dates below — do not copy literally.** `T_TRAIN_START`/`T_TRAIN_END` as shown (`2022-01-01`→`2026-01-01`) spans all three archive eras (§2.2.1) and will now be **rejected** by `load_training_window` (a cross-era window). Pick a single-era window instead — e.g. era 2's full span, `2023-10-02` to `2025-10-27` — until the actual production training window is decided (§1, `tasks/16-archive-grid-resolution-drift.md`); this doc's pseudocode has not been updated with a considered choice, only flagged as needing one. Rewriting the actual notebook is `tasks/11-notebooks.md`'s scope, not done as part of that flagging.
+Training is a notebook activity. Structure so that expensive stages run once and cheap stages iterate. The notebook is currently parked in `notebooks/tbd/`; rewriting it to this cell structure is part of the v3 implementation.
 
 ```
-Cell 1  — Setup: imports, paths, SEED, training + validation windows.
-          T_TRAIN_START      = datetime(2022, 1,  1,  tzinfo=timezone.utc)
-          T_TRAIN_END        = datetime(2026, 1,  1,  tzinfo=timezone.utc)   # exclusive
-          T_METRICS_START    = datetime(2026, 1,  1,  tzinfo=timezone.utc)
-          T_METRICS_END      = datetime(2026, 7, 19, 21, tzinfo=timezone.utc) # last real snap
-          T_EXTRAP_START     = datetime(2026, 7, 20, 0,  tzinfo=timezone.utc) # first synth-only
-          T_EXTRAP_END       = datetime(2026, 12, 31, 21, tzinfo=timezone.utc) # or wherever
-                                                                              # the router needs
+Cell 1  — Setup: imports, paths, SEED, windows (§1).
+          T_TRAIN_START = datetime(2025, 10, 27, tzinfo=timezone.utc)
+          T_TRAIN_END   = datetime(2026, 10, 27, tzinfo=timezone.utc)   # exclusive
+          T_VALID_START = T_TRAIN_END
+          T_VALID_END   = <last real snapshot + 3 h>                     # grows with the archive
+          VARIABLES = ["sigwh", "wsh", "wsp", "wsd", "was", "wad_come_from"]   # tier 1
+          GROUPS = None                                                  # one group per tensor
 
-Cell 2  — Ingest training data (2022–2025 only, NOT including 2026-H1).
-          X_raw = load_training_window(data_dir, T_TRAIN_START, T_TRAIN_END, variables)
+Cell 2  — Ingest the training window (one era only; §5.1).
+          X_raw = load_training_window(data_dir, T_TRAIN_START, T_TRAIN_END, VARIABLES)
 
-Cell 3  — Build and fit the preprocessing Pipeline (§5.2–5.4).
-          preprocess = Pipeline([
-              ("coming_from_to_uv", ComingFromToUV(pairs=[
-                  ("wsh", "wsd", "u_wsea", "v_wsea"),
-                  ("was", "wad_come_from", "u_wind", "v_wind"),
-              ])),
-              ("going_to_to_uv", GoingToToUV(pairs=[
-                  # empty for tier 1; tier 3 (ocean currents) adds:
-                  # ("ocs", "ocd", "u_current", "v_current"),
-              ])),
-              ("reproject",   Reprojector(target_grid="wave")),
-              ("climatology", ClimatologyRemover(
-                  diurnal_variables=["sst"],
-                  include_trend=True,
-              )),
-              ("standardize", PerCellStandardizer()),
-              ("gaussianize", GaussianCopula(n_bins=500)),
-          ], memory=Path("./cache"))          # cache for iteration
-          Z = preprocess.fit_transform(X_raw)              # slow: ~30 min
-          # inspect climatology diagnostics:
-          climatology = preprocess.named_steps["climatology"]
-          print(f"trend-significant cells: "
-                f"{(climatology.trend_significance_ratio_ > 0.1).mean():.1%}")
+Cell 3  — Build and fit the preprocessing Pipeline (§5.3–§5.4).
+          preprocess = Pipeline([...], memory=Path("./cache"))   # §5.3 placement
+          A_std = preprocess.fit_transform(X_raw)                # one tensor per variable
+          ocean_mask = preprocess.named_steps["sentinel"].ocean_mask_
+          # log: trend-significant cell fraction; period sentinels and their agreement
 
-Cell 4  — Inspect Z: QQ plots at random cells (should be N(0,1)).
+Cell 4  — Inspect A_std: unit scale per cell, land NaN where the mask says,
+          no NaN at ocean cells (the sentinel fill worked).
 
-Cell 5  — Tucker at various ranks.
-          tucker_200 = tucker_fit(Z.to_numpy(), r_ocean=200, r_var=6, rng=rng)
-          tucker_400 = tucker_fit(Z.to_numpy(), r_ocean=400, r_var=6, rng=rng)
-          print(f"200: err={tucker_200.reconstruction_error:.4f}")
-          print(f"400: err={tucker_400.reconstruction_error:.4f}")
+Cell 5  — Tucker per tensor (§5.5). Expensive: 15–20 h per tensor on a VM.
+          Run notebooks/07_placement2_tucker_on_anomalies.py-style checkpointed jobs,
+          then load each TuckerFit and its core here:
+          tucker[v], core[v] = load_checkpointed_tucker(v)
 
-Cell 6  — DMD at chosen Tucker. `variant="exact"` here — this cell reruns on
-          every rank sweep, and BOP-DMD's ~100-model bagging makes that
-          painfully slow during iteration. Refit with `variant="bop"` only for
-          the final production model (see "Production runs" below); the
-          WeatherModel assembled in Cell 9 below is for validation feedback
-          during iteration, not the model that ships.
-          core = tucker_transform(Z.to_numpy(), tucker_400)
-          dmd = dmd_fit(core, r_dmd=100, dt=DT, rng=rng, variant="exact")
-          plot_eigenvalues(dmd)
+Cell 6  — Copula per core (§5.5.1); QQ plots of the Gaussianized cores.
+          core_copula[v] = GaussianCopula(n_bins=500).fit(wrap(core[v]))
+          gauss_core[v] = core_copula[v].transform(wrap(core[v]))
 
-Cell 7  — Mode OU fit against the chosen DMD.
-          mode_ou = fit_mode_ou(core, dmd)
+Cell 7  — DMD + mode OU per group (§5.6). `variant="exact"` here — this cell reruns
+          on every rank sweep; BOP-DMD's ~100-model bagging is for the final fit.
+          state[g] = concat(gauss_core[v].reshape(T, -1) for v in members(g))
+          dmd[g] = dmd_fit(state[g], r_dmd=100, dt=DT, rng=rng, variant="exact")
+          mode_ou[g] = fit_mode_ou(state[g], dmd[g])
+          plot_eigenvalues(dmd[g])
 
-Cell 8  — Coherent reconstruction, then local residual fit (NEW in v2).
-          Z_coherent = coherent_reconstruction(core, tucker_400, dmd, mode_ou)
-          local = fit_local_residual(Z.to_numpy(), Z_coherent, dt=DT,
-                                      variance_floor=0.02)
-          print(f"active local cells: {local.active_mask.mean():.1%}")
-          plot_variance_ratio_map(local)
+Cell 7b — Group dynamics diagnostics (§5.6.2): tau test + coupling, per group.
+          group_diagnostics = {
+              name: diagnose_group({v: gauss_core[v] for v in members},
+                                   ranks={v: 20 for v in members}, dt=DT,
+                                   test_lags=[1, 2, 4, 8, 16],
+                                   n_bootstrap=100, rng=rng)
+              for name, members in groups.items()
+          }
+          for diag in group_diagnostics.values():
+              print(diagnostics_summary(diag))
+          # NO across consecutive lags → revisit the training lag or try
+          # variant="hankel" before trusting DMD's multi-step behaviour.
+          # Coupling not significant → the group gains nothing from a joint fit.
 
-Cell 9  — Assemble WeatherModel; save.
+Cell 7c — Generative fidelity (§5.6.3): simulate each group's fitted dynamics and
+          compare with its cores. from_components refuses a failing group.
+          fidelity_diagnostics = {
+              name: diagnose_fidelity(state[name], member_sizes(name), dmd[name],
+                                      mode_ou[name], times=times, lags=FIDELITY_LAGS,
+                                      ranks={v: 20 for v in members},
+                                      n_replicates=100, rng=rng)
+              for name, members in groups.items()
+          }
+          for diag in fidelity_diagnostics.values():
+              print(fidelity_summary(diag))
+
+Cell 8  — Assemble WeatherModel; save.
           model = WeatherModel.from_components(
-              preprocess=preprocess,
-              tucker=tucker_400, dmd=dmd, mode_ou=mode_ou,
-              local_residual=local,
+              preprocess=preprocess, tucker=tucker, core_copula=core_copula,
+              dmd=dmd, mode_ou=mode_ou, group_diagnostics=group_diagnostics,
+              fidelity_diagnostics=fidelity_diagnostics,
               ocean_mask=ocean_mask, metadata=metadata,
           )
           model.save(Path("./models/v0.1.0"))
 
-Cell 10 — Validation: metrics on 2026-H1 (real ground truth),
-          extrapolation checks on 2026-H2 (no ground truth).
-          report = full_report(
-              model, data_dir=data_dir,
-              metrics_start=T_METRICS_START,
-              metrics_end=T_METRICS_END,
-              extrapolation_start=T_EXTRAP_START,
-              extrapolation_end=T_EXTRAP_END,
-              output=Path("./reports/v0.1.0_validation.pdf"),
-          )
+Cell 9  — Validation (§6) on T_VALID_START → T_VALID_END, extrapolation checks after.
+          report = full_report(model, data_dir=data_dir,
+                               metrics_start=T_VALID_START, metrics_end=T_VALID_END,
+                               extrapolation_start=T_VALID_END,
+                               extrapolation_end=..., output=Path("./reports/v0.1.0.pdf"))
 ```
 
-**Production runs** (after the notebook workflow has settled) use the "just train the whole thing" one-liner. This is the one place `dmd_variant="bop"` belongs — everywhere upstream in the iteration workflow (§8.6 Cell 6) uses `"exact"`:
+v2's Cell 8 (local residual) is gone in v3 (§5.7).
+
+**Production runs.** v3's production path is the notebook above with `dmd_variant="bop"` in Cell 7 once ranks are settled. The in-process one-liner is for small windows and tests:
 
 ```python
 model = WeatherModel(
-    t_start=datetime(2022, 1, 1, tzinfo=timezone.utc),
-    t_end=datetime(2026, 1, 1, tzinfo=timezone.utc),     # exclusive; last training snap
-                                                          # is 2025-12-31T21:00Z
-    variables=["sigwh", "wsh", "wsp", "was", "wad", "wsd"],
-    r_ocean=300, r_var=6, r_dmd=100,
+    t_start=datetime(2025, 10, 27, tzinfo=timezone.utc),
+    t_end=datetime(2026, 10, 27, tzinfo=timezone.utc),   # exclusive; last training snap
+                                                         # is 2026-10-26T21:00Z
+    variables=["sigwh", "wsh", "wsp", "wsd", "was", "wad_come_from"],
+    tucker_rank_fraction=0.4, r_dmd=100,
     dmd_variant="bop",  # final fit only — see §5.6, §8.5
-    include_trend=True, include_local_residual=True,
     random_state=42,
 )
 model.fit(Path("./data"))
 model.save(Path("./models/v0.1.0"))
 ```
 
-**Important:** `t_end` is *exclusive* — the last training snapshot is `t_end - 3h`. For a training window ending at 2025-12-31T21:00Z, pass `t_end=datetime(2026, 1, 1, tzinfo=timezone.utc)`. This matches the `enumerate_snapshots(..., t_start, t_end)` convention in §5.1.
+**Important:** `t_end` is *exclusive* — the last training snapshot is `t_end - 3h`. This matches the `enumerate_snapshots(..., t_start, t_end)` convention in §5.1.
 
-The 2026-H1 data (2026-01-01 to 2026-07-19T21:00Z) is **not** used for training — it's reserved entirely for the numerical validation battery. If the archive gets more data appended later, the training window can be extended; the metrics window then slides forward accordingly.
+Data from 2026-10-27 onward is **not** used for training — it's reserved for the numerical validation battery. As the archive grows, the validation window grows with it. A longer training window is to be revisited at the era-3 18-month checkpoint (§1).
 
 **Pipeline caching.** `Pipeline(memory=Path("./cache"))` transparently caches each transformer's output. Turn caching *off* (delete the cache dir) before production runs — the fitted `preprocess.pkl` shouldn't carry references to a disk cache that other machines don't have.
 
@@ -1689,21 +1960,21 @@ Ordered by expected pain if missed.
 
 6. **`float16` precision on disk is much coarser than `float64` in memory.** `sigwh` at 8 m has ~0.008 m precision. Not a bug.
 
-7. **Land mask consistency.** Use the *intersection* of `not isnan` across all modeled variables at all training snapshots.
+7. **Land mask comes from `sigwh` only** (task 17, §5.1). A partition variable's NaN (`wsh`, `pswh`, their periods and directions) also fires where that partition is absent at a genuine ocean cell. Intersecting every modeled variable's NaN, as v2 did, deletes large areas of real ocean.
 
-8. **Complex-conjugate DMD pair handling — depends on DMD variant.** With `dmd_variant="bop"`, `eig_constraints={"conjugate_pairs"}` handles this automatically. With `"exact"` or `"hankel"`, the sampler must force `η_{k'}(t) = conj(η_k(t))` at every step. Add an assertion: `assert np.abs(Y_sim.imag).max() < 1e-10` after every simulation step in debug builds. **v2 defaults to `"exact"`** (fast enough for repeated rank sweeps during notebook iteration, §8.6) **so this manual handling is live during iteration** — don't skip it just because `"bop"` makes it unnecessary in the final fit. Switch to `"bop"` for the production model, which sidesteps this class of bug entirely at ~100× the fit cost — a cost worth paying once ranks are settled, not on every sweep.
+8. **Complex-conjugate DMD pairs are one stochastic driver.** A real field needs `η_k'(t) = conj(η_k(t))` exactly. Independent per-mode draws make the reconstruction about as imaginary as real (task 07). v3 builds this into the fit: `fit_mode_ou` gives each pair one log-magnitude channel with a deterministic phase, and `mode_amplitudes` sets the partner to the conjugate (§5.6.1, §5.8). The sampler's real part is then exact, not a discard of a large imaginary part. With `dmd_variant="bop"`, `eig_constraints={"conjugate_pairs"}` also enforces exact pairs at fit time; with `"exact"` or `"hankel"`, pairs are matched by eigenvalue within `1e-6`, and a mode whose partner the truncation dropped is treated as real. Exact conjugacy is necessary but not sufficient: the construction loses the cancellation between non-orthogonal modes, which inflates the sampled variance (§5.6.1, "Known defect").
 
 9. **Wraparound at year boundaries in the climatology.** Compute `t_since_epoch_days` continuously from `t_ref` (the training-window midpoint); don't reset at Jan 1. The cosines handle periodicity.
 
-10. **Parallelism goes on modes, seeds, and cells for the local residual — never on grid cells for the coherent layer.** Coherent-layer grid cells couple through Tucker reconstruction. But the local residual fit is embarrassingly parallel per cell (in fact vectorized in one numpy op — no joblib needed). Use `joblib.Parallel` for the mode-level OU across independent modes if it ever becomes a bottleneck.
+10. **Parallelism goes on tensors, modes and seeds — never on grid cells for the coherent layer.** Coherent-layer grid cells couple through Tucker reconstruction. The per-tensor Tucker fits are independent and parallelize across machines (§5.5). Use `joblib.Parallel` for the mode-level OU across independent modes if it ever becomes a bottleneck.
 
 11. **`float16` in arithmetic paths.** Never. Cast to `float64` at the I/O boundary.
 
 12. **Time zones — always UTC.** Naive datetimes raise `ValueError` at the API boundary.
 
 13. **Reference epochs are TWO datetimes, not one.**
-    - `t_train_start = 2022-01-01T00:00Z` — beginning of training window; used by DMD/OU as the time origin for `Λ^{Δn}` and OU closed-form evolution. **This specific example date is now illegal on its own** — see gotcha 15: `t_train_start=2022-01-01` combined with a `2026-01-01` end spans three archive eras and `load_training_window` will reject it. The two-epoch *mechanism* described below is still correct; only this literal example pair needs revisiting once the real production training window (§1) is chosen.
-    - `t_ref = 2024-01-01T10:30Z` — midpoint of the 2022-01-01 → 2026-01-01 training window, used as the climatology's linear trend origin (`Δτ = (t − t_ref) / 1_year`).
+    - `t_train_start = 2025-10-27T00:00Z` — beginning of the v3 training window; used by DMD/OU as the time origin for `Λ^{Δn}` and OU closed-form evolution.
+    - `t_ref = 2026-04-27T12:00Z` — midpoint of the 2025-10-27 → 2026-10-27 training window, used as the climatology's linear trend origin (`Δτ = (t − t_ref) / 1_year`).
     Compute `t_ref` at fit time as `t_train_start + (t_train_end - t_train_start) / 2`. Do not hardcode; if the training window changes, `t_ref` should shift with it. Both stored in `metadata.json`. All temporal computations at query time reference the correct one — climatology uses `t_ref`, DMD/OU use `t_train_start`. Getting these swapped produces a systematic bias that's hard to spot in QQ plots but shows up loudly in the trend-term diagnostic (§6.A.8).
 
 14. **Physical consistency across variables is NOT enforced.** `wsh ≤ sigwh` etc. can be violated. The Gaussian copula preserves correlations but not physical relationships. Defer projection layer until validation shows it's needed.
@@ -1716,40 +1987,50 @@ Ordered by expected pain if missed.
 
 17. **Pickle version drift.** `preprocess.pkl` is a pickled sklearn Pipeline. `metadata.json` records tensorly, pydmd, and sklearn versions used at training. `WeatherModel.load` warns if any differ from the runtime — a mismatch on tensorly or pydmd almost always breaks loading.
 
-18. **Local residual assumes cell-independence.** If short-lag variogram check (§6.4) shows short-range spatial correlation in residuals matters, escalate to SPDE-GMRF (§3.13). For v0.1.0 the independence assumption is defensible but should be diagnosed explicitly.
+18. **(Deferred in v3, §5.7.) Local residual assumes cell-independence.** If short-lag variogram check (§6.4) shows short-range spatial correlation in residuals matters, escalate to SPDE-GMRF (§3.13). For v0.1.0 the independence assumption is defensible but should be diagnosed explicitly.
 
-19. **Local residual can over-fit near ice edges.** Cells near the seasonally-varying ice edge alternate between "valid ocean" and "ice" across the training window. The intersection ocean mask (§5.1) should exclude these, but any that slip through will produce spuriously large `σ_local` (the residual there is not really OU-distributed). Diagnostic: plot `σ_local` and check for a suspiciously bright rim around Antarctic/Arctic ice edges.
+19. **(Deferred in v3, §5.7.) Local residual can over-fit near ice edges.** Cells near the seasonally-varying ice edge alternate between "valid ocean" and "ice" across the training window. The intersection ocean mask (§5.1) should exclude these, but any that slip through will produce spuriously large `σ_local` (the residual there is not really OU-distributed). Diagnostic: plot `σ_local` and check for a suspiciously bright rim around Antarctic/Arctic ice edges.
 
-20. **Trend term can fit noise on short windows.** With 4 years of training data, the linear trend estimator is noisy in the presence of interannual variability (ENSO, NAO). The `trend_significance_ratio_` diagnostic in `ClimatologyRemover` reports where this is happening. If the median ratio is above ~0.5 in specific regions, the trend is likely aliasing interannual variability into a fake secular trend; escalate to index-regressed climatology (§3.13).
+20. **Trend term can fit noise on short windows.** v3 trains on only 12 months, where this is sharper than in v2's 4-year framing (§3.9 caveat). With a few years of training data, the linear trend estimator is noisy in the presence of interannual variability (ENSO, NAO). The `trend_significance_ratio_` diagnostic in `ClimatologyRemover` reports where this is happening. If the median ratio is above ~0.5 in specific regions, the trend is likely aliasing interannual variability into a fake secular trend; escalate to index-regressed climatology (§3.13).
 
-21. **`partial_tucker` return signature has drifted historically.** TensorLy has changed the exact tuple shape returned by `partial_tucker` between minor versions. First cell of the notebook: `print(partial_tucker.__doc__)` and confirm the unpacking pattern. Add a version pin (`tensorly>=0.9,<0.10`) once you've validated a specific version.
+21. **Don't call tensorly's `partial_tucker` for the masked fit.** v3 uses the vendored `train/masked_tucker.partial_tucker_lowmem`, which fixes tensorly 0.9.0's per-iteration memory blow-up and its ignored `svd=` argument (task 07 §5). It is pinned to the tensorly 0.9 internals it was vendored from (`tensorly>=0.9,<0.10` in `pyproject.toml`); re-verify `tests/train/test_masked_tucker.py` against any tensorly upgrade.
 
 22. **PyDMD snapshot orientation is `(n_features, n_snapshots)`.** Opposite of what we treat internally. One `.T` at the boundary in `dmd_fit`. Getting this wrong produces plausible-looking eigenvalues on the wrong basis.
+
+23. **Interpolate only linear-safe fields, after the per-cell inverses** (§5.8). Interpolating physical values after the full inverse averages direction angles across the 0°/360° seam and heights in physical rather than log space. v2's sampler did both.
+
+24. **Land cells are NaN until the Tucker boundary, then `0.0` plus mask.** Never feed NaN to the masked ALS: it poisons the initial norm. Never use a large sentinel either: the placeholder must be neutral (`tucker_decomposition.md` §4.2). And never confuse the land placeholder with the partition sentinel (§5.3.1), which marks a real "no partition" observation at an ocean cell.
+
+25. **The 1 cm log floor is applied everywhere, not only at sentinel cells.** A real `H = 0` would otherwise give `log 0 = −∞`. At sampling, heights reconstructed below the floor decode to `0.0` (§5.3.1).
+
+26. **The production `wsh` core fails the tau test at 3 h** (§5.6.2). DMD's one-step fit is internally consistent, but its multi-step predictions are not validated. Don't read good one-step CV (task 07) as evidence for multi-day behaviour.
 
 ---
 
 ## 10. Variable table
 
-Directions decoded per §2.3 (one uniform formula, `(code % 16) * 22.5`) then handled by the appropriate transformer per §5.3 (native convention). The "Modeled as" column shows the final internal representation after preprocessing. **Grid and origin-code columns corrected against `docs/noaa_etl/noaa_transform.md`**: `wave` and `wind` are the same GFS Wave grid (§2.2), not two grids, and there is no per-field origin code (§2.3) — all direction fields use code range 1–16.
+Directions decoded per §2.3 (one uniform formula, `(code % 16) * 22.5`) then handled by the transformer for their native convention (§5.3). The "Tensors" column is the internal representation after preprocessing (`variable_taxonomy.md` §5): 17 independent tensors in total. `wave` and `wind` are the same GFS Wave grid (§2.2).
 
-| File            | Meaning                            | On-disk dtype | Units    | Source grid | Native conv.   | Transformer         | Modeled as                                 | Tier |
-|-----------------|------------------------------------|---------------|----------|-------------|----------------|---------------------|--------------------------------------------|------|
-| `sigwh.npy`     | Significant wave height            | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 1    |
-| `wsh.npy`       | Wind-sea wave height                | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 1    |
-| `wsp.npy`       | Wind-sea period                    | float16       | s        | GFS Wave    | —              | (pass-through)      | scalar                                     | 1    |
-| `wsd.npy`       | Wind-sea direction                 | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | paired with `wsh` → `(u_wsea, v_wsea)`     | 1    |
-| `was.npy`       | Wind speed at surface              | float16       | **knots** | GFS Wave   | —              | (pass-through)      | scalar                                     | 1    |
-| `wad_come_from.npy` | Wind direction, coming from    | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — raw `wdir`) | `ComingFromToUV`    | paired with `was` → `(u_wind, v_wind)`     | 1    |
-| `wad.npy`       | Wind direction, going to           | int8 (1–16)   | —        | GFS Wave    | `going_to` (deliberate ±180° flip of `wad_come_from`) | (consistency check only, §5.1) | **not modeled** — raw codes are `wad_come_from` shifted 180° (0% cell-identical; *not* a duplicate); same wind vector, opposite convention | 1    |
-| `pwh.npy`       | Peak wave height                   | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 2    |
-| `pwp.npy`       | Peak wave period                   | float16       | s        | GFS Wave    | —              | (pass-through)      | scalar                                     | 2    |
-| `pwd.npy`       | Peak wave direction                | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | paired with `pwh` → `(u_peak, v_peak)` | 2    |
-| `sst.npy`       | Sea surface temperature            | float16       | verify K/°C (no conversion applied by the ETL) | Ocean (HYCOM/RTOFS) | —              | (pass-through)      | scalar                              | 2    |
-| `pswh.npy`      | Primary swell height               | float16       | m        | GFS Wave    | —              | (pass-through)      | scalar                                     | 3    |
-| `pswp.npy`      | Primary swell period               | float16       | s        | GFS Wave    | —              | (pass-through)      | scalar                                     | 3    |
-| `pswd.npy`      | Primary swell direction            | int8 (1–16)   | —        | GFS Wave    | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | paired with `pswh` → `(u_pswell, v_pswell)` | 3 |
-| `ocs.npy`       | Ocean current speed                | float16       | **knots** | Ocean (HYCOM/RTOFS) | —              | (pass-through)      | scalar                                     | 3    |
-| `ocd.npy`       | Ocean current direction            | int8 (1–16)   | —        | Ocean (HYCOM/RTOFS) | `going_to` (confirmed — NDBC ocean-current convention, derived from `atan2(u, v)` on native HYCOM velocity, independent of grid orientation, §2.3/§2.7) | `GoingToToUV` | paired with `ocs` → `(u_current, v_current)`; no `ocd_come_from` sibling exists | 3    |
+| File | Meaning | On-disk dtype | Units | Source grid | Native conv. | Transformers | Tensors | Tier |
+|---|---|---|---|---|---|---|---|---|
+| `sigwh.npy` | Significant wave height | float16 | m | GFS Wave | — | `LogTransform` | `logE_sigwh`; also defines the land mask (§5.1) | 1 |
+| `wsh.npy` | Wind-sea wave height | float16 | m | GFS Wave | — | `PartitionSentinelFiller`, `ComingFromToUV` (kept), `LogTransform` | `logE_wsh`; magnitude of `(u_wsea, v_wsea)` | 1 |
+| `wsp.npy` | Wind-sea mean period (`T_m01`) | float16 | s | GFS Wave | — | `PartitionSentinelFiller`, `LogTransform` | `T_wsp` | 1 |
+| `wsd.npy` | Wind-sea direction | int8 (1–16) | — | GFS Wave | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | `u_wsea`, `v_wsea` | 1 |
+| `was.npy` | Wind speed at surface | float16 | **knots** | GFS Wave | — | `ComingFromToUV` | magnitude of `(u_wind, v_wind)` | 1 |
+| `wad_come_from.npy` | Wind direction, coming from | int8 (1–16) | — | GFS Wave | `coming_from` (confirmed — raw `wdir`) | `ComingFromToUV` | `u_wind`, `v_wind` (knots) | 1 |
+| `wad.npy` | Wind direction, going to | int8 (1–16) | — | GFS Wave | `going_to` (deliberate ±180° flip of `wad_come_from`) | consistency check only (§5.1) | **not modeled** | — |
+| `pwh.npy` | Peak wave height (≡ `sigwh`, `open_questions.md` §1.4) | float16 | m | GFS Wave | — | `ComingFromToUV` (not kept) | magnitude of `(u_pwave, v_pwave)` only; no tensor of its own | 2 |
+| `pwp.npy` | Peak wave mean period | float16 | s | GFS Wave | — | `LogTransform` | `T_pwp` | 2 |
+| `pwd.npy` | Peak wave direction | int8 (1–16) | — | GFS Wave | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | `u_pwave`, `v_pwave` | 2 |
+| `sst.npy` | Sea surface temperature | float16 | verify K/°C (no conversion applied by the ETL) | Ocean (HYCOM/RTOFS) | — | `Reprojector` | `sst` (no log); blocked by task 16 | 2 |
+| `pswh.npy` | Primary swell height | float16 | m | GFS Wave | — | `PartitionSentinelFiller`, `ComingFromToUV` (kept), `LogTransform` | `logE_pswh`; magnitude of `(u_pswell, v_pswell)` | 3 |
+| `pswp.npy` | Primary swell mean period | float16 | s | GFS Wave | — | `PartitionSentinelFiller`, `LogTransform` | `T_pswp` | 3 |
+| `pswd.npy` | Primary swell direction | int8 (1–16) | — | GFS Wave | `coming_from` (confirmed — NCEP/NDBC) | `ComingFromToUV` | `u_pswell`, `v_pswell` | 3 |
+| `ocs.npy` | Ocean current speed | float16 | **knots** | Ocean (HYCOM/RTOFS) | — | `GoingToToUV`, `Reprojector` | magnitude of `(u_current, v_current)` | 3 |
+| `ocd.npy` | Ocean current direction | int8 (1–16) | — | Ocean (HYCOM/RTOFS) | `going_to` (confirmed — NDBC ocean-current convention, §2.3) | `GoingToToUV`, `Reprojector` | `u_current`, `v_current`; blocked by task 16 | 3 |
+
+Tensor count by tier: 7 (tier 1), +4 (tier 2), +6 (tier 3) = 17.
 
 ---
 
@@ -1793,7 +2074,7 @@ Ordered by usefulness for this project.
 A tagged v0.1.0 release providing:
 
 1. `poetry install` produces a working environment on Python 3.14. `poetry run pytest` passes.
-2. A working `notebooks/test_pipeline.ipynb` that produces a fitted `WeatherModel` on 2022–2025 data and a validation PDF against 2026 held-out data end-to-end.
+2. A working `notebooks/test_pipeline.ipynb` that produces a fitted `WeatherModel` on the era-3 training window (§1) and a validation PDF against the held-out data that follows it, end-to-end.
 3. The public API from §8.4, with docstrings and full type hints.
 4. Green CI on Python 3.14: `black --check src/ tests/`, `isort --check-only src/ tests/`, `mypy --strict src/`, `pytest --cov=src` (coverage ≥ 85%).
 5. Unit test coverage:

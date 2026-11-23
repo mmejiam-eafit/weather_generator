@@ -157,13 +157,31 @@ def test_throughput_benchmark_returns_positive_timings_per_n(
 def test_held_out_normality_check_pvalues_within_unit_interval(
     tier1_archive: Path, fitted_tier1_model: WeatherModel
 ) -> None:
-    """Every non-NaN KS-test p-value lies in [0, 1]."""
+    """One p-value per sampled core coefficient per tensor, each in [0, 1] (§6 check 7)."""
     model = fitted_tier1_model
-    p_values = held_out_normality_check(model, tier1_archive, model.t_start, model.t_end, n_cells=5)
-    assert set(p_values) == set(model.variable_names_)
+    p_values = held_out_normality_check(
+        model, tier1_archive, model.t_start, model.t_end, n_coefficients=3
+    )
+    assert set(p_values) == set(model.tensor_names_)
     for values in p_values.values():
+        assert values.shape == (3,)
         finite = values[~np.isnan(values)]
         assert np.all((finite >= 0.0) & (finite <= 1.0))
+
+
+def test_held_out_normality_check_training_cores_are_near_normal(
+    tier1_archive: Path, fitted_tier1_model: WeatherModel
+) -> None:
+    """On the training window itself the copula makes each coefficient close to N(0, 1).
+
+    Not every p-value is large: held-out projection (`tucker_transform`)
+    differs slightly from the ALS core near land, and the LUT has 50 bins.
+    """
+    model = fitted_tier1_model
+    p_values = held_out_normality_check(
+        model, tier1_archive, model.t_start, model.t_end, n_coefficients=4
+    )
+    assert np.median(np.concatenate(list(p_values.values()))) > 0.05
 
 
 def test_full_report_writes_a_pdf(

@@ -4,7 +4,7 @@ import numpy as np
 from numpy.testing import assert_allclose
 
 from train.local_residual import LocalResidualFit, coherent_reconstruction, fit_local_residual
-from train.tucker import tucker_fit, tucker_inverse, tucker_transform
+from train.tucker import TuckerFit, tucker_inverse
 
 
 def test_variance_ratio_diagnostic() -> None:
@@ -234,16 +234,19 @@ def test_negative_phi_alternation_gives_fast_decorrelation() -> None:
 def test_coherent_reconstruction_matches_tucker_inverse() -> None:
     """`coherent_reconstruction` is a thin wrapper reproducing `tucker_inverse` exactly."""
     rng = np.random.default_rng(4)
-    n_times, n_ocean, n_var = 15, 20, 3
-    Z = rng.normal(size=(n_times, n_ocean, n_var))
-
-    tucker = tucker_fit(Z, r_ocean=6, r_var=2, rng=rng)
-    core_deterministic = tucker_transform(Z, tucker)
+    n_times, n_lat, n_lon = 15, 8, 10
+    tucker = TuckerFit(
+        factor_lat=rng.normal(size=(n_lat, 3)),
+        factor_lon=rng.normal(size=(n_lon, 4)),
+        reconstruction_error=0.0,
+        n_iter=0,
+    )
+    core_deterministic = rng.normal(size=(n_times, 3, 4))
 
     Z_coherent = coherent_reconstruction(core_deterministic, tucker)
     expected = tucker_inverse(core_deterministic, tucker)
 
-    assert Z_coherent.shape == (n_times, n_ocean, n_var)
+    assert Z_coherent.shape == (n_times, n_lat, n_lon)
     assert_allclose(Z_coherent, expected, rtol=1e-12)
 
 

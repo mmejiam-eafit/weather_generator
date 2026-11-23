@@ -15,6 +15,7 @@ dependencies = [
     "pydmd (>=2025.8.1,<2026.0.0)",
     "seaborn (>=0.13.2,<0.14.0)",
     "plotly (>=6.9.0,<7.0.0)",
+    "structlog (>=26.1.0,<27.0.0)",
 ]
 
 [build-system]
