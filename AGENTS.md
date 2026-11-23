@@ -79,7 +79,13 @@ review.
   returns a `GroupDiagnostics`. It holds a tau test of the linear-Markov
   assumption and the coupling information an independent fit loses, each
   judged against a bootstrap envelope. Results are stored on the model and
-  logged; they never feed sampling or gate the fit.
+  logged; they never feed sampling or gate the fit. Then the **generative
+  fidelity** stage (`train/fidelity.py`, §5.6.3): `diagnose_fidelity`
+  simulates each group's fitted DMD + mode OU exactly as the sampler does,
+  and compares the samples with the training cores on variance, multi-day
+  memory and residual time-of-day cycle. It returns a `FidelityDiagnostics`.
+  This stage **gates**: `fit` and `from_components` raise `ValueError` when
+  a check fails, with no bypass.
 
 `weather.model.WeatherModel` inherits `BaseEstimator + TransformerMixin` and
 glues the two layers together. Sampling operations are **free functions** in
@@ -118,6 +124,7 @@ before changing the module. Section numbers without a file name refer to
 | `src/train/masking.py` | §5.1, §5.3.1; `docs/variable_taxonomy.md` §3.3.1; task 17 | ✓ Exists |
 | `src/train/dmd.py` | §5.6, §5.6.1 | ✓ Exists |
 | `src/train/linear_inverse.py` | §5.6.2; `docs/correlated_variables.md` §4.4 | ✓ Exists |
+| `src/train/fidelity.py` | §5.6.3 | ✓ Exists — gates the fit |
 | `src/train/local_residual.py` | §3.10, §5.7 | ✓ Exists — deferred in v3, not wired into `WeatherModel` |
 | `src/weather/model.py` | §7, §8.4, §8.5 | ✓ Exists |
 | `src/weather/simulate.py` | §5.8, §8.4 | ✓ Exists |
@@ -346,7 +353,7 @@ that restate the code*: explain reasoning, never mechanics.
 - `warnings.warn` stays the tool for caller-actionable conditions (see
   *Error Handling*).
 - Logging is on the training path only (ingest checks, period sentinels,
-  trend significance, Tucker errors, group diagnostics). The query path
+  trend significance, Tucker errors, group diagnostics, generative fidelity). The query path
   (`weather/simulate.py`) logs nothing and must stay that way.
 
 ---
@@ -583,8 +590,10 @@ weather_generator/
 │   │   ├── masking.py                   # Land mask, partition sentinel policy,
 │   │   │                                # PartitionSentinelFiller, LogTransform
 │   │   ├── dmd.py                       # group_state, dmd_fit, fit_mode_ou,
-│   │   │                                # ou_transition, mode_amplitudes
+│   │   │                                # ou_transition, channel_path, mode_amplitudes
 │   │   ├── linear_inverse.py            # group_pcs, fit_lim, tau_test, diagnose_group
+│   │   ├── fidelity.py                  # simulate_amplitudes, diagnose_fidelity,
+│   │   │                                # fidelity_summary (the training gate)
 │   │   └── local_residual.py            # coherent_reconstruction, fit_local_residual
 │   └── weather/                         # Public API
 │       ├── __init__.py                  # Re-exports (see handoff §8.4)

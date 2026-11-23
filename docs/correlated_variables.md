@@ -1014,6 +1014,33 @@ responses, none tested yet: a longer training lag ($\tau_0$ = 6–12 h),
 time-delay (Hankel) DMD (`train.dmd.dmd_fit(variant="hankel")`), or
 treating the fast component explicitly as noise.
 
+**Cause (2026-11-22).** The failure comes from slow variability, not from
+fast noise at 3 h:
+
+- **Most of the leading PCs' variance is slow.** 74% of the top-20 PCs'
+  variance lies at periods over 10 days, and 45% over 30 days.
+- **The 3 h fit forgets it.** Their autocorrelation at 4 days is 0.40,
+  against 0.11 for the 3 h first-order fit.
+- **Removing it makes the test pass.** With the variability slower than
+  10 days removed, the 20-PC test passes at 6 h and 12 h.
+
+The core also carries a physical daily cycle (`open_questions.md` §7.2).
+Removing its time-of-day mean barely changes the result: the ratio at 12 h
+goes from 0.70 to 0.76.
+
+None of the candidate responses above passes, each judged against its own
+20-replicate bootstrap envelope:
+
+- **Fitting at 6 h or 12 h.** Only the 48 h lag clears its envelope, and
+  only at 20 PCs.
+- **AR(2) and AR(3) at 3 h,** the discrete analogue of Hankel DMD. They
+  still fail at 6–24 h.
+
+The production sampler loses even more memory than the LIM, and it inflates
+the variance (`model_design.md` §5.6.1, "Known defect"). Both are now
+measured at every fit by `model_design.md` §5.6.3. Redesign:
+`open_questions.md` §5.7.
+
 ---
 
 ## 5. Results: what a correctly joint-fit operator should show

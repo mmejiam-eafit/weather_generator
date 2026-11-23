@@ -50,6 +50,29 @@ still specification-level documents, not implementations.
 
 ---
 
+## Priorities (2026-11-22)
+
+On 2026-11-22, probing the production `wsh` core showed that the sampler
+does not reproduce its training data (`model_design.md` §5.6.1, "Known
+defect"). A new training stage now measures that and refuses to build a
+failing model (§5.6.3). Until the items below are done, no model can be
+trained and the 36 tests that need a fitted model fail. Work in this order:
+
+| # | Work | Questions | Why at this position | Done when |
+|---|---|---|---|---|
+| 1 | Make the measurement trustworthy | §5.9 | Everything after it is judged by the fidelity stage, which has no unit tests yet and raises false alarms on short windows. | `train/fidelity.py` has unit tests: no false alarm on a known model, and each defect caught. The short-window tolerance is decided. |
+| 2 | Choose the space the dynamics are fit in | §4.3 | Cheap analysis on the cached core, and the redesign in item 3 works in whatever space this picks. | The raw and Gaussianized cores' energy coverage are compared and the space is chosen. |
+| 3 | Redesign the sampler | §5.7 (and §5.2) | The blocker: no model can be built. | The cached `wsh` core passes the §5.6.3 variance and memory checks. |
+| 4 | Remove wind sea's daily cycle | §7.2 | A configuration change (diurnal terms for `logE_wsh`), independent of item 3. The `wsh` time-of-day check fails until it is done. | The `wsh` time-of-day check passes. |
+| 5 | Land the gate | §5.9 | Needs items 1, 3 and 4. | The test fixture is regenerated so a correct model passes, and the suite is green with the gate enforced. |
+| 6 | Revalidate task 07's sampling-based decisions | §5.8 | They were judged by checks that could not see the defect, and they need the new sampler. | `r_dmd` is re-derived and passes §5.6.3. |
+
+Everything else keeps its own status and is not reprioritized. That
+includes §9.1, training-time memory, which waits on the training
+infrastructure.
+
+---
+
 ## 1. Data and convention-level questions
 
 ### 1.1 Is the ocean grid's row-0 latitude/orientation south-first, like the wave and wind grids? — **ANSWERED** (yes, confirmed by direct geo-referenced lookup)
@@ -857,6 +880,42 @@ be placed at any of the three §4.1 locations, so resolving §4.1 does not
 resolve this, and vice versa — they are genuinely independent axes of the
 same design space, and both remain open.
 
+### 4.3 Does giving every Tucker-core coefficient unit variance undermine the dynamics fit? — **OPEN** (2026-11-22, hypothesis; priority 2)
+
+Raised in: the 2026-11-22 sampler findings (`model_design.md` §5.6.1,
+"Known defect").
+
+The copula (`model_design.md` §5.5.1) maps each core coefficient to a
+standard normal. That is 142,848 coefficients for the 40% era-2 core. Every
+coefficient then has unit variance, whatever its share of the anomaly's
+energy. Tucker's basis orders energy: on the 20% raw core, the first 10
+latitude modes carry 37.7% of the energy and the last 10 carry 0.9%; for
+longitude modes it is 24.5% against 0.3% (`tasks/07-tucker-dmd-rank-selection.md`).
+Gaussianization erases that order. DMD (SVD-truncated at `r_dmd = 100`)
+and the LIM's principal components are then fit in a space where small-scale,
+noise-like coefficients weigh as much as large-scale ones.
+
+Consistent with this, but not proven by it: on the 40% Gaussianized core,
+the 100-mode DMD span carries 11.4% of the energy, and the leading 20 and
+100 principal components carry 3.3% and 11.4% (`correlated_variables.md`
+§4.4). The same numbers in anomaly space have not been measured.
+
+**Cheap test, on the cached task-07 files.** Compare the principal-component
+energy spectrum and the DMD span coverage of the raw core (the cached
+Tucker `.npz`) with those of the Gaussianized core. Also measure how much of
+the anomaly-space energy the Gaussianized-space DMD span reproduces.
+
+**If the raw core concentrates its energy and the Gaussianized core does
+not,** two candidates:
+
+- fit the dynamics on the raw core and apply the copula only to the
+  marginals at sampling;
+- fit them on Gaussianized coefficients rescaled by their raw standard
+  deviations (an energy-weighted space), and undo the weights at sampling.
+
+§4.1 decided *where* Gaussianization happens, not which space the dynamics
+are fit in, so this can likely be answered without reopening §4.1.
+
 ---
 
 ## 5. DMD-specific questions
@@ -882,7 +941,7 @@ variant only once a concrete deficiency is observed) rather than a reason
 to default to the more complex option up front. **Recommendation, not a
 closed empirical fact** — flagged as such.
 
-### 5.2 Should conjugate-paired DMD/OU modes be sampled independently, or forced to satisfy the exact conjugate relationship at every simulated step? — **ANSWERED**, concrete procedure validated (2026-09-24); production port still task 9's job
+### 5.2 Should conjugate-paired DMD/OU modes be sampled independently, or forced to satisfy the exact conjugate relationship at every simulated step? — **REOPENED** (2026-11-22): conjugacy solved, but the procedure inflates the sampled variance; see §5.7
 
 Raised in: `dynamic_mode_decomposition.md` §2.4/§6, `ornstein_uhlenbeck_processes.md`
 §6.
@@ -924,6 +983,20 @@ sampling approach this section originally warned against produced
 imaginary as real — not safely-discardable noise); the fix brought it to
 ≈3×10⁻¹⁷-6×10⁻¹⁷ (machine precision) at every rank 5-200 on the real
 35,712-dimensional core.
+
+**Reopened (2026-11-22).** The procedure was ported to production in v3
+(`model_design.md` §5.6.1). Exact conjugacy holds, but it is necessary,
+not sufficient. Each pair's phase is deterministic and independent of every
+other pair's. On the production `wsh` core (40% Tucker, `r_dmd = 100`) the
+DMD modes are far from orthogonal: the condition number of `Φᴴ Φ` is
+4.6e3, and near-duplicate pairs have |cos| = 0.965. The training amplitudes
+of different modes cancel, and independent phases destroy that
+cancellation. The sampled energy in the DMD span is 31–34 times the
+training value. The 2026-09-24 check measured the imaginary part, the
+spectrum and a pooled KS statistic on the 20% core. Its KS fidelity got
+worse from `r_dmd = 100` upward, and it attributed that, unverified, to
+cond(Φ). That was this effect. The question now is how to sample without
+losing cross-mode coherence: §5.7.
 
 ### 5.3 How should Tucker ranks $(r_{\text{lat}}, r_{\text{lon}}, r_{\text{time}})$ and DMD rank $r_{\text{dmd}}$ be chosen? — **DECIDED**: `r_dmd=100` (2026-09-25); Tucker rank 40% `(248, 576)` (2026-09-29, pragmatic/budget-bound, no elbow found)
 
@@ -1308,6 +1381,109 @@ reconstruction error now **decreases** with rank (was increasing).
 **Still open:** whether/how this gets wired into production, and the
 `wsd`-vs-`wad` provenance question above.
 
+### 5.7 How should the sampler preserve the training cores' variance and multi-day memory? — **OPEN** (2026-11-22; priority 3)
+
+Raised in: probing the production `wsh` core (`model_design.md` §5.6.1,
+"Known defect"). The generative fidelity stage (`model_design.md` §5.6.3)
+now measures these errors and refuses to build a model that has them.
+
+Three errors, each measured on task 07's production `wsh` core:
+
+1. **Cross-mode cancellation lost** (§5.2). The sampled variance in the
+   DMD span is 31–34 times the training value. The sampled per-coefficient
+   RMS has a median of 1.73, against 1.0 in training.
+2. **Unmodeled variance.** The 100-mode DMD span carries about 10% of the
+   Gaussianized core's variance. Nothing generates the other 90%; the local
+   residual is deferred (§6.2).
+3. **Multi-day memory lost.** The mode-OU channels decorrelate in about
+   6 h (median φ = 0.605 at 3 h). The core's leading principal components
+   keep 0.49 autocorrelation at 4 days. Neither a 6 h or 12 h training lag
+   nor AR(2)/AR(3) passes the tau test (`model_design.md` §5.6).
+
+Candidates, none tested yet:
+
+- **Joint PC-space sampling.** Sample each member's leading principal
+  components with a linear model and their full innovation covariance, as
+  `correlated_variables.md` §4.4 specifies and `simulate_lim` implements.
+  Cross-mode correlation is estimated rather than assumed away, and
+  conjugacy is automatic. This addresses error 1.
+- **Per-coefficient residual noise** for the core variance outside the
+  sampled subspace, matched to each coefficient's variance and lag-1
+  autocorrelation. This addresses error 2, and is the core-space
+  counterpart of the deferred local residual.
+- **A multi-timescale linear model**, for example one with daily- and
+  weekly-aggregated lags, or a slow subspace modeled at a longer step. This
+  addresses error 3. The tau test and §5.6.3's memory check out to 16 days
+  are the acceptance criteria.
+
+### 5.8 Do task 07's sampling-based decisions still hold? — **OPEN** (2026-11-22; priority 6, after §5.7)
+
+Raised in: the 2026-11-22 sampler findings.
+
+- **`r_dmd = 100`** (§5.3) was chosen at the knee between spectral and
+  marginal generative fidelity, measured on the pair procedure. Its pooled
+  KS statistic worsened from `r_dmd = 100` upward, and task 07 attributed
+  that, unverified, to cond(Φ). That was the cross-mode cancellation defect
+  (§5.2). The rank should be re-derived with the redesigned sampler and
+  judged by `model_design.md` §5.6.3.
+- **The pair procedure's validation** (§5.2) measured only the imaginary
+  part of the reconstruction, which says nothing about its variance.
+- **Tucker rank 40%** (§5.3) rests on reconstruction error, which the
+  defect does not affect. It interacts with §4.3, though: a larger core in
+  a unit-variance space adds noise-like coefficients the dynamics must
+  carry.
+
+### 5.9 How does the generative fidelity gate land, and how should it judge short windows? — **OPEN** (2026-11-22; priorities 1 and 5)
+
+Raised in: implementing `model_design.md` §5.6.3.
+
+**Decided (2026-11-22):** the stage fails the fit, with no bypass. A model
+whose samples fail it is never built, by `fit` or by `from_components`.
+
+**Consequence.** With the current sampler no model can be built. The
+60-snapshot tier-1 test fixture fails in every group and every seed. Both a
+white-noise version and one driven by a latent AR(1) process fail, with
+variance ratios of 1.5–10 and a spurious oscillation in the sampled
+autocorrelation from the fixed pair phases. The 36 tests that need a fitted
+model fail. The stage was committed in that state, deliberately, so the
+work is not lost.
+
+**Open points:**
+
+1. **Unit tests for `train/fidelity.py`, not yet written** (priority 1).
+   Planned:
+   - a state generated from a known model passes;
+   - near-collinear conjugate pairs with cancelling amplitudes fail the
+     variance check;
+   - a two-timescale process fit with an AR(1) fails the memory check;
+   - the span fraction matches a known signal share;
+   - an injected daily cycle fails the time-of-day check and white noise
+     passes;
+   - the same seed gives identical diagnostics;
+   - a lag of `T / 2` or more raises.
+
+   Also tests for `train.dmd.channel_path` and `measured_amplitudes`.
+2. **Short windows** (priority 1). The tolerances (0.1 autocorrelation,
+   0.05 time-of-day share) are about the size of the sampling noise at
+   T = 60: an autocorrelation standard error of about 0.075 with 3 PCs, and
+   a spread of about 0.04 in the time-of-day null. Across 7 groups and 6
+   checks each, even a correct model would likely fail something. At
+   T = 2920 the same tolerances are 2–5σ. Proposal, not adopted: fail only
+   beyond max(tolerance, 3σ of the replicates or permutations). Production
+   behaviour would be unchanged, and short windows would stop raising false
+   alarms.
+3. **A fixture artifact** (priority 5). The fixture's absent wind-sea cell
+   (`TIER1_ABSENT_CELL`) is absent every 4th step, so always at 00 and 12
+   UTC. That is a real time-of-day cycle in `logE_wsh`, `T_wsp`, `u_wsea`
+   and `v_wsea`, and the gate sees it: a white-noise fixture failed the
+   time-of-day check on `logE_wsh`. The regenerated fixture should make the
+   absent pattern independent of the time of day.
+4. **How it lands** (priority 5). Candidates:
+   - together with the sampler redesign (§5.7), once the suite is green;
+   - record-only (log a warning) until then;
+   - rebuild the model tests on `from_components`, using a synthetic model
+     that passes.
+
 ---
 
 ## 6. Ornstein–Uhlenbeck-specific questions
@@ -1385,7 +1561,7 @@ together with the specific window it was estimated over, not treated as a
 window-independent physical constant, until that broader training-window
 decision is made.
 
-### 7.2 Is the "waves have no diurnal signal" reasoning resolution-dependent? — **OPEN**, conditionally
+### 7.2 Is the "waves have no diurnal signal" reasoning resolution-dependent? — **OPEN**, and now active: wind sea has a measurable daily cycle at the archive's resolution (2026-11-22; priority 4)
 
 Raised in: `harmonic_climatology.md` §6.
 
@@ -1397,6 +1573,26 @@ short-fetch seas forced by diurnal sea/land-breeze cycles could carry a
 weak but real diurnal signature. **Not an active concern at the current
 archive's resolution** — listed here for completeness, not because it
 needs attention now.
+
+**Update (2026-11-22): the premise fails for wind sea at this archive's
+resolution.** The production `wsh` core (task 07, era 2, no diurnal terms)
+keeps a daily cycle:
+
+- **Per cell it is small:** median amplitude 0.037 of a cell's standard
+  deviation, up to about 0.18 near coasts.
+- **It is the core's most coherent structure:** it explains 86% and 71% of
+  the first two principal components' variance, and 15% of the top-20 PCs'
+  variance, against 0.2% under a within-day permutation null.
+- **It follows the sun.** Its phase is more coherent in local solar time
+  than in UTC (coastal concentration 0.21 against 0.02). The open-ocean
+  12 h harmonic peaks near 09 local solar time, like the atmospheric
+  semidiurnal tide.
+
+It is therefore physical, not an artifact of the GFS forecast cycle.
+`model_design.md` §5.6.3 measures the residual daily cycle at every fit and
+fails the fit on it. Enabling diurnal terms for `logE_wsh` is the
+configuration change it calls for. Whether other partition tensors need
+them is open.
 
 ---
 
@@ -1587,18 +1783,22 @@ mistaken for open items that need chasing:
 | 3.5 | Is `E − 2T ≈ const` clean evidence, or a shared-moment artifact? | ANSWERED (artifact risk confirmed; `{E,F}` fix proposed, unverified) |
 | 4.1 | Gaussianization placement | DECIDED (ii, Tucker on log-energy anomalies then Gaussianize the core, before DMD — supersedes the earlier placement-i default; 2026-09-13) |
 | 4.2 | Copula family (Gaussian vs. t/GPD) | OPEN |
+| 4.3 | Unit-variance core coefficients vs. the dynamics fit | OPEN (hypothesis, 2026-11-22; priority 2) |
 | 5.1 | DMD state-vectorization | ANSWERED (recommendation) |
-| 5.2 | Conjugate-pair sampling | ANSWERED, procedure validated 2026-09-24 (production port deferred to task 9) |
+| 5.2 | Conjugate-pair sampling | REOPENED 2026-11-22 (conjugacy solved; independent pair phases inflate variance, see 5.7) |
 | 5.3 | Tucker/DMD rank selection | DECIDED — DMD: **r_dmd=100** (2026-09-25, knee point between spectral- and marginal-fidelity optima); Tucker: **40% (248, 576)** (2026-09-29, pragmatic/budget-bound, not a swept optimum) |
 | 5.4 | Masked-HOOI convergence | OPEN (mitigation proposed) |
 | 5.5 | Growing DMD modes | OPEN (mitigation proposed) |
 | 5.6 | Partition-absence NaN vs. land/ice NaN | DECIDED (policy validated empirically, task 17) |
+| 5.7 | Sampler preserving core variance and multi-day memory | OPEN (2026-11-22; priority 3; measured by the fidelity gate, model_design §5.6.3) |
+| 5.8 | Task 07's sampling-based decisions (r_dmd, pair procedure) | OPEN (2026-11-22; priority 6, after 5.7) |
+| 5.9 | Landing the fidelity gate; short-window tolerances | OPEN (2026-11-22; priorities 1 and 5) |
 | 6.1 | OU variance-ratio floor | OPEN |
 | 6.2 | Local residual under placement (ii) | DEFERRED (not in the first era-3 model, 2026-11-22; space still open) |
 | 7.1 | Climatology quasi-stationarity | OPEN |
-| 7.2 | Diurnal reasoning resolution-dependence | OPEN (conditional, inactive) |
+| 7.2 | Diurnal reasoning resolution-dependence | OPEN, active (wind sea has a daily cycle, 2026-11-22; priority 4) |
 | 8.1 | Direction-blind physical constraints | PARTIALLY ANSWERED |
 | 8.2 | Cross-cell/cross-time blindness | OPEN (structural) |
 | 8.3 | Rejection vs. copula fix | OPEN (= 4.2) |
 | 8.4 | Static PM check vs. young-sea transients | ANSWERED (not yet integrated) |
-| 9.1 | Fitting era-3 training in memory | OPEN (decide together with the training and production infrastructure, 2026-11-22) |
+| 9.1 | Fitting era-3 training in memory | OPEN (decide together with the training and production infrastructure, 2026-11-22; not reprioritized) |

@@ -6,7 +6,7 @@
 
 **One-line summary:** train a stochastic model on the raw 3-hourly `.npy` archive produced by the [`noaa_etl`](./noaa_etl/) pipeline — NOAA GFS-Wave GRIB2 (wave *and* wind fields together, one product) plus RTOFS/HYCOM (sea surface temperature and ocean currents) — and provide plausible synthetic samples of any variable at any continuous `(lat, lon, datetime)` when real data isn't available. v3 trains on 12 months of archive era 3 and validates on the real data that follows. **`docs/noaa_etl/` is the unequivocal source of truth for this archive's origin and transformations** (see `docs/noaa_etl/pipeline.md`); every data fact in §2 below is stated to be consistent with it.
 
-**Approach chosen:** hierarchical decomposition, one independent chain per modeled field — **linear-trend + harmonic climatology** on log-energy / log-period / `(u, v)` fields → **per-variable masked Tucker** compression of the standardized anomaly → **Gaussian copula on each Tucker core** → **DMD + OU on mode amplitudes** per variable group. A training-time diagnostics stage (linear inverse model, tau test, coupling information) is recorded with the model. The per-cell local-residual layer is deferred in v3 (§3.10, §5.7). Orchestrated by a scikit-learn `BaseEstimator + TransformerMixin` wrapper. See §3 for rationale and rejected alternatives.
+**Approach chosen:** hierarchical decomposition, one independent chain per modeled field — **linear-trend + harmonic climatology** on log-energy / log-period / `(u, v)` fields → **per-variable masked Tucker** compression of the standardized anomaly → **Gaussian copula on each Tucker core** → **DMD + OU on mode amplitudes** per variable group. A training-time diagnostics stage (linear inverse model, tau test, coupling information) is recorded with the model, and a generative fidelity stage simulates the fitted dynamics against the training cores and refuses to build a model that fails it (§5.6.3). The per-cell local-residual layer is deferred in v3 (§3.10, §5.7). Orchestrated by a scikit-learn `BaseEstimator + TransformerMixin` wrapper. See §3 for rationale and rejected alternatives.
 
 **Language:** Python 3.14 only. Batched-first API design (§1, §8). If a downstream consumer eventually shows sub-millisecond point queries are needed and cannot be batched, a C++ query library can be added; do not build one preemptively.
 
@@ -26,11 +26,12 @@ Read this section if you know v2. v3 brings the handoff in line with the decisio
 2. **Per-variable masked Tucker** on each `(T, lat, lon)` tensor, compressing only the spatial modes, through the vendored `train/masked_tucker.partial_tucker_lowmem` (task 07 §5 fixed two tensorly bugs). Replaces v2's joint ocean-cell × variable Tucker and its `r_ocean`/`r_var` ranks. Rank: 40% of each spatial dimension (task 07). §5.5.
 3. **Gaussianization after Tucker** (placement ii, DECIDED in `open_questions.md` §4.1). The copula is fit on each Tucker core's coefficients, not on grid cells, and leaves the preprocessing Pipeline. §3.5, §5.5.1.
 4. **Land mask from `sigwh`, sentinel fill for absent partitions** (task 17, `open_questions.md` §5.6). §5.1, §5.3.1.
-5. **DMD and mode-level OU per variable group**: one group per tensor by default; joint groups are a Linear Inverse Model (`correlated_variables.md` §4). `r_dmd = 100` (task 07). The mode OU drives one real channel per real mode and per conjugate pair (task 07's validated pair procedure), with one joint innovation covariance per group. §5.6, §5.6.1.
+5. **DMD and mode-level OU per variable group**: one group per tensor by default; joint groups are a Linear Inverse Model (`correlated_variables.md` §4). `r_dmd = 100` (task 07). The mode OU drives one real channel per real mode and per conjugate pair (task 07's pair procedure), with one joint innovation covariance per group. Its samples inflate the variance on the production core (§5.6.1, "Known defect"). §5.6, §5.6.1.
 6. **Group dynamics diagnostics stage** (tau test, coupling information). §5.6.2.
-7. **Local residual deferred.** Not part of the first era-3 model (`include_local_residual=False`). §3.10, §5.7.
-8. **Sampling interpolates in linear-safe space.** Per-cell inverses on grid cells, then bilinear interpolation of `(u, v)`, `logE` and `T`, then pointwise `exp` / `hypot` / `atan2`. v2 interpolated physical values, direction angles included. §5.8.
-9. **Training and validation windows** moved to era 3 (above).
+7. **Generative fidelity gate.** Training simulates each group's fitted dynamics and compares the samples with the training cores: variance, multi-day memory, residual time-of-day cycle. A model that fails cannot be built. The current sampler fails it on the production `wsh` core (§5.6.1, "Known defect"). §5.6.3.
+8. **Local residual deferred.** Not part of the first era-3 model (`include_local_residual=False`). §3.10, §5.7.
+9. **Sampling interpolates in linear-safe space.** Per-cell inverses on grid cells, then bilinear interpolation of `(u, v)`, `logE` and `T`, then pointwise `exp` / `hypot` / `atan2`. v2 interpolated physical values, direction angles included. §5.8.
+10. **Training and validation windows** moved to era 3 (above).
 
 ## What changed in v2 (vs. v1)
 
@@ -856,7 +857,7 @@ where:
 
 - `Δτ(t) = (t − t_ref) / 1_year`, with `t_ref = (t_train_start + t_train_end) / 2`. Normalizing by 1 year gives `c_lin` interpretable units of "change per year." Centering at `t_ref` makes `c_lin` uncorrelated with `c₀`.
 - `ω_y = 2π / 365.25 days`, `ω_d = 2π / 1 day`.
-- Diurnal terms (`c₅, c₆`) only for the tensors named in `diurnal_variables` (`sst`, `u_wind`, `v_wind` are the candidates). Waves don't have a diurnal cycle at 0.25° global resolution (`open_questions.md` §7.2).
+- Diurnal terms (`c₅, c₆`) only for the tensors named in `diurnal_variables` (`sst`, `u_wind`, `v_wind` are the candidates). The default is none. "Waves have no diurnal cycle" (`open_questions.md` §7.2) does not hold for wind sea. The production `wsh` core (task 07, era 2) keeps a daily cycle locked to local solar time. It is small per cell (median amplitude 0.037 of a cell's standard deviation, up to about 0.18 near coasts), but it makes up most of the core's two leading principal components: 15% of the top-20 PCs' variance, against 0.2% under a within-day permutation null. The open-ocean 12 h harmonic peaks near 09 local solar time, as the atmospheric semidiurnal tide does. §5.6.3 measures the residual cycle and fails the fit on it, so a `wsh` fit fails until `logE_wsh` gets diurnal terms.
 
 Fit by vectorized OLS, NaN-aware so land cells stay NaN. Fitted attributes, per tensor: the coefficient fields `(n_terms, H, W)`, `t_ref_`, and `c_lin_` for the trend diagnostic.
 
@@ -1026,7 +1027,12 @@ def dmd_fit(
 
 **Rank `r_dmd = 100`** for a single-member group: DECIDED in task 07 (`open_questions.md` §5.3), at the knee between the spectral and marginal generative-fidelity optima. A surrogate test and 8-fold walk-forward CV both showed predictive accuracy is almost rank-insensitive between 5 and 200. A joint group's `r_dmd^G ≤ min(n_G, T − 1)` is chosen per group. Diagnostic: plot `Lambda` on the complex plane.
 
-**Multi-step validity is in question.** At 3 h, the production `wsh` core fails the tau test from 6 h onward (§5.6.2): it stays predictable longer than a 3 h linear-Markov fit implies. Treat DMD's multi-step behaviour as unvalidated until a longer training lag or `variant="hankel"` has been tested against the same check.
+**Multi-step behaviour is wrong on the production core.** At 3 h, the production `wsh` core fails the tau test from 6 h onward (§5.6.2): it stays predictable longer than a 3 h linear-Markov fit implies. The cause is slow variability. 74% of the variance of the core's top-20 principal components lies at periods over 10 days, and 45% over 30 days. The autocorrelation at 4 days is 0.40, against 0.11 for the 3 h first-order fit. Removing the variability slower than 10 days makes the 20-PC tau test pass at 6 h and 12 h. Neither remedy that was tested passes:
+
+- **A longer training lag.** At 6 h or 12 h, only the 48 h lag clears its envelope, and only at 20 PCs.
+- **Delay embedding.** AR(2) and AR(3) at 3 h are the discrete analogue of `variant="hankel"`. They still fail at 6–24 h.
+
+In production the loss is larger. The mode-OU channels have a median φ of 0.605 at 3 h, an e-folding time of about 6 h. Sampled trajectories keep almost no correlation at 4–8 days, where the data keep 0.49 and 0.33 (§5.6.1, "Known defect"). §5.6.3 measures this at every fit.
 
 **Complex-conjugate pair handling.** With `variant="bop"`, the `eig_constraints={"conjugate_pairs"}` option enforces this at fit time — no manual handling needed. With `variant="exact"` or `"hankel"`, the pairs are still present in the fit but the sampler must force `η_{k'}(t) = conj(η_k(t))` at every step (see §5.6.1 below and §9 gotcha #8). **Default to `variant="exact"` during notebook iteration** (§8.6 Cell 7 re-fits DMD on every rank sweep; BOP-DMD's ~100-model bagging makes that 100× slower per sweep, which is painful across a rank grid). **Switch to `variant="bop"` only for the final production fit**, once ranks are settled — the conjugate-pair constraint and bagged UQ are worth the one-time 100× cost there, but not during exploration.
 
@@ -1087,6 +1093,14 @@ class ModeOUFit:
 ```
 
 v2's `ModeOUFit(theta, sigma, phi, dt)` held one complex OU per mode with independent noise; `phi` was complex.
+
+**Known defect (2026-11-22): the samples do not reproduce the training cores.** Simulating this section's model with the cached task-07 DMD on the production `wsh` core (40% Tucker, `r_dmd = 100`, era 2) shows three errors. Task 07 never checked this configuration generatively, and no training stage measured them until §5.6.3:
+
+1. **Variance inflation from lost cross-mode cancellation.** The DMD modes are far from orthogonal: the condition number of `Φᴴ Φ` is 4.6e3, and near-duplicate pairs (periods of 174 h and 176 h) have |cos| = 0.965. In the training data the measured amplitudes of different modes largely cancel. Their reconstruction energy is 15 times smaller than the sum of the per-mode energies. Each pair's phase here is deterministic and independent of every other pair's, so the cancellation is lost. Per mode the sampled amplitudes match the training ones: median pair `E|η|²` ratio 1.08, real channels 1.000. Summed, the sampled energy in the DMD span is 31–34 times the training value, about 3.8 times the energy of the whole core. Rotating each pair of the true training amplitudes by one random constant phase already gives 27 times. The sampled per-coefficient RMS has a median of 1.73, against 1.0 for the Gaussianized core. 2.5% of sampled values fall beyond the copula's ±4.75 saturation, against 0.12% in training.
+2. **Most of the core variance is unmodeled.** The DMD span carries about 10% of the Gaussianized core's variance (span RMS median 0.32 per coefficient). Nothing models the rest: the local residual is deferred (§5.7). With the phases fixed, samples would be too weak by about the same factor.
+3. **Multi-day memory is lost.** See §5.6. The pair channels are `log|η|`, with a skewness of about −6, because near-zero magnitudes produce large negative spikes. That depresses their lag-1 coefficient further.
+
+The sampler is therefore not production-ready, and §5.6.3 refuses to build a model that shows these errors. The redesign is open (`open_questions.md` §5.7). The first candidate is the specification in `correlated_variables.md` §4.4: sample a member's leading principal components jointly, with their full innovation covariance, so the cross-mode correlation is estimated rather than assumed away.
 
 #### 5.6.2 Group dynamics diagnostics: linear inverse model, tau test, coupling information
 
@@ -1167,16 +1181,21 @@ and always reads as consistent.
 
 **Never gates or alters the fit.** The production `wsh` core already fails
 the tau test from 6 h onward (`correlated_variables.md` §4.4, "First
-application"), so a hard gate would block every fit. The diagnostics are
-evidence for the decisions they inform: the training lag, `variant="hankel"`
-(§5.6), and group membership (`open_questions.md` §3.2). They also
-complement the held-out checks of §6. They are in-sample, and they measure
-the regression's assumptions rather than the samples.
+application"). The diagnostics are evidence for the decisions they inform:
+the training lag, `variant="hankel"` (§5.6), and group membership
+(`open_questions.md` §3.2). They also complement the held-out checks of §6.
+They are in-sample, and they measure the regression's assumptions rather
+than the samples. §5.6.3 measures the samples, and that stage does gate the
+fit. The tau test stays record-only: a failure is evidence about an
+assumption, while §5.6.3's memory check measures what that failure does to
+the samples.
 
 **Correlated noise.** Within a group, stochastic forcing is one joint
 Gaussian draw with the group's innovation covariance
 (`correlated_variables.md` §4.4). The sampler draws it in DMD channel
-coordinates, from the covariance `fit_mode_ou` estimates (§5.6.1);
+coordinates, from the covariance `fit_mode_ou` estimates (§5.6.1). The pair
+phases stay deterministic and mutually independent, which is the variance
+defect in §5.6.1;
 `simulate_lim` is the reference implementation of the same idea in PC
 coordinates. This stage estimates the LIM's own covariance and measures
 what independent draws would lose; it does not feed the sampler.
@@ -1184,6 +1203,118 @@ what independent draws would lose; it does not feed the sampler.
 **Cost.** Dominated by one principal-component decomposition per member:
 the T × T Gram matrix, under a minute at production scale. The bootstrap
 adds two times `n_bootstrap` simulations in the small PC space.
+
+#### 5.6.3 Generative fidelity diagnostics (gates the fit)
+
+Lives in `train/fidelity.py`. Pure functions returning a frozen
+`FidelityDiagnostics` per group.
+
+**What it answers.** Do samples from the fitted dynamics look like the
+training data they were fit on? §5.6.2 checks the regression's assumptions,
+and no other stage looked at the sampler's output. The production `wsh` core
+had three errors that only such a check sees (§5.6.1, "Known defect"):
+
+- sampled variance 3.8 times the core's;
+- multi-day memory lost;
+- a residual daily cycle (§5.4).
+
+The stage simulates each group's fitted DMD and mode OU exactly as the
+sampler does (`train.dmd.channel_path`, then `mode_amplitudes`; §5.8 step 1).
+It runs `fidelity_replicates` replicates as long as the training window and compares
+them with the group's Gaussianized cores, member by member, in core space.
+The copula and Tucker inverses are not involved.
+
+**Where.** After DMD and the mode OU (§5.6, §5.6.1) and the §5.6.2
+diagnostics, on the same group state.
+
+**Checks, per member.**
+
+| Check | Training statistic | Compared with | Fails when |
+|---|---|---|---|
+| Variance | mean per-snapshot core energy `‖x_t‖²` | the replicates' energies | outside the replicates' envelope **and** the sampled/training ratio is outside [1/1.5, 1.5] |
+| Memory | energy-weighted ACF of the member's leading `lim_rank` PCs at each of `fidelity_lags` | the replicates projected onto the same EOFs | at any lag: outside the replicates' envelope **and** more than 0.1 from their mean |
+| Time of day | share of those PCs' variance explained by their mean at each time of day | the same share with time-of-day labels permuted within each day, `fidelity_replicates` times | above the permutations' maximum **and** more than 0.05 above their mean |
+
+Also recorded, without gating:
+
+- **Span fraction**: the share of the training core's energy that the DMD
+  reconstruction with measured amplitudes `Φ⁺x` reproduces. This is the most
+  any sampler built on these modes could carry.
+- **Sampled per-coefficient RMS** at the 5th, 50th, 95th and 99.9th
+  percentiles, from the first replicate on about 300 snapshots.
+- **Saturated fractions**: the share of sampled and of training values
+  beyond `train.copula.SATURATION_Z` ≈ 4.753, where the copula inverse clips
+  (§5.5.1).
+
+**Why both an envelope and a tolerance.** An envelope alone fires on
+deviations that are statistically real but harmless, and with few
+replicates on noise (see §5.6.2's false-alarm reasoning). A tolerance
+alone ignores sampling noise, which over one year is about ±20% on the
+energy of slow, multi-day components. Requiring both makes the gate fire only
+on errors that are both real and large. The tolerances are judgement, not
+derived:
+
+- 1.5 times the variance, about 22% in standard deviation;
+- 0.1 of autocorrelation;
+- 5% of the leading PCs' variance for a daily cycle.
+
+The `wsh` errors exceed each by a wide margin (3.8 times; 0.49 against about
+0 at 4 days; 0.147). They are `Final` constants in `train/fidelity.py`.
+
+**Gates the fit, with no bypass.** `WeatherModel.fit` raises `ValueError`
+with `fidelity_summary`'s text when any member of any group fails, before any
+fitted attribute is set. `from_components` refuses failing diagnostics the
+same way, and so does `load`, which goes through it. A model whose samples do
+not resemble its training data cannot be built or saved. Until the sampler
+is redesigned (`open_questions.md` §5.7) and `logE_wsh` gets diurnal terms
+(§5.4), the production `wsh` fit fails.
+
+**Defaults.**
+
+| Parameter | Default | Reason |
+|---|---|---|
+| `fidelity_lags` | `(1, 2, 4, 8, 16, 32, 64, 128)` | 3 h to 16 days at 3 h, where the `wsh` memory loss shows. The largest must be below T / 2. |
+| `fidelity_replicates` | 100 | Replicates and time-of-day permutations: about 2% two-sided per check, as in §5.6.2. Separate from `n_bootstrap` because a replicate costs one r × T simulation, while a LIM bootstrap replicate refits the LIM. |
+| PCs per member | `lim_rank` (20), capped as in §5.6.2 | The same subspace the tau test reads. |
+
+**Output.** `FidelityDiagnostics` per group, with `members`, `n_replicates`,
+`dt` and, per member:
+
+- `variance` (`VarianceCheck`): training and replicate energies, span
+  fraction, RMS quantiles, saturated fractions, verdict;
+- `memory` (`MemoryCheck`): lags, training ACF, replicate envelope and mean,
+  per-lag verdicts;
+- `time_of_day` (`TimeOfDayCheck`): share, permutation mean and maximum,
+  verdict.
+
+The `passed` property combines the verdicts. `fidelity_summary` renders a
+group as text. Persisted as `fidelity_diagnostics.json` (§7).
+
+**Cost.** Each replicate is one channel path and its mode amplitudes
+(r × T). Member energies come from the r × r Gram matrices `Φ_mᴴΦ_m` and
+`Φ_mᵀΦ_m`, so the sampled state is never materialized, plus a k × r
+projection onto the EOFs. Per group there is also one principal-component
+decomposition per member (as in §5.6.2) and one `Φ⁺x` pass. The
+per-coefficient statistics materialize the first replicate on about 300
+snapshots, in chunks. At production size this is minutes per group.
+
+**First application (2026-11-22): production `wsh` core.** `notebooks/07_generative_fidelity_wsh_core.py` ran the stage on task 07's 40% Gaussianized core (era 2, 2024-01 to 2024-09, T = 2192), with its cached `r_dmd = 100` DMD and the mode OU refit by `fit_mode_ou`. It used 100 replicates and 20 PCs, and ran under an 8 GiB address-space cap with a 5.3 GiB peak. All three checks fail:
+
+| Check | Training | Replicates | Verdict |
+|---|---|---|---|
+| Variance: sampled / training energy | 1 | 3.84 (3.49–4.25) | fail |
+| ACF at 3 h / 6 h | 0.896 / 0.746 | [0.862, 0.883] / [0.776, 0.812] | pass (within 0.1) |
+| ACF at 12 h / 24 h / 48 h | 0.585 / 0.845 / 0.697 | [0.677, 0.728] / [0.582, 0.647] / [0.338, 0.423] | fail |
+| ACF at 4 d / 8 d / 16 d | 0.487 / 0.333 / 0.254 | [−0.069, 0.050] / [−0.022, 0.098] / [0.085, 0.173] | fail |
+| Time-of-day share | 0.148 | permutations: mean 0.001, max 0.002 | fail |
+
+Also recorded:
+
+- The DMD span carries 11.4% of the core energy.
+- The sampled per-coefficient RMS is 1.16 / 1.81 / 3.03 / 5.39 at the 5th / 50th / 95th / 99.9th percentiles.
+- 3.12% of sampled values lie beyond the copula's saturation, against 0.06% in training.
+
+The data's 24 h rebound (0.845, above its 12 h value) is the daily cycle. The samples have none.
 
 ### 5.7 Local residual OU field (deferred in v3)
 
@@ -1290,6 +1421,8 @@ a_k(t_q) = b0_k · Λ_k^Δn + η_k
 The channels are Markov, so this is the exact joint law at every query time, regular or not: consecutive points along a route carry the model's temporal correlation. Each distinct gap is factorized once. The noise is one correlated draw per group (`Q` of §5.6.1), never independent per mode or per member (§5.6.2). `variant="bop"` already returns exact pairs; the same channel construction applies.
 
 *Rejected: jumping every query time from one reference draw at `t_train_start`* (v2's sampler, and this section until 2026-11-22). Each time then has the right marginal, but beyond a few decorrelation times `φ^Δn ≈ 0` and the points become independent draws. Measured on one channel with `φ = 0.9` at 3 h, a month past `t_train_start`, consecutive 3-hourly queries had lag-1 correlation −0.006 instead of 0.90; chaining gives 0.90.
+
+**Known defect.** The pair construction above gives every pair a deterministic phase, independent of every other pair's. On non-orthogonal DMD modes that loses the cancellation between modes and inflates the sampled variance (§5.6.1, "Known defect"). §5.6.3 refuses to build a model where this happens.
 
 **Step 2: Joint state → per-tensor Gaussianized cores.**
 ```
@@ -1400,6 +1533,9 @@ Directory layout — one dir per model version:
 ├── group_diagnostics.json   # per group (§5.6.2): members, variance retained, tau-test
 │                            # lags / drift / ratio / bands / verdicts, coupling nats,
 │                            # null bands and significance flags
+├── fidelity_diagnostics.json # per group (§5.6.3): per member, variance (energies, span
+│                            # fraction, RMS quantiles, saturated fractions), memory (ACF,
+│                            # envelope, per-lag verdicts), time of day (share, null), verdicts
 └── lim/<group>.npz          # per group: G, L, Q, C0, innovation_cov, lag, dt
 ```
 
@@ -1626,6 +1762,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         dmd_              : dict[str, DMDFit]           (group -> fit)
         mode_ou_          : dict[str, ModeOUFit]        (group -> fit)
         group_diagnostics_: dict[str, GroupDiagnostics] (group -> §5.6.2 stage output)
+        fidelity_diagnostics_: dict[str, FidelityDiagnostics] (group -> §5.6.3, all passed)
         local_residual_   : None in v3 (§5.7)
         metadata_         : ModelMetadata
     """
@@ -1649,6 +1786,8 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         groups: dict[str, list[str]] | None = None,  # None: one group per tensor (§5.6.2)
         lim_rank: int = 20,
         tau_test_lags: tuple[int, ...] = (1, 2, 4, 8, 16),
+        fidelity_lags: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128),  # §5.6.3
+        fidelity_replicates: int = 100,                                  # §5.6.3
         n_bootstrap: int = 100,
         random_state: int | None = None,
     ) -> None:
@@ -1656,7 +1795,8 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         ...  # one `self.<name> = <name>` per parameter, verbatim
 
     # --- sklearn transformer surface ---------------------------------------
-    def fit(self, X: Path, y: None = None) -> Self: ...
+    def fit(self, X: Path, y: None = None) -> Self:
+        """Raises ValueError when the §5.6.3 generative fidelity checks fail."""
     def transform(self, X: Path) -> xr.Dataset:
         """Apply preprocessing chain only. Returns standardized anomalies per tensor."""
     def fit_transform(self, X: Path, y: None = None) -> xr.Dataset: ...
@@ -1672,6 +1812,7 @@ class WeatherModel(BaseEstimator, TransformerMixin):
         dmd: dict[str, DMDFit],
         mode_ou: dict[str, ModeOUFit],
         group_diagnostics: dict[str, GroupDiagnostics],
+        fidelity_diagnostics: dict[str, FidelityDiagnostics],  # raises unless all passed
         ocean_mask: np.ndarray,
         metadata: ModelMetadata,
     ) -> Self: ...
@@ -1747,10 +1888,23 @@ Cell 7b — Group dynamics diagnostics (§5.6.2): tau test + coupling, per group
           # variant="hankel" before trusting DMD's multi-step behaviour.
           # Coupling not significant → the group gains nothing from a joint fit.
 
+Cell 7c — Generative fidelity (§5.6.3): simulate each group's fitted dynamics and
+          compare with its cores. from_components refuses a failing group.
+          fidelity_diagnostics = {
+              name: diagnose_fidelity(state[name], member_sizes(name), dmd[name],
+                                      mode_ou[name], times=times, lags=FIDELITY_LAGS,
+                                      ranks={v: 20 for v in members},
+                                      n_replicates=100, rng=rng)
+              for name, members in groups.items()
+          }
+          for diag in fidelity_diagnostics.values():
+              print(fidelity_summary(diag))
+
 Cell 8  — Assemble WeatherModel; save.
           model = WeatherModel.from_components(
               preprocess=preprocess, tucker=tucker, core_copula=core_copula,
               dmd=dmd, mode_ou=mode_ou, group_diagnostics=group_diagnostics,
+              fidelity_diagnostics=fidelity_diagnostics,
               ocean_mask=ocean_mask, metadata=metadata,
           )
           model.save(Path("./models/v0.1.0"))
@@ -1808,7 +1962,7 @@ Ordered by expected pain if missed.
 
 7. **Land mask comes from `sigwh` only** (task 17, §5.1). A partition variable's NaN (`wsh`, `pswh`, their periods and directions) also fires where that partition is absent at a genuine ocean cell. Intersecting every modeled variable's NaN, as v2 did, deletes large areas of real ocean.
 
-8. **Complex-conjugate DMD pairs are one stochastic driver.** A real field needs `η_k'(t) = conj(η_k(t))` exactly. Independent per-mode draws make the reconstruction about as imaginary as real (task 07). v3 builds this into the fit: `fit_mode_ou` gives each pair one log-magnitude channel with a deterministic phase, and `mode_amplitudes` sets the partner to the conjugate (§5.6.1, §5.8). The sampler's real part is then exact, not a discard of a large imaginary part. With `dmd_variant="bop"`, `eig_constraints={"conjugate_pairs"}` also enforces exact pairs at fit time; with `"exact"` or `"hankel"`, pairs are matched by eigenvalue within `1e-6`, and a mode whose partner the truncation dropped is treated as real.
+8. **Complex-conjugate DMD pairs are one stochastic driver.** A real field needs `η_k'(t) = conj(η_k(t))` exactly. Independent per-mode draws make the reconstruction about as imaginary as real (task 07). v3 builds this into the fit: `fit_mode_ou` gives each pair one log-magnitude channel with a deterministic phase, and `mode_amplitudes` sets the partner to the conjugate (§5.6.1, §5.8). The sampler's real part is then exact, not a discard of a large imaginary part. With `dmd_variant="bop"`, `eig_constraints={"conjugate_pairs"}` also enforces exact pairs at fit time; with `"exact"` or `"hankel"`, pairs are matched by eigenvalue within `1e-6`, and a mode whose partner the truncation dropped is treated as real. Exact conjugacy is necessary but not sufficient: the construction loses the cancellation between non-orthogonal modes, which inflates the sampled variance (§5.6.1, "Known defect").
 
 9. **Wraparound at year boundaries in the climatology.** Compute `t_since_epoch_days` continuously from `t_ref` (the training-window midpoint); don't reset at Jan 1. The cosines handle periodicity.
 

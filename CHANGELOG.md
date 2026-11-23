@@ -7,6 +7,36 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — The sampler's defects recorded, a generative fidelity gate
+  specified, the open questions prioritized** — `docs/model_design.md`
+  (summary, §5.4, §5.6, §5.6.1, new §5.6.3, §5.8, §7, §8.5, §8.6, §9 gotcha
+  8), `docs/open_questions.md` (new Priorities section, new §4.3, §5.7,
+  §5.8, §5.9, reopened §5.2, updated §7.2), `docs/correlated_variables.md`
+  §4.4, `AGENTS.md`.
+  - **Findings, on task 07's production `wsh` core.**
+    - **Variance.** The sampler inflates the variance about 3.8-fold. The
+      DMD modes are non-orthogonal, and their training amplitudes cancel;
+      independent per-pair phases lose that.
+    - **Unmodeled variance.** The 100-mode DMD span carries about 11% of
+      the core's variance, and nothing models the rest.
+    - **Memory.** Samples forget within about a day; the data keep 0.49
+      autocorrelation at 4 days. That slow variability is what fails the
+      tau test. A 6 h or 12 h training lag and AR(2)/AR(3) do not fix it.
+    - **Daily cycle.** Wind sea keeps a physical, sun-locked daily cycle
+      the climatology leaves in.
+  - **Specified.** A training stage that simulates the fitted dynamics and
+    compares them with the training cores on variance, multi-day memory
+    and residual daily cycle. It fails the fit with no bypass (user
+    decision).
+  - **Prioritized.**
+    1. Make the measurement trustworthy.
+    2. Choose the space the dynamics are fit in (a new hypothesis: unit
+       variance per core coefficient).
+    3. Redesign the sampler.
+    4. Add diurnal terms for `logE_wsh`.
+    5. Land the gate.
+    6. Revalidate task 07's `r_dmd`.
+
 - **2026-11-22 — `fastjsonschema` 2.22.0 → 2.22.3 in the lock file** —
   `poetry.lock`. A dev-group transitive dependency (through `nbformat`); the
   lock now also records its `python >= 3.10` requirement. No runtime change.
