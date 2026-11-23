@@ -7,6 +7,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — Probes behind the v3 sampler decisions kept** —
+  `notebooks/probes/sampler_jump_vs_chain.py`,
+  `notebooks/probes/sampler_per_time_cost.py` (new).
+  - **Jump versus chain.** Reproduces the lag-1 correlation that rejected
+    the jump design: -0.006 jumping, 0.898 chained, 0.900 for the process.
+    It now restates the jump design locally, because the helpers it used
+    while the sampler was being rewritten no longer exist.
+  - **Per-time cost.** Times the per-cell inverses and the interpolator
+    per unique query time at era-3 size. Rerun on 2026-11-22: 105 ms and
+    28 ms, against 290 ms and 326 ms when the decision was made; the cost
+    depends on machine load.
+  - **Dropped.** The fixture smoke and persistence probes fit the tier-1
+    fixture, which the fidelity gate now always rejects. Tests and the
+    script above cover their results.
+
 - **2026-11-22 — Probe scripts get a home and a rule** — `AGENTS.md`
   (module layout, *Notebook Protocol*). `notebooks/probes/` holds the
   scripts behind recorded results. Every tracked script must run against
