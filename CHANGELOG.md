@@ -7,6 +7,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — Probes behind the sampler findings kept** —
+  `notebooks/probes/` (new): `07_leading_pcs_by_utc_hour.py` (run first;
+  caches the PCs in `results/`), `07_increment_energy_by_utc_hour.py`,
+  `07_time_of_day_share.py`, `07_diurnal_phase_frame.py`,
+  `07_tau_remedies.py`, `07_slow_variability.py`,
+  `07_production_sampler_memory.py`, `07_sampler_energy.py`,
+  `07_mode_cancellation.py`, `07_sampled_coefficient_rms.py`,
+  `fixture_gate_white_noise.py`, `fixture_gate_ar1.py`.
+  - **What they back.** The numbers in `docs/model_design.md` §5.6 and
+    §5.6.1 ("Known defect") and in `docs/open_questions.md` §4.3, §5.7,
+    §5.9 and §7.2:
+    - the daily cycle, and that it is locked to the sun;
+    - the slow variability behind the tau-test failure, and the remedies
+      that do not fix it;
+    - the production sampler's lost memory;
+    - the cross-mode cancellation that inflates the sampled variance;
+    - the fixtures the fidelity gate rejects.
+  - **Verified.** All rerun against this tree on 2026-11-22 and reproduce
+    the recorded numbers.
+
 - **2026-11-22 — Probes behind the LIM tau-test stage kept** —
   `notebooks/probes/07_lim_tau_test_first_run.py`,
   `notebooks/probes/07_lim_bootstrap_envelope.py` (new).
