@@ -7,6 +7,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **2026-11-22 — Probe scripts get a home and a rule** — `AGENTS.md`
+  (module layout, *Notebook Protocol*). `notebooks/probes/` holds the
+  scripts behind recorded results. Every tracked script must run against
+  the tree it is committed in; one broken by a later change is fixed or
+  deleted, never kept broken.
+
 - **2026-11-22 — The sampler's defects recorded, a generative fidelity gate
   specified, the open questions prioritized** — `docs/model_design.md`
   (summary, §5.4, §5.6, §5.6.1, new §5.6.3, §5.8, §7, §8.5, §8.6, §9 gotcha

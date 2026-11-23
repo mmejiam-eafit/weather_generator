@@ -565,6 +565,7 @@ weather_generator/
 ├── notebooks/
 │   ├── NN_<slug>.ipynb                  # Task NN experiments
 │   ├── NN_<slug>.py                     # Task NN long / unattended runs (scripts, not CLIs)
+│   ├── probes/                          # Scratch probes behind recorded results; each must run
 │   └── tbd/                             # Parked: test_pipeline.ipynb, verify_*.ipynb, …
 ├── azureml/                             # Cloud experiment tooling (task 18)
 ├── src/
@@ -853,6 +854,15 @@ same prefix — never CLI entry points in `src/`.
 - Convert the notebook to a script only if you find yourself running the
   same cells repeatedly — but even then, keep it under `notebooks/` as a
   `.py` file, not a CLI entry point.
+
+**Probes (`notebooks/probes/`).** Quick scripts written while investigating,
+kept because a recorded result (in `docs/`, a task file or `CHANGELOG.md`)
+rests on them. Each states in its docstring which result it backs, how to
+run it, and what it needs first. They are not held to the `src/` standards,
+but **every tracked script must run against the tree it is committed in**.
+A probe broken by a later change is fixed, or deleted once its result is
+covered elsewhere (a test, a maintained script). It is never kept broken.
+Its numbers stay in the document that records them.
 
 ---
 
